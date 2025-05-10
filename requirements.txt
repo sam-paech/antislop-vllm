@@ -1,0 +1,8 @@
+openai>=1.0.0
+pyyaml>=6.0
+tiktoken>=0.4.0
+nltk>=3.6.0
+pandas
+wordfreq
+datasets
+tqdm

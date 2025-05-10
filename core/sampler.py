@@ -1,0 +1,530 @@
+# core/sampler.py
+"""
+ApiAntiSlopSampler
+==================
+
+Coordinates chunk-wise text generation over any OpenAI-compatible
+completion endpoint, applies a set of *validators* (phrase block-list,
+regex block-list, …), and performs local back-tracking when a validator
+flags an offending token.
+
+The sampler never calls the remote API during back-tracking; it resamples
+from the *top-logprob lists* already returned with each chunk, applying
+temperature, min-p, top-p, and top-k exactly as normal decoding does.
+
+If back-tracking fails (no viable alternative token in the cached list),
+the violation is **suppressed** so validators won’t raise the same error
+again.  Generation continues from that point.
+
+All ban / back-track events are pushed to `self.events` for downstream
+inspection or metrics.
+"""
+from __future__ import annotations
+
+import logging
+import math
+import random
+from typing import Dict, Generator, List, Optional, Tuple, Callable, Any
+
+import tiktoken # Added tiktoken
+
+from api_client.base_client import BaseApiClient
+from core.models import ApiChunkResult, ViolationInfo
+from state.generation_state import (
+    GenerationState,
+    _decode_token,
+    _tokens_to_text,
+)
+from validators.base_validator import BaseValidator
+from validators.slop_phrase_validator import SlopPhraseValidator
+from utils.slop_helpers import detect_disallowed_sequence
+
+logger = logging.getLogger(__name__)
+
+
+class ApiAntiSlopSampler:
+    """
+    High-level controller for generation → validation → (optional)
+    back-tracking.  No local tokenizer is required; all token strings and
+    log-probs come from the API.
+    """
+
+    # ------------------------------------------------------------------ #
+    #  Initialisation                                                     #
+    # ------------------------------------------------------------------ #
+    def __init__(
+        self,
+        api_client: BaseApiClient,
+        validators: List[BaseValidator],
+        config: Dict[str, object],
+        on_ban_event_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        on_chunk_yielded_callback: Optional[Callable[[str, int], None]] = None,
+        # Use model_name for tiktoken by default, fallback in code
+        tiktoken_model_name_for_counting: Optional[str] = None,
+    ) -> None:
+        self.api_client = api_client
+        self.validators = validators
+        self.config = config
+
+        # Callbacks
+        self.on_ban_event_callback = on_ban_event_callback
+        self.on_chunk_yielded_callback = on_chunk_yielded_callback
+
+        # Tiktoken encoding for internal token counting
+        # Use the provided model name or default to cl100k_base
+        _tiktoken_encoding_name = tiktoken_model_name_for_counting or "cl100k_base"
+        try:
+            # If tiktoken_model_name_for_counting is None, it will use "cl100k_base"
+            # If it's a model name, it will try that.
+            if tiktoken_model_name_for_counting:
+                 self.tiktoken_encoding = tiktoken.encoding_for_model(tiktoken_model_name_for_counting)
+            else:
+                 self.tiktoken_encoding = tiktoken.get_encoding("cl100k_base")
+            logger.info(f"ApiAntiSlopSampler using tiktoken encoding for '{_tiktoken_encoding_name}' for yielded chunk token counts.")
+        except KeyError:
+            logger.warning(
+                f"Tiktoken model '{tiktoken_model_name_for_counting}' not found. "
+                f"Falling back to 'cl100k_base' for yielded chunk token counts."
+            )
+            self.tiktoken_encoding = tiktoken.get_encoding("cl100k_base")
+        except Exception as e:
+            logger.error(f"Error getting tiktoken encoding for '{_tiktoken_encoding_name}': {e}. "
+                         f"Falling back to 'cl100k_base' for yielded chunk token counts.")
+            self.tiktoken_encoding = tiktoken.get_encoding("cl100k_base")
+
+
+        gen = config.get("generation_params", {})
+        self.chunk_size = gen.get("chunk_size", 50)
+        self.top_logprobs_count = gen.get("top_logprobs_count", 1)
+        self.max_new_tokens = gen.get("max_new_tokens", 600)
+        self.temperature = max(gen.get("temperature", 0.7), 1e-3)
+        self.top_p = gen.get("top_p")
+        self.top_k = gen.get("top_k")
+        self.min_p = gen.get("min_p")
+        self.stop_sequences = gen.get("stop_sequences")
+        self.timeout = gen.get("timeout", 120)
+
+        back = config.get("backtracking", {})
+        self.max_retries_per_position = back.get("max_retries_per_position", 20)
+
+        self.slop_info: Optional[Dict[str, object]] = None
+        for v in validators:
+            if isinstance(v, SlopPhraseValidator):
+                self.slop_info = {
+                    "keys": v.slop_phrases_keys,
+                    "max_len": v.max_phrase_len,
+                    "min_len": v.min_phrase_len,
+                }
+                break
+
+        # Remember which alternative tokens we've already tried at each
+        # generated position so we never pick the same word twice.
+        # Key: generated_index (int) → set of raw token strings tried
+        self._tried_alternatives = {}
+
+        self.events: List[Dict[str, object]] = []
+
+        # ------------------------------------------------------------------ #
+        #  Tail-buffer size: keep enough tokens so that *any* validator       #
+        #  (regex, n-gram, phrase) can still match across a chunk boundary.   #
+        #                                                                     #
+        #  • Regex   → unlimited in principle → use a fixed safety window     #
+        #                that you can raise in config.yaml:                   #
+        #      regex_max_span_tokens: 999999    # default                        #
+        #  • N-gram  → v.max_ngram_len tokens                                 #
+        #  • Phrase  → (max_phrase_len + scan_window_base_size)/4 chars ≈     #
+        #                number of tokens (rough estimate)                    #
+        # ------------------------------------------------------------------ #
+        regex_tail = int(config.get("regex_max_span_tokens", 999999))
+        tail_tokens = regex_tail
+
+        for v in validators:
+            if v.__class__.__name__ == "NGramValidator":
+                tail_tokens = max(tail_tokens, getattr(v, "max_ngram_len", 0) + 2)
+            elif v.__class__.__name__ == "SlopPhraseValidator":
+                est = (v.max_phrase_len + v.scan_window_base_size) // 4 + 2
+                tail_tokens = max(tail_tokens, est)
+
+        self.tail_keep_tokens = tail_tokens
+        logger.info(
+            f"ApiAntiSlopSampler ready — chunk={self.chunk_size}, "
+            f"max_new_tokens={self.max_new_tokens}, T={self.temperature}, "
+            f"top_p={self.top_p}, top_k={self.top_k}, min_p={self.min_p}, "
+            f"tail_keep_tokens={self.tail_keep_tokens}"
+        )
+
+    def _run_validators(self, state: GenerationState) -> Optional[ViolationInfo]:
+        """
+        Query every validator and return the violation that starts at the
+        **lowest token index**.  If two violations start at the same index
+        we keep the one from the validator that appears first in
+        self.validators so existing priority ties stay stable.
+        """
+        earliest: Optional[ViolationInfo] = None
+        for v in self.validators:
+            vio = v.check(state)
+            if not vio:
+                continue
+            if (earliest is None) or (vio.violation_index < earliest.violation_index):
+                earliest = vio
+        return earliest
+
+    # ------------------------------------------------------------------ #
+    #  Fast sanity-check for a candidate                                 #
+    # ------------------------------------------------------------------ #
+    def _check_hypothetical_state(
+        self,
+        state: GenerationState,
+        truncate_idx: int,
+        alt_token: str,
+    ) -> tuple[bool, tuple[str, str] | None]:
+        """
+        (passes_all, (validator_name, detail_key) | None)
+
+        A violation blocks the candidate IFF the validator’s affected-token
+        span includes the *candidate index*.
+
+        For single-token validators (slop phrase, regex char map, …) that means
+        `violation_index == truncate_idx`.
+
+        For N-gram validator we treat the span as
+            [violation_index, violation_index + len(ngram_tuple)-1].
+        """
+        if not self.validators:
+            return True, None
+
+        # ⸺ build hypothetical state ------------------------
+        hypo_state = GenerationState(state.prompt_string)
+        hypo_state.generated_token_strings = (
+            state.generated_token_strings[:truncate_idx] + [alt_token]
+        )
+
+        for v in self.validators:
+            vio = v.check(hypo_state)
+            if not vio:
+                continue
+
+            # ---------- does the violation involve the new token? ----------
+            start = vio.violation_index
+            end   = start                      # default: single token
+
+            # n-gram gives us the length
+            if v.__class__.__name__ == "NGramValidator":
+                if isinstance(vio.details, dict) and "ngram_tuple" in vio.details:
+                    end = start + len(vio.details["ngram_tuple"]) - 1
+
+            # Ignore it if the span is wholly before the candidate position
+            if end < truncate_idx:
+                continue
+
+            # otherwise block the candidate
+            det = (
+                (vio.details.get("ngram_string")
+                or vio.details.get("phrase")
+                or vio.details.get("pattern"))
+                if isinstance(vio.details, dict) else "?"
+            )
+            return False, (v.__class__.__name__, det)
+
+        return True, None
+
+
+
+
+
+        # ------------------------------------------------------------------ #
+    #  Back-tracking                                                     #
+    # ------------------------------------------------------------------ #
+    def _perform_backtrack(self, state: GenerationState, vio: ViolationInfo) -> bool:
+        idx       = vio.violation_index
+        original  = vio.original_token_string
+        lp_list   = state.get_logprobs(idx)
+
+        if not lp_list:
+            logger.error("Back-track failed — no logprobs available.")
+            return False
+
+        # -------------------------------------------------------------- #
+        #  Keep track of what we have already tried at this position     #
+        # -------------------------------------------------------------- #
+        tried_here = self._tried_alternatives.setdefault(idx, set())
+
+        logger.warning(
+            f"Back-tracking @tok={idx} orig='{original}' ban='{vio.details}'."
+        )
+
+        banned_raw = (
+            vio.details.get("phrase")
+            or vio.details.get("match")
+            or vio.details.get("ngram_string")
+            or ""
+        )
+        banned_lower = banned_raw.lstrip().lower()
+
+        # rank by descending log-prob
+        lp_sorted = sorted(lp_list, key=lambda t: t[1], reverse=True)
+        candidates: List[Tuple[str, float]] = []
+
+        orig_dec = _decode_token(original).lstrip().lower()
+
+        reasons = []                 # (token, reason) tuples for debug
+
+        for tok, lp in lp_sorted:
+            dec = _decode_token(tok).lstrip().lower()
+
+            if dec == orig_dec:
+                reasons.append((tok, "identical"))
+                continue
+
+            if dec and banned_lower.startswith(dec):
+                reasons.append((tok, "banned-prefix"))
+                continue
+
+            if tok in tried_here:
+                reasons.append((tok, "already-tried"))
+                continue
+
+            ok, bad = self._check_hypothetical_state(state, idx, tok)
+            if not ok:
+                vname, detail = bad
+                reasons.append((tok, f"{vname}:{detail}"))
+                continue
+
+
+            candidates.append((tok, lp))
+            if len(candidates) >= self.max_retries_per_position:
+                break
+
+        if not candidates:
+            logger.error(
+                "Back-track: no alternative tokens pass filters.  Details: %s",
+                ", ".join(f"{t!r}:{r}" for t, r in reasons[:20])  # cap to 20 entries
+            )
+            return False
+
+        if not candidates:
+            logger.error(
+                "Back-track debug @tok=%d – banned='%s'  tried=%s  lp_top=%s",
+                idx,
+                banned_raw,
+                sorted(tried_here)[:10],                 # first few we’ve tried
+                [(t, round(lp, 2)) for t, lp in lp_sorted[:10]]  # top-10 raw list
+            )
+            return False
+
+
+
+        if not candidates:
+            logger.error("Back-track: no alternative tokens pass filters.")
+            return False
+
+        # -------------------------------------------------------------- #
+        #  Build initial (token, prob) list                              #
+        # -------------------------------------------------------------- #
+        logits = [lp for _, lp in candidates]
+        raw_probs = [math.exp(l) for l in logits]
+        tempered = [p ** (1 / self.temperature) for p in raw_probs]
+        Z = sum(tempered)
+        pairs = [(tok, pt / Z if Z > 0 else 1 / len(tempered))
+                 for (tok, _), pt in zip(candidates, tempered)]
+
+        # min-p filter
+        if self.min_p is not None:
+            floor = self.min_p * max(pt for _, pt in pairs)
+            pairs = [(tok, pt) for tok, pt in pairs if pt >= floor]
+            if not pairs:
+                logger.error("Back-track: all alternatives removed by min_p.")
+                return False
+
+        # top-p (nucleus) filter
+        if self.top_p is not None:
+            pairs.sort(key=lambda tp: tp[1], reverse=True)
+            nucleus, cum = [], 0.0
+            for tok, pt in pairs:
+                nucleus.append((tok, pt))
+                cum += pt
+                if cum >= self.top_p:
+                    break
+            pairs = nucleus
+
+        # top-k filter
+        if self.top_k is not None and len(pairs) > self.top_k:
+            pairs = sorted(pairs, key=lambda tp: tp[1], reverse=True)[: self.top_k]
+
+        if not pairs:
+            logger.error("Back-track: all alternatives removed by top_p/top_k.")
+            return False
+
+        # -------------------------------------------------------------- #
+        #  Sample replacement token                                      #
+        # -------------------------------------------------------------- #
+        tokens, probs_final = zip(*pairs)
+        choice = random.choices(tokens, weights=probs_final, k=1)[0]
+
+
+        # -------------------------------------------------------------- #
+        #  Commit replacement & housekeeping                             #
+        # -------------------------------------------------------------- #
+        tried_here.add(choice)                  # remember this attempt
+        state.truncate(idx + 1)
+        state.replace_token_string(idx, choice)
+
+        # purge tried-alt caches for any indices that no longer exist
+        for k in list(self._tried_alternatives):
+            if k > idx:
+                del self._tried_alternatives[k]
+
+        logger.warning(
+            f"    ✓ replacement='{choice}' "
+            f"(pool={len(tokens)}, T={self.temperature}, "
+            f"min_p={self.min_p}, top_p={self.top_p}, top_k={self.top_k})"
+        )
+        return True
+
+
+    def _suppress_violation(self, vio: ViolationInfo) -> None:
+        for v in self.validators:
+            v_name = v.__class__.__name__.lower()
+            if vio.validator_type in v_name and hasattr(v, "ignore_violation"):
+                v.ignore_violation(vio)
+
+    def _yield_text_and_callback(self, text_to_yield: str) -> str:
+        """Helper to count tokens, call callback, and yield text."""
+        if self.on_chunk_yielded_callback:
+            try:
+                num_tokens = len(self.tiktoken_encoding.encode(text_to_yield))
+                self.on_chunk_yielded_callback(text_to_yield, num_tokens)
+            except Exception as e_cb:
+                logger.error(f"Error in on_chunk_yielded_callback: {e_cb}", exc_info=True)
+        return text_to_yield
+
+    # ------------------------------------------------------------------ #
+    #  Generation loop                                                   #
+    # ------------------------------------------------------------------ #
+        # ------------------------------------------------------------------ #
+    #  Generation loop                                                   #
+    # ------------------------------------------------------------------ #
+    def generate(self, prompt: str) -> Generator[str, None, None]:
+        """
+        Stream text while validating the *entire* prompt + generation after
+        every chunk.  We yield only tokens that are farther back than
+        `self.tail_keep_tokens`, so no future span (regex, n-gram, phrase)
+        can touch them.
+
+        Token-throughput (tok/s) is updated whenever new tokens survive the
+        current validation pass, even if the chunk needed back-tracking.
+        """
+        state = GenerationState(prompt)
+        last_yield_idx = 0                         # first token not yet sent
+
+        while True:
+            # ---------- stop if we’ve reached the hard token limit ----------
+            if (
+                self.max_new_tokens is not None
+                and state.get_generated_length() >= self.max_new_tokens
+            ):
+                logger.info("Reached max_new_tokens.")
+                break
+
+            # ---------- ask the API for more text ---------------------------
+            try:
+                chunk = self.api_client.generate_chunk(
+                    prompt_text    = state.get_full_text(),
+                    max_tokens     = self.chunk_size,
+                    top_logprobs   = self.top_logprobs_count,
+                    temperature    = self.temperature,
+                    top_p          = self.top_p,
+                    top_k          = self.top_k,
+                    min_p          = self.min_p,
+                    timeout        = self.timeout,
+                    stop_sequences = self.stop_sequences,
+                )
+            except Exception as e:
+                logger.error(f"API call failed: {e}", exc_info=True)
+                break
+
+            if not chunk.token_strings:            # end-of-stream
+                break
+
+            # ---------- append & validate -----------------------------------
+            pre_len = state.get_generated_length()
+            state.append_chunk(chunk)
+
+            vio = self._run_validators(state)
+
+            if vio:                                # ▸ violation detected
+                fixed = self._perform_backtrack(state, vio)
+
+                event = {
+                    "type":  vio.validator_type,
+                    "index": vio.violation_index,
+                    "details": vio.details,
+                    "original_token_string": vio.original_token_string,
+                    "fixed": fixed,
+                }
+                self.events.append(event)
+
+                if self.on_ban_event_callback:
+                    try:
+                        self.on_ban_event_callback(event)
+                    except Exception as e_cb:
+                        logger.error(
+                            f"Error in on_ban_event_callback: {e_cb}",
+                            exc_info=True,
+                        )
+
+                if not fixed:
+                    self._suppress_violation(vio)
+
+                # --------- live token accounting (even after fix) ----------
+                post_len = state.get_generated_length()
+                newly_accepted = post_len - pre_len
+                if newly_accepted and self.on_chunk_yielded_callback:
+                    try:
+                        self.on_chunk_yielded_callback("", newly_accepted)
+                    except Exception as e_cb:
+                        logger.error(
+                            f"Throughput callback failed: {e_cb}",
+                            exc_info=True,
+                        )
+
+                # re-run loop (state may have been truncated/replaced)
+                continue
+
+            # ---------- clean chunk: count tokens & update tok/s ------------
+            post_len = state.get_generated_length()
+            newly_accepted = post_len - pre_len
+            if newly_accepted and self.on_chunk_yielded_callback:
+                try:
+                    self.on_chunk_yielded_callback("", newly_accepted)
+                except Exception as e_cb:
+                    logger.error(
+                        f"Throughput callback failed: {e_cb}",
+                        exc_info=True,
+                    )
+
+            # ---------- safe-to-stream portion ------------------------------
+            safe_upto = max(0, post_len - self.tail_keep_tokens)
+            if safe_upto > last_yield_idx:
+                safe_tokens = state.generated_token_strings[last_yield_idx : safe_upto]
+                text_to_yield = _tokens_to_text(safe_tokens)
+                if text_to_yield:
+                    yield text_to_yield            # callback already handled
+                last_yield_idx = safe_upto
+
+            # ---------- stop if model signalled completion ------------------
+            if chunk.finish_reason and chunk.finish_reason != "length":
+                logger.info(f"finish_reason={chunk.finish_reason}")
+                break
+
+        # --------------------- flush residual tail --------------------------
+        if state.get_generated_length() > last_yield_idx:
+            residual = state.generated_token_strings[last_yield_idx :]
+            text_to_yield = _tokens_to_text(residual)
+            if text_to_yield:
+                yield text_to_yield                # final flush; no callback
+
+        logger.info(
+            f"Generation finished. Total tokens in state="
+            f"{state.get_generated_length()}"
+        )

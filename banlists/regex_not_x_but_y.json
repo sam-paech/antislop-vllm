@@ -1,0 +1,7 @@
+[
+    "\\bnot\\s+(?:just|only|merely)?\\s*(?:[^\\s]+\\s*){1,6}?[,;:—–-]?\\s*but\\s+(?:also\\s+)?",
+    "\\bnot\\s+only\\s+(?:[^\\s]+\\s*){1,6}?[,;:—–-]?\\s*but\\s+also\\s+",
+    "\\bit'?s\\s+not\\s+(?:just|only|merely)?\\s*(?:[^\\s]+\\s*){1,6}?[,;:—–-]\\s*it'?s\\s+",
+    "\\b(?:[^\\s]+\\s*){1,4}?is\\s+not\\s+(?:just\\s+|only\\s+)?(?:about\\s+)?(?:[^\\s]+\\s*){1,6}?[,;:—–-]\\s*it'?s\\s+(?:about\\s+)?"
+  ]
+  

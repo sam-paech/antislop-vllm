@@ -1,0 +1,57 @@
+# Antislop-vLLM Configuration
+
+# Note: values here will be overridden if cmdline params are specified.
+
+# specify the url your vllm openai-compatible api is running at:
+api_base_url: "http://localhost:8000/v1"
+api_key: "xxx"
+
+model_name: "unsloth/gemma-3-1b-it"
+
+
+# Slop Configuration
+slop_phrases_file: "banlists/slop_phrases.json"
+top_n_slop_phrases: 200 # Use top N phrases from the file (assumes file is ordered)
+
+# Generation Parameters
+generation_params:
+  chunk_size: 50
+  top_logprobs_count: 20
+  max_new_tokens: 600
+  temperature: 0.7
+  top_p: 1.0
+  top_k: 50
+  min_p: 0.05
+  timeout: 120        # seconds
+  stop_sequences: []
+
+# Backtracking Configuration
+backtracking:
+  max_retries_per_position: 20
+
+# N-Gram Validator Configuration (Optional)
+ngram_validator:
+  # Option 1: Specify a file containing a JSON list of banned n-grams
+  # Each item in the JSON list can be a string (e.g., "this is an n gram")
+  # or a list of strings (e.g., ["this", "is", "an", "n", "gram"])
+  # banned_file: "banned_ngrams.json"
+
+  # Option 2: Specify the list directly in the config
+  # This takes precedence if banned_file is also specified but CLI overrides file.
+  # CLI --ngram-banned-list overrides this.  
+  banned_file: "banlists/banned_ngrams.json"
+
+  #banned_list:
+    # - "as an AI language model" # Will be tokenized
+    # - "I am programmed"
+    # - ["repeated", "phrase", "here"] # Already tokenized
+    # - "feel free to ask"
+  
+  remove_stopwords: true # Default: true. Whether to remove stopwords before matching.
+  language: "english"    # Default: "english". Language for stopwords.
+
+# optional:
+regex_blocklist_file: "banlists/regex_not_x_but_y.json"
+
+# Logging
+logging_level: INFO
