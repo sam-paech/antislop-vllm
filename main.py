@@ -42,6 +42,11 @@ overall_prompts_processed_count = 0
 overall_tokens_generated_count = 0
 overall_processing_start_time = 0.0
 
+from collections import deque
+
+TOK_WINDOW_SIZE = 160           # how many recent chunks to smooth across
+token_history   = deque(maxlen=TOK_WINDOW_SIZE)   # (timestamp, num_tokens)
+history_lock    = Lock()
 
 def _setup_validators(cfg: Dict[str, Any], main_logger: logging.Logger) -> List[Any]:
     validators = []
@@ -286,16 +291,32 @@ def generate_for_prompt_worker(
 
     def _on_chunk_yielded_callback(text_chunk: str, num_tokens: int):
         nonlocal current_prompt_tokens_generated
-        global overall_tokens_generated_count, overall_processing_start_time
+        global overall_tokens_generated_count
 
+        # Update per-prompt counters first
         current_prompt_tokens_generated += num_tokens
+        now = time.perf_counter()
+
         with progress_lock:
             overall_tokens_generated_count += num_tokens
-            if overall_processing_start_time > 0:
-                elapsed_time = time.perf_counter() - overall_processing_start_time
-                tok_per_sec = overall_tokens_generated_count / elapsed_time if elapsed_time > 0 else 0.0
-                if not pbar_global.disable:
-                    pbar_global.set_postfix_str(f"{tok_per_sec:.1f} tok/s", refresh=True)
+
+        # Record this chunk in the rolling window
+        with history_lock:
+            token_history.append((now, num_tokens))
+            if len(token_history) < 2:
+                return                        # need at least one interval
+
+            earliest_t = token_history[0][0]
+            tok_sum    = sum(t for _, t in token_history)
+
+        dt = now - earliest_t
+        if dt <= 0:
+            return                           # avoid div-zero / bogus interval
+
+        smoothed_rate = tok_sum / dt         # tokens per second over the window
+        if not pbar_global.disable:
+            pbar_global.set_postfix_str(f"{smoothed_rate:.1f} tok/s", refresh=True)
+
 
     thread_cfg = copy.deepcopy(config)
     validators = _setup_validators(thread_cfg, main_logger)
