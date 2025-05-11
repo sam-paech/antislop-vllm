@@ -2,6 +2,7 @@
 import yaml
 import logging
 import argparse
+import copy
 from typing import Dict, Any, List, Tuple
 from pathlib import Path # Added Path
 
@@ -12,21 +13,60 @@ logging.basicConfig(
 logger = logging.getLogger(__name__) # Logger for this module
 
 
-def load_config(path: str = "config.yaml") -> dict:
+# --------------------------------------------------------------------- #
+#  Built-in fallback                                                   #
+# --------------------------------------------------------------------- #
+_BUILTIN_DEFAULT: Dict[str, Any] = {
+    "logging_level": "INFO",
+    "generation_params": {
+        "chunk_size":        50,
+        "top_logprobs_count": 20,
+        "max_new_tokens":   1200,
+        "temperature":      0.7,
+        "top_p":            1.0,
+        "top_k":              50,
+        "min_p":            0.05,
+        "timeout":           120,
+        "stop_sequences":   [],
+    },
+    "backtracking": {
+        "max_retries_per_position": 20,
+    },
+    "ngram_validator": {
+        # no banned list/file by default
+        "remove_stopwords": True,
+        "language":         "english",
+    },
+}
+
+def _deep_merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    """b ← a  (a wins only where b lacks the key).  Non-dict leaves are copied."""
+    out: Dict[str, Any] = copy.deepcopy(b)
+    for k, v in a.items():
+        if k in out and isinstance(out[k], dict) and isinstance(v, dict):
+            out[k] = _deep_merge(v, out[k])
+        else:
+            out[k] = copy.deepcopy(v)
+    return out
+
+# --------------------------------------------------------------------- #
+#  Public loader                                                        #
+# --------------------------------------------------------------------- #
+def load_config(path: str = "config.yaml") -> Dict[str, Any]:
+    user_cfg: Dict[str, Any] = {}
     try:
         with open(path, "r", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f)
-        logger.debug(f"Base configuration loaded from {path}") # Changed to debug
-        return cfg
+            user_cfg = yaml.safe_load(f) or {}
+        logger.debug(f"Configuration loaded from {path}")
     except FileNotFoundError:
-        logger.warning(f"Config file {path} not found. Using empty base config.")
-        return {}
+        logger.warning(f"Config file '{path}' not found – using built-in defaults.")
     except yaml.YAMLError as e:
-        logger.error(f"Error parsing YAML config file {path}: {e}")
-        return {}
+        logger.error(f"YAML parse error in '{path}': {e} – using built-in defaults.")
     except Exception as e:
-        logger.error(f"Unexpected error loading config file {path}: {e}")
-        return {}
+        logger.error(f"Unexpected error loading '{path}': {e} – using built-in defaults.")
+
+    # Merge (built-in ← user) so user values override defaults.
+    return _deep_merge(_BUILTIN_DEFAULT, user_cfg)
 
 
 def add_common_generation_cli_args(parser: argparse.ArgumentParser, base_cfg: Dict[str, Any]):
