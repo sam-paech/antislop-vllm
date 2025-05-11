@@ -6,3 +6,4 @@ pandas
 wordfreq
 datasets
 tqdm
+transformers>=4.40.0

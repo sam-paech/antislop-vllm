@@ -61,6 +61,7 @@ class ApiAntiSlopSampler:
         on_chunk_yielded_callback: Optional[Callable[[str, int], None]] = None,
         # Use model_name for tiktoken by default, fallback in code
         tiktoken_model_name_for_counting: Optional[str] = None,
+        chat_template_formatter: Optional[Any] = None, 
     ) -> None:
         self.api_client = api_client
         self.validators = validators
@@ -103,6 +104,7 @@ class ApiAntiSlopSampler:
         self.min_p = gen.get("min_p")
         self.stop_sequences = gen.get("stop_sequences")
         self.timeout = gen.get("timeout", 120)
+        self.chat_formatter = chat_template_formatter
 
         back = config.get("backtracking", {})
         self.max_retries_per_position = back.get("max_retries_per_position", 20)
@@ -428,8 +430,16 @@ class ApiAntiSlopSampler:
 
             # ---------- ask the API for more text ---------------------------
             try:
+                if self.chat_formatter is not None:
+                    full_prompt = self.chat_formatter.build_prompt(
+                        state.prompt_string,
+                        state.get_generated_text()
+                    )                    
+                else:
+                    full_prompt = state.get_full_text()
+                print(full_prompt)
                 chunk = self.api_client.generate_chunk(
-                    prompt_text    = state.get_full_text(),
+                    prompt_text    = full_prompt,
                     max_tokens     = self.chunk_size,
                     top_logprobs   = self.top_logprobs_count,
                     temperature    = self.temperature,

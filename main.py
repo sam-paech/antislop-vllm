@@ -34,8 +34,6 @@ logging.basicConfig(
     level=logging.CRITICAL,
     format="%(asctime)s [%(levelname)-5.5s] [%(name)-20.20s]: %(message)s",
 )
-# We don't need a separate script_debug_logger anymore; the root logger will be controlled.
-
 
 progress_lock = Lock()
 overall_prompts_processed_count = 0
@@ -47,6 +45,8 @@ from collections import deque
 TOK_WINDOW_SIZE = 160           # how many recent chunks to smooth across
 token_history   = deque(maxlen=TOK_WINDOW_SIZE)   # (timestamp, num_tokens)
 history_lock    = Lock()
+
+chat_formatter = None
 
 def _setup_validators(cfg: Dict[str, Any], main_logger: logging.Logger) -> List[Any]:
     validators = []
@@ -196,7 +196,8 @@ def handle_single_generation(cfg: Dict[str, Any], args: Any, script_effective_lo
         api_client=api_client,
         validators=validators,
         config=cfg,
-        tiktoken_model_name_for_counting=model_name
+        tiktoken_model_name_for_counting=model_name,
+        chat_template_formatter=chat_formatter
     )
 
     # User-facing start message for single mode
@@ -336,7 +337,8 @@ def generate_for_prompt_worker(
         config=thread_cfg,
         on_ban_event_callback=_on_ban_event_callback,
         on_chunk_yielded_callback=_on_chunk_yielded_callback,
-        tiktoken_model_name_for_counting=model_name
+        tiktoken_model_name_for_counting=model_name,
+        chat_template_formatter=chat_formatter
     )
 
     full_response_parts = []
@@ -502,6 +504,8 @@ def handle_batch_generation(cfg: Dict[str, Any], args: argparse.Namespace, scrip
 
 
 def main_cli():
+    global chat_formatter
+    
     parser = argparse.ArgumentParser(
         description="AntiSlop API Sampler. Single prompt or batch data generation.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -529,6 +533,17 @@ def main_cli():
 
     final_base_cfg = load_config(str(args.config)) 
     cfg = merge_configs(final_base_cfg, args)
+    
+    if cfg.get("chat_template_model_id"):
+        from utils.chat_template_helper import ChatTemplateFormatter
+        try:
+            chat_formatter = ChatTemplateFormatter(cfg["chat_template_model_id"])
+        except Exception as e:
+            app_logger.error(
+                f"Failed to load chat template for "
+                f"{cfg['chat_template_model_id']}: {e}"
+            )
+
 
     # --- Configure Logging Based on Effective Level ---
     # Determine the user's desired overall script output level

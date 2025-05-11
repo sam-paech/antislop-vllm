@@ -45,6 +45,13 @@ def add_common_generation_cli_args(parser: argparse.ArgumentParser, base_cfg: Di
     common_group.add_argument("--logging-level",
                               choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
                               help="Logging level for the script's operations.")
+    common_group.add_argument(
+        "--chat-template-model-id",
+        type=str,
+        help="HF model ID whose chat template should be prepended before "
+             "calling the /v1/completions endpoint."
+    )
+
 
     gen_param_group = parser.add_argument_group('Generation Parameters (override config.yaml)')
     gen_param_group.add_argument("--chunk-size", type=int, default=g_default.get("chunk_size"), help="Chunk size for API requests.")
@@ -78,8 +85,10 @@ def merge_configs(base_cfg: Dict[str, Any], cli_args: argparse.Namespace) -> Dic
     scalar_keys = [
         "prompt", "api_key", "api_base_url", "model_name",
         "slop_phrases_file", "top_n_slop_phrases",
-        "regex_blocklist_file", "logging_level" # logging_level is handled later for effective level
+        "regex_blocklist_file", "logging_level",
+        "chat_template_model_id"
     ]
+
     for key in scalar_keys:
         if args_dict.get(key) is not None:
             cfg[key] = args_dict[key]
