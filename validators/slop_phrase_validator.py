@@ -56,7 +56,7 @@ class SlopPhraseValidator(BaseValidator):
             f"scan_window_base_size={self.scan_window_base_size})"
         )
 
-    @profile_zone
+    @profile_zone()
     def check(self, state: GenerationState) -> Optional[ViolationInfo]:
         # early exits
         if not self.slop_phrases_keys or state.get_generated_length() == 0 or self.min_phrase_len == 0:

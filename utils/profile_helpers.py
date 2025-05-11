@@ -23,7 +23,8 @@ import os, sys, time, threading, atexit
 from functools import wraps
 from collections import defaultdict
 
-_ENABLED = os.getenv("ANTISLOP_PROFILE") == "1"
+#_ENABLED = os.getenv("ANTISLOP_PROFILE") == "1"
+_ENABLED = True
 _lock    = threading.Lock()
 _stats   = defaultdict(lambda: [0.0, 0])   # label -> [accum_sec, calls]
 

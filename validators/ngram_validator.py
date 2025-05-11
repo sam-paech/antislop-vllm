@@ -157,7 +157,7 @@ class NGramValidator(BaseValidator):
         return cleaned_words_map
 
 
-    @profile_zone
+    @profile_zone()
     def check(self, state: GenerationState) -> Optional[ViolationInfo]:
         if self.is_disabled or not self.banned_ngrams_tuples or state.get_generated_length() == 0 or self.min_ngram_len == 0:
             return None
