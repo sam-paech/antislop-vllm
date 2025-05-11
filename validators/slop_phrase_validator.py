@@ -75,13 +75,14 @@ class SlopPhraseValidator(BaseValidator):
         phrase            = None
         rel_pos_in_window = None
 
-        if self._aho is not None:
-            for end_idx, found in self._aho.iter(text_to_scan.lower()):
-                phrase            = found
-                rel_pos_in_window = end_idx - len(found) + 1
-                break   # earliest hit wins
-        else:
-            print('_aho missing!')
+        if False:
+            if self._aho is not None:
+                for end_idx, found in self._aho.iter(text_to_scan.lower()):
+                    phrase            = found
+                    rel_pos_in_window = end_idx - len(found) + 1
+                    break   # earliest hit wins
+            else:
+                print('_aho missing!')
 
         # ------------------------------------------------------------------
         #  2) fallback to legacy sliding-window search                       #
