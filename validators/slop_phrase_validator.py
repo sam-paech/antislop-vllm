@@ -43,8 +43,10 @@ class SlopPhraseValidator(BaseValidator):
             A.make_automaton()
             self._aho = A
             logger.info(f"Aho-Corasick automaton built ({len(self.slop_phrases_keys)} phrases).")
+            print(f"Aho-Corasick automaton built ({len(self.slop_phrases_keys)} phrases).")
         except Exception as e:
             logger.warning(f"Automaton build failed – reverting to legacy scanner: {e}")
+            print(f"Automaton build failed – reverting to legacy scanner: {e}")
 
         logger.info(
             "SlopPhraseValidator ready "
@@ -78,6 +80,8 @@ class SlopPhraseValidator(BaseValidator):
                 phrase            = found
                 rel_pos_in_window = end_idx - len(found) + 1
                 break   # earliest hit wins
+        else:
+            print('_aho missing!')
 
         # ------------------------------------------------------------------
         #  2) fallback to legacy sliding-window search                       #
