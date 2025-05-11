@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 from typing import Optional, Set, Tuple, Any # Added Any
 
 from state.generation_state import GenerationState # Keep relative import
+from state.generation_state import _decode_token
 from core.models import ViolationInfo # Keep relative import
 
 
@@ -199,9 +200,8 @@ class BaseValidator(ABC):
                 # The one from SlopPhraseValidator:
                 cur = 0
                 for idx, raw_tok in enumerate(state.generated_token_strings):
-                    # length **after** decoding (matches the cached text)
-                    dec_len = len(state._decode_token(raw_tok))   # uses the same helper as the cache
-                    nxt = cur + dec_len
+                    cur_len = len(_decode_token(raw_tok))          # decoded length
+                    nxt = cur + cur_len
                     if cur <= char_pos < nxt:
                         return idx
                     cur = nxt

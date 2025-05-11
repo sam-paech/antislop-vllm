@@ -84,7 +84,7 @@ class GenerationState:
         self.generated_token_strings = self.generated_token_strings[:generated_index]
         # rebuild decoded cache so validators stay consistent
         self._decoded_so_far = _tokens_to_text(self.generated_token_strings)
-        
+
         self.logprobs_cache = {
             k: v for k, v in self.logprobs_cache.items() if k < generated_index
         }
@@ -97,6 +97,7 @@ class GenerationState:
             )
             return
         self.generated_token_strings[generated_index] = new_token_string
+        self._decoded_so_far = _tokens_to_text(self.generated_token_strings)
 
     # ------------------------------------------------------------------ #
     #  Views as decoded text                                              #
