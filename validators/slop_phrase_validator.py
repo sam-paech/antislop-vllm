@@ -37,17 +37,18 @@ class SlopPhraseValidator(BaseValidator):
 
         # ── fast matcher (falls back to sliding window on any error) ──────────
         self._aho = None
-        try:
-            A = ahocorasick.Automaton()
-            for p in self.slop_phrases_keys:
-                A.add_word(p, p)
-            A.make_automaton()
-            self._aho = A
-            logger.info(f"Aho-Corasick automaton built ({len(self.slop_phrases_keys)} phrases).")
-            print(f"Aho-Corasick automaton built ({len(self.slop_phrases_keys)} phrases).")
-        except Exception as e:
-            logger.warning(f"Automaton build failed – reverting to legacy scanner: {e}")
-            print(f"Automaton build failed – reverting to legacy scanner: {e}")
+        if False:
+            try:
+                A = ahocorasick.Automaton()
+                for p in self.slop_phrases_keys:
+                    A.add_word(p, p)
+                A.make_automaton()
+                self._aho = A
+                logger.info(f"Aho-Corasick automaton built ({len(self.slop_phrases_keys)} phrases).")
+                print(f"Aho-Corasick automaton built ({len(self.slop_phrases_keys)} phrases).")
+            except Exception as e:
+                logger.warning(f"Automaton build failed – reverting to legacy scanner: {e}")
+                print(f"Automaton build failed – reverting to legacy scanner: {e}")
 
         logger.info(
             "SlopPhraseValidator ready "
@@ -77,7 +78,7 @@ class SlopPhraseValidator(BaseValidator):
         phrase            = None
         rel_pos_in_window = None
 
-        if True:
+        if False:
             if self._aho is not None:
                 for end_idx, found in self._aho.iter(text_to_scan.lower()):
                     phrase            = found
