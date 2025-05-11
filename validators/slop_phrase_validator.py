@@ -37,7 +37,7 @@ class SlopPhraseValidator(BaseValidator):
 
         # ── fast matcher (falls back to sliding window on any error) ──────────
         self._aho = None
-        if False:
+        if True:
             try:
                 A = ahocorasick.Automaton()
                 for p in self.slop_phrases_keys:
@@ -72,13 +72,16 @@ class SlopPhraseValidator(BaseValidator):
         if not text_to_scan.strip():
             return None
 
+
+        logger.debug("SPV-1  window len=%d", len(text_to_scan))
+
         # ------------------------------------------------------------------
         #  1) try Aho-Corasick (O(window))                                  #
         # ------------------------------------------------------------------
         phrase            = None
         rel_pos_in_window = None
 
-        if False:
+        if True:
             if self._aho is not None:
                 for end_idx, found in self._aho.iter(text_to_scan.lower()):
                     phrase            = found
@@ -98,6 +101,19 @@ class SlopPhraseValidator(BaseValidator):
                 min_phrase_len=self.min_phrase_len,
                 check_n_chars_back=len(text_to_scan)
             )
+
+        if phrase is None:
+            logger.debug("SPV-2  no phrase found in window")
+            return None
+        logger.debug("SPV-2  found '%s' at rel %d", phrase, rel_pos)
+
+        # 2) char-pos → token-idx
+        absolute_char_pos = start_scan_char_offset + rel_pos
+        tok_idx = self._char_to_token_index(state, absolute_char_pos)
+        if tok_idx is None:
+            logger.debug("SPV-3  map-fail char=%d (phrase '%s')", absolute_char_pos, phrase)
+            return None
+        logger.debug("SPV-3  map-ok tok_idx=%d", tok_idx)
 
         if not phrase:
             return None
