@@ -77,7 +77,7 @@ class SlopPhraseValidator(BaseValidator):
         phrase            = None
         rel_pos_in_window = None
 
-        if False:
+        if True:
             if self._aho is not None:
                 for end_idx, found in self._aho.iter(text_to_scan.lower()):
                     phrase            = found
