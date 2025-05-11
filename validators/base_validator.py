@@ -198,11 +198,12 @@ class BaseValidator(ABC):
                 # For the purpose of this PR, let's assume the existing char_to_token_index is sufficient.
                 # The one from SlopPhraseValidator:
                 cur = 0
-                for idx, tok_str_from_state in enumerate(state.generated_token_strings):
-                    # This uses the raw token string length from the state.
-                    next_char_offset = cur + len(tok_str_from_state)
-                    if cur <= char_pos < next_char_offset:
+                for idx, raw_tok in enumerate(state.generated_token_strings):
+                    # length **after** decoding (matches the cached text)
+                    dec_len = len(state._decode_token(raw_tok))   # uses the same helper as the cache
+                    nxt = cur + dec_len
+                    if cur <= char_pos < nxt:
                         return idx
-                    cur = next_char_offset
+                    cur = nxt
                 return None
             
