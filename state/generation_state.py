@@ -7,30 +7,28 @@ logger = logging.getLogger(__name__)
 
 
 def _decode_token(token: str) -> str:
-    """
-    Normalise a single token to plain text.
-
-    Handles both GPT-BPE (Ġ, Ċ) and SentencePiece (▁) styles, and
-    removes *all* occurrences of the space marker so leftovers never
-    reach the final string.
-    """
     if not token:
         return token
 
-    # 1) Newline marker (GPT-BPE)
+    # 1) GPT-BPE newline
     if token.startswith("Ċ"):
         token = "\n" + token[1:]
 
-    # 2) Leading-space markers
+    # 2) GPT-BPE / SP leading-space
     if token.startswith("Ġ"):
         token = " " + token[1:]
-    elif token.startswith("▁"):        # SentencePiece
+    elif token.startswith("▁"):
         token = " " + token[1:]
 
-    # 3) Any remaining '▁' inside the token (rare but possible)
-    token = token.replace("▁", " ")
+    # 3) Remove *any remaining* marker occurrences inside the token
+    token = (
+        token.replace("Ċ", "\n")
+             .replace("Ġ", " ")
+             .replace("▁", " ")
+    )
 
     return token
+
 
 
 def _tokens_to_text(tokens: List[str]) -> str:
