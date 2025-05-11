@@ -437,7 +437,7 @@ class ApiAntiSlopSampler:
                     )                    
                 else:
                     full_prompt = state.get_full_text()
-                print(full_prompt)
+                #print(full_prompt)
                 chunk = self.api_client.generate_chunk(
                     prompt_text    = full_prompt,
                     max_tokens     = self.chunk_size,
