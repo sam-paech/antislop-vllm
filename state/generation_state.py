@@ -47,6 +47,7 @@ class GenerationState:
             raise TypeError("prompt_string must be a string.")
         self.prompt_string: str = prompt_string
         self.generated_token_strings: List[str] = []
+        self._decoded_so_far: str = ""      # running decoded view
         self.logprobs_cache: Dict[int, List[Tuple[str, float]]] = {}
         logger.info(
             f"GenerationState initialised. Prompt length (chars): {len(prompt_string)}"
@@ -81,6 +82,9 @@ class GenerationState:
             f"Old length: {len(self.generated_token_strings)}"
         )
         self.generated_token_strings = self.generated_token_strings[:generated_index]
+        # rebuild decoded cache so validators stay consistent
+        self._decoded_so_far = _tokens_to_text(self.generated_token_strings)
+        
         self.logprobs_cache = {
             k: v for k, v in self.logprobs_cache.items() if k < generated_index
         }
@@ -98,7 +102,8 @@ class GenerationState:
     #  Views as decoded text                                              #
     # ------------------------------------------------------------------ #
     def get_generated_text(self) -> str:
-        return _tokens_to_text(self.generated_token_strings)
+        # O(1) – no re-join every call
+        return self._decoded_so_far
 
     def get_full_text(self) -> str:
         return self.prompt_string + self.get_generated_text()
