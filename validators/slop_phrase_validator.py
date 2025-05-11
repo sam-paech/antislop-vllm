@@ -73,7 +73,7 @@ class SlopPhraseValidator(BaseValidator):
             return None
 
 
-        logger.debug("SPV-1  window len=%d", len(text_to_scan))
+        logger.info("SPV-1  window len=%d", len(text_to_scan))
 
         # ------------------------------------------------------------------
         #  1) try Aho-Corasick (O(window))                                  #
