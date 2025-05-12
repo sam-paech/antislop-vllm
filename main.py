@@ -51,75 +51,151 @@ chat_formatter = None
 def _setup_validators(cfg: Dict[str, Any], main_logger: logging.Logger) -> List[Any]:
     validators = []
 
-    # Slop Phrase Validator
-    slop_cfg_path_str = cfg.get("slop_phrases_file")
-    slop_top_n = cfg.get("top_n_slop_phrases")
-    
-    if slop_cfg_path_str and str(slop_cfg_path_str).strip():
-        slop_dict = load_slop_phrases(str(slop_cfg_path_str), top_n=slop_top_n)
-        if slop_dict:
-            validators.append(SlopPhraseValidator(slop_dict, app_config=cfg))
-        else:
-            main_logger.debug(f"Slop phrases file '{slop_cfg_path_str}' configured but no phrases loaded (file might be empty or unreadable).")
-    elif "slop_phrases_file" in cfg:
-        main_logger.debug("Slop phrases file key ('slop_phrases_file') exists in config but is not set to a valid path or is empty.")
+    # --- Slop Phrase Validator ---
+    # CLI --slop-phrases-file overrides config.yaml's slop_phrases_file.
+    # If CLI passes "", slop_cfg_path_str becomes "".
+    slop_cfg_path_str = cfg.get("slop_phrases_file") 
+    slop_top_n = cfg.get("top_n_slop_phrases") # This is also influenced by CLI merge
 
-    # Regex Validator
+    # Only attempt to load if path_str is non-empty and not just whitespace.
+    if slop_cfg_path_str and slop_cfg_path_str.strip():
+        slop_file_path = Path(slop_cfg_path_str)
+        if slop_file_path.exists():
+            if slop_file_path.is_dir():
+                main_logger.error(f"Slop phrases file path '{slop_file_path}' is a directory. No slop phrases loaded.")
+            else:
+                slop_dict = load_slop_phrases(str(slop_file_path), top_n=slop_top_n)
+                if slop_dict:
+                    validators.append(SlopPhraseValidator(slop_dict, app_config=cfg))
+                    main_logger.info(f"Initialized SlopPhraseValidator with {len(slop_dict)} phrases from '{slop_file_path}' (top_n={slop_top_n}).")
+                else:
+                    main_logger.debug(f"Slop phrases file '{slop_file_path}' loaded but yielded no phrases (or top_n={slop_top_n} resulted in none).")
+        else:
+            main_logger.warning(f"Slop phrases file '{slop_file_path}' specified but not found.")
+    elif "slop_phrases_file" in cfg: # Key exists, but path was empty (e.g., CLI passed "")
+        main_logger.debug("Slop phrases file path was empty or None after config merge. No slop phrases loaded from file.")
+
+    # --- Regex Validator ---
+    # CLI --regex-blocklist-file overrides config.yaml's regex_blocklist_file.
+    # If CLI passes "", regex_cfg_path_str becomes "".
     regex_cfg_path_str = cfg.get("regex_blocklist_file")
-    if regex_cfg_path_str and str(regex_cfg_path_str).strip():
-        regex_list = load_regex_patterns(str(regex_cfg_path_str))
-        if regex_list:
-            validators.append(RegexValidator(regex_list))
+
+    # Only attempt to load if path_str is non-empty and not just whitespace.
+    if regex_cfg_path_str and regex_cfg_path_str.strip():
+        regex_file_path = Path(regex_cfg_path_str)
+        if regex_file_path.exists():
+            if regex_file_path.is_dir():
+                main_logger.error(f"Regex blocklist file path '{regex_file_path}' is a directory. No regex patterns loaded.")
+            else:
+                regex_list = load_regex_patterns(str(regex_file_path))
+                if regex_list:
+                    validators.append(RegexValidator(regex_list))
+                    main_logger.info(f"Initialized RegexValidator with {len(regex_list)} patterns from '{regex_file_path}'.")
+                else:
+                    main_logger.debug(f"Regex blocklist file '{regex_file_path}' loaded but yielded no patterns.")
         else:
-            main_logger.debug(f"Regex blocklist file '{regex_cfg_path_str}' configured but no patterns loaded.")
-    elif "regex_blocklist_file" in cfg:
-        main_logger.debug("Regex blocklist file key ('regex_blocklist_file') exists in config but is not set or path is empty.")
+            main_logger.warning(f"Regex blocklist file '{regex_file_path}' specified but not found.")
+    elif "regex_blocklist_file" in cfg: # Key exists, but path was empty
+        main_logger.debug("Regex blocklist file path was empty or None after config merge. No regex patterns loaded from file.")
 
-    # N-Gram Validator
+    # --- N-Gram Validator ---
     try:
-        from validators.ngram_validator import NGramValidator
+        from validators.ngram_validator import NGramValidator # Assuming this import is fine
         
-        ngram_validator_config = cfg.get("ngram_validator", {})
+        ngram_validator_config = cfg.get("ngram_validator", {}) # This reflects CLI overrides
         banned_ngrams_for_validator: List[Union[str, List[str]]] = []
-        source_of_ngrams = "nothing"
+        source_of_ngrams = "nothing" # For logging where n-grams came from
 
-        if ngram_validator_config.get("banned_list_from_cli"):
-            banned_ngrams_for_validator = ngram_validator_config["banned_list_from_cli"]
-            source_of_ngrams = "CLI --ngram-banned-list"
-        elif ngram_validator_config.get("banned_file"):
-            ngram_file_path_str = ngram_validator_config.get("banned_file")
-            if ngram_file_path_str and str(ngram_file_path_str).strip():
-                ngram_file_path = Path(ngram_file_path_str)
+        # Priority 1: CLI --ngram-banned-list (direct list of n-grams)
+        # The key "banned_list_from_cli" is specifically added by merge_configs if CLI arg is used.
+        if "banned_list_from_cli" in ngram_validator_config:
+            cli_list = ngram_validator_config.get("banned_list_from_cli")
+            if isinstance(cli_list, list) and cli_list: # Must be a non-empty list
+                banned_ngrams_for_validator = cli_list
+                source_of_ngrams = "CLI --ngram-banned-list"
+            elif cli_list is not None: # CLI arg was present but empty or invalid
+                 main_logger.debug("CLI --ngram-banned-list was provided but was empty or not a valid list.")
+        
+        # Priority 2: CLI --ngram-banned-file (file path from CLI)
+        # This is checked only if a direct CLI list wasn't used.
+        # The key "banned_file" in ngram_validator_config would have been set by CLI merge
+        # if --ngram-banned-file was passed by auto-antislop (value could be "" for iter 0).
+        elif "banned_file" in ngram_validator_config: 
+            # This means --ngram-banned-file CLI arg was used, potentially setting the value to ""
+            ngram_file_path_str_from_cli_merge = ngram_validator_config.get("banned_file")
+
+            if ngram_file_path_str_from_cli_merge and ngram_file_path_str_from_cli_merge.strip():
+                # Path from CLI is non-empty, attempt to load it.
+                ngram_file_path = Path(ngram_file_path_str_from_cli_merge)
                 if ngram_file_path.exists():
+                    if ngram_file_path.is_dir():
+                        main_logger.error(f"N-gram 'banned_file' path '{ngram_file_path}' (from CLI) is a directory. No n-grams loaded from this source.")
+                    else:
+                        try:
+                            with ngram_file_path.open("r", encoding="utf-8") as f:
+                                loaded_ngrams = json.load(f)
+                            if isinstance(loaded_ngrams, list): # N-grams should be a list
+                                banned_ngrams_for_validator = loaded_ngrams
+                                source_of_ngrams = f"file '{ngram_file_path}' (from CLI)"
+                            else:
+                                main_logger.error(f"N-gram file {ngram_file_path} (from CLI) must contain a JSON list of n-grams.")
+                        except json.JSONDecodeError:
+                            main_logger.error(f"JSON decode error in n-gram file {ngram_file_path} (from CLI).")
+                        except Exception as e: # Catch other file I/O errors
+                            main_logger.error(f"Error loading n-gram file {ngram_file_path} (from CLI): {e}.")
+                else:
+                    main_logger.warning(f"N-gram banned file specified via CLI ('{ngram_file_path}') but not found.")
+            else:
+                # ngram_file_path_str_from_cli_merge was "" or just whitespace (e.g., from auto-antislop iter 0).
+                # This means CLI explicitly said "no file", overriding config.yaml's "banned_file".
+                main_logger.debug("CLI --ngram-banned-file was empty/whitespace; no n-gram file loaded via CLI. This overrides config.yaml 'banned_file'.")
+                source_of_ngrams = "CLI (no file specified)" # Mark that CLI made an explicit "no file" decision
+        
+        # Priority 3: banned_file from config.yaml (ONLY if CLI did not provide "banned_file" key at all)
+        # This means the "banned_file" key was *not* in ngram_validator_config after CLI merge.
+        # We look at the original config.yaml setting for "banned_file" if it exists.
+        # This requires that merge_configs in utils/helpers.py *doesn't* add the "banned_file" key
+        # to ngram_validator_config if the CLI arg --ngram-banned-file was not used.
+        # The current merge_configs does: `ngram_validator_cfg["banned_file"] = str(getattr(cli_args, "ngram_banned_file"))`
+        # if the attr is not None. So, if CLI arg is not used, "banned_file" in ngram_validator_config
+        # will retain its value from the base config.yaml.
+        # Thus, this `elif` block needs to check the value of `ngram_validator_config.get("banned_file")`
+        # when `source_of_ngrams` is still "nothing".
+        elif source_of_ngrams == "nothing" and \
+             (cfg_yaml_banned_file_path := ngram_validator_config.get("banned_file")) and \
+             isinstance(cfg_yaml_banned_file_path, str) and cfg_yaml_banned_file_path.strip():
+            
+            main_logger.debug(f"Attempting to load n-grams from config.yaml (as CLI did not specify a file): ngram_validator.banned_file='{cfg_yaml_banned_file_path}'")
+            ngram_file_path = Path(cfg_yaml_banned_file_path)
+            if ngram_file_path.exists():
+                if ngram_file_path.is_dir():
+                    main_logger.error(f"config.yaml ngram_validator.banned_file path '{ngram_file_path}' is a directory.")
+                else:
                     try:
                         with ngram_file_path.open("r", encoding="utf-8") as f:
                             loaded_ngrams = json.load(f)
                         if isinstance(loaded_ngrams, list):
                             banned_ngrams_for_validator = loaded_ngrams
-                            source_of_ngrams = f"file '{ngram_file_path}'"
+                            source_of_ngrams = f"config.yaml banned_file '{ngram_file_path}'"
                         else:
-                            main_logger.error(f"N-gram file {ngram_file_path} must contain a JSON list. NGramValidator might be ineffective.")
+                            main_logger.error(f"N-gram file {ngram_file_path} (from config.yaml) must contain a JSON list.")
                     except json.JSONDecodeError:
-                        main_logger.error(f"JSON decode error in n-gram file {ngram_file_path}. NGramValidator might be ineffective.")
+                        main_logger.error(f"JSON decode error in n-gram file {ngram_file_path} (from config.yaml).")
                     except Exception as e:
-                        main_logger.error(f"Error loading n-gram file {ngram_file_path}: {e}. NGramValidator might be ineffective.")
-                else:
-                    main_logger.warning(f"N-gram banned file specified ('{ngram_file_path}') but not found.")
-            elif "banned_file" in ngram_validator_config:
-                 main_logger.debug("ngram_validator.banned_file path is empty or None in config.")
-        elif ngram_validator_config.get("banned_list"): 
-            config_list = ngram_validator_config.get("banned_list")
-            if isinstance(config_list, list) and config_list:
-                banned_ngrams_for_validator = config_list
-                source_of_ngrams = "config.yaml 'ngram_validator.banned_list'"
-            elif isinstance(config_list, list) and not config_list:
-                main_logger.debug("ngram_validator.banned_list in config.yaml is an empty list.")
-            elif "banned_list" in ngram_validator_config:
-                main_logger.warning("ngram_validator.banned_list in config.yaml is present but not a valid list or is empty.")
+                        main_logger.error(f"Error loading n-gram file {ngram_file_path} (from config.yaml): {e}.")
+            else:
+                main_logger.warning(f"N-gram banned file from config.yaml ('{ngram_file_path}') not found.")
 
-
-        if banned_ngrams_for_validator:
-            main_logger.debug(f"Initializing NGramValidator with {len(banned_ngrams_for_validator)} n-gram entries from {source_of_ngrams}.")
+        # Priority 4: banned_list from config.yaml (inline list, if no file was successfully loaded)
+        elif source_of_ngrams == "nothing" and not banned_ngrams_for_validator and \
+             (cfg_yaml_inline_list := ngram_validator_config.get("banned_list")) and \
+             isinstance(cfg_yaml_inline_list, list) and cfg_yaml_inline_list: # Must be non-empty list
+            banned_ngrams_for_validator = cfg_yaml_inline_list
+            source_of_ngrams = "config.yaml 'ngram_validator.banned_list'"
+        
+        # --- Initialize NGramValidator only if there are n-grams to ban ---
+        if banned_ngrams_for_validator: # This will be false if the list is empty
+            main_logger.info(f"Initializing NGramValidator with {len(banned_ngrams_for_validator)} n-gram entries from {source_of_ngrams}.")
             remove_sw = ngram_validator_config.get("remove_stopwords", True)
             lang = ngram_validator_config.get("language", "english")
             
@@ -128,22 +204,27 @@ def _setup_validators(cfg: Dict[str, Any], main_logger: logging.Logger) -> List[
                 remove_stopwords_flag=remove_sw,
                 language=lang
             )
-            if not ngram_validator_instance.is_disabled:
+            if not ngram_validator_instance.is_disabled: # NGramValidator might disable itself (e.g., NLTK issues)
                 validators.append(ngram_validator_instance)
             else:
-                main_logger.warning("NGramValidator was disabled due to NLTK setup issues (check logs from NGramValidator initialization).")
-        elif cfg.get("ngram_validator"):
-            main_logger.debug("NGramValidator section is configured but no banned n-grams were loaded from any source (CLI, file, or config list).")
+                main_logger.warning("NGramValidator instance was created but is disabled (e.g., NLTK resource issue). It will not be used.")
+        else: # No n-grams were loaded from any source, or CLI explicitly disabled file loading for n-grams.
+            # Log if the ngram_validator section was configured but resulted in no n-grams.
+            if "ngram_validator" in cfg: # Check if the section itself was present in the final config
+                main_logger.debug(f"No banned n-grams loaded for NGramValidator (final source decision: {source_of_ngrams}). NGramValidator will not be initialized.")
+            # If "ngram_validator" section wasn't even in cfg, no need to log anything here.
 
     except ImportError:
         main_logger.warning("Could not import NGramValidator. NLTK might not be installed or its data (punkt, stopwords) might be missing. Skipping n-gram validation.")
-    except Exception as e_ngram_init:
+    except Exception as e_ngram_init: # Catch any other unexpected error during NGramValidator setup
         main_logger.error(f"Unexpected error during NGramValidator setup: {e_ngram_init}", exc_info=True)
 
+    # --- Final summary of validators ---
     if not validators:
-        main_logger.info("No validators were configured or loaded.")
+        main_logger.info("No validators were configured or successfully initialized.")
     else:
-        main_logger.info(f"Initialized {len(validators)} validators: {[v.__class__.__name__ for v in validators]}")
+        validator_names = [v.__class__.__name__ for v in validators]
+        main_logger.info(f"Initialized {len(validators)} validators: {validator_names}")
 
     return validators
 
