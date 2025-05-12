@@ -50,7 +50,7 @@ except ImportError as e:
     TreebankWordTokenizer = None
     nltk_ngrams_util = None
 
-from utils.profile_helpers import profile_zone
+
 class NGramValidator(BaseValidator):
     """
     Hard-ban validator for specified N-grams.
@@ -157,7 +157,6 @@ class NGramValidator(BaseValidator):
         return cleaned_words_map
 
 
-    @profile_zone("NGramValidator.check")
     def check(self, state: GenerationState) -> Optional[ViolationInfo]:
         if self.is_disabled or not self.banned_ngrams_tuples or state.get_generated_length() == 0 or self.min_ngram_len == 0:
             return None

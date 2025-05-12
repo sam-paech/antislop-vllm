@@ -99,7 +99,7 @@ def detect_disallowed_sequence(
                 # Same starting pos but longer phrase → keep the longer one
                 elif global_pos == earliest_pos and len(cand) > len(earliest_phrase):
                     earliest_phrase = cand
-            if earliest_pos is not None:
-                break
+            if earliest_pos != None: # early return
+                return earliest_phrase, earliest_pos
 
     return earliest_phrase, earliest_pos

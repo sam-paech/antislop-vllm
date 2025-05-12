@@ -37,6 +37,7 @@ from state.generation_state import (
 )
 from validators.base_validator import BaseValidator
 from validators.slop_phrase_validator import SlopPhraseValidator
+from utils.slop_helpers import detect_disallowed_sequence
 
 logger = logging.getLogger(__name__)
 
