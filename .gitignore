@@ -2,3 +2,4 @@ config.yaml
 __pycache__
 experiments
 results
+.devnotes

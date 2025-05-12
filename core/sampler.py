@@ -38,6 +38,8 @@ from state.generation_state import (
 from validators.base_validator import BaseValidator
 from validators.slop_phrase_validator import SlopPhraseValidator
 from utils.slop_helpers import detect_disallowed_sequence
+from utils.profile_helpers import profile_zone
+import csv, time, datetime, os
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +68,12 @@ class ApiAntiSlopSampler:
         self.api_client = api_client
         self.validators = validators
         self.config = config
+
+        # ── per-chunk timing CSV ───────────────────────────────────────────────
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_path = f"timings_antislop_{ts}.csv"
+        self._timings_path = os.getenv("ANTISLOP_TIMINGS", default_path)
+        self._chunk_timings: list[tuple[int, int, float, float]] = []   # (chunk#, ctx_len, api_s, val_s)
 
         # Callbacks
         self.on_ban_event_callback = on_ban_event_callback
@@ -400,27 +408,25 @@ class ApiAntiSlopSampler:
                 logger.error(f"Error in on_chunk_yielded_callback: {e_cb}", exc_info=True)
         return text_to_yield
 
-    # ------------------------------------------------------------------ #
-    #  Generation loop                                                   #
-    # ------------------------------------------------------------------ #
-        # ------------------------------------------------------------------ #
-    #  Generation loop                                                   #
-    # ------------------------------------------------------------------ #
     def generate(self, prompt: str) -> Generator[str, None, None]:
         """
         Stream text while validating the *entire* prompt + generation after
-        every chunk.  We yield only tokens that are farther back than
-        `self.tail_keep_tokens`, so no future span (regex, n-gram, phrase)
-        can touch them.
-
-        Token-throughput (tok/s) is updated whenever new tokens survive the
-        current validation pass, even if the chunk needed back-tracking.
+        every chunk, and log per-chunk timing data to CSV so throughput
+        decay can be analysed afterwards.
         """
+        # ── one-off timing setup ────────────────────────────────────────────
+        if not hasattr(self, "_chunk_timings"):
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            default_path = f"timings_antislop_{ts}.csv"
+            self._timings_path = os.getenv("ANTISLOP_TIMINGS", default_path)
+            self._chunk_timings: list[tuple[int, int, float, float]] = []  # chunk, ctx_len, api_s, val_s
+
+        chunk_nr = 0
         state = GenerationState(prompt)
         last_yield_idx = 0                         # first token not yet sent
 
         while True:
-            # ---------- stop if we’ve reached the hard token limit ----------
+            # hard token limit
             if (
                 self.max_new_tokens is not None
                 and state.get_generated_length() >= self.max_new_tokens
@@ -428,41 +434,43 @@ class ApiAntiSlopSampler:
                 logger.info("Reached max_new_tokens.")
                 break
 
-            # ---------- ask the API for more text ---------------------------
+            # build prompt for backend
+            if self.chat_formatter is not None:
+                full_prompt = self.chat_formatter.build_prompt(
+                    state.prompt_string, state.get_generated_text()
+                )
+            else:
+                full_prompt = state.get_full_text()
+
+            # ── API call timing ─────────────────────────────────────────────
+            t0 = time.perf_counter()
             try:
-                if self.chat_formatter is not None:
-                    full_prompt = self.chat_formatter.build_prompt(
-                        state.prompt_string,
-                        state.get_generated_text()
-                    )                    
-                else:
-                    full_prompt = state.get_full_text()
-                #print(full_prompt)
                 chunk = self.api_client.generate_chunk(
-                    prompt_text    = full_prompt,
-                    max_tokens     = self.chunk_size,
-                    top_logprobs   = self.top_logprobs_count,
-                    temperature    = self.temperature,
-                    top_p          = self.top_p,
-                    top_k          = self.top_k,
-                    min_p          = self.min_p,
-                    timeout        = self.timeout,
-                    stop_sequences = self.stop_sequences,
+                    prompt_text     = full_prompt,
+                    max_tokens      = self.chunk_size,
+                    top_logprobs    = self.top_logprobs_count,
+                    temperature     = self.temperature,
+                    top_p           = self.top_p,
+                    top_k           = self.top_k,
+                    min_p           = self.min_p,
+                    timeout         = self.timeout,
+                    stop_sequences  = self.stop_sequences,
                 )
             except Exception as e:
                 logger.error(f"API call failed: {e}", exc_info=True)
                 break
+            api_sec = time.perf_counter() - t0
 
             if not chunk.token_strings:            # end-of-stream
                 break
 
-            # ---------- append & validate -----------------------------------
+            # ── append & validate timing ────────────────────────────────────
             pre_len = state.get_generated_length()
             state.append_chunk(chunk)
 
+            t1 = time.perf_counter()
             vio = self._run_validators(state)
-
-            if vio:                                # ▸ violation detected
+            if vio:
                 fixed = self._perform_backtrack(state, vio)
 
                 event = {
@@ -478,63 +486,61 @@ class ApiAntiSlopSampler:
                     try:
                         self.on_ban_event_callback(event)
                     except Exception as e_cb:
-                        logger.error(
-                            f"Error in on_ban_event_callback: {e_cb}",
-                            exc_info=True,
-                        )
+                        logger.error(f"Error in on_ban_event_callback: {e_cb}",
+                                    exc_info=True)
 
                 if not fixed:
                     self._suppress_violation(vio)
+            val_sec = time.perf_counter() - t1
 
-                # --------- live token accounting (even after fix) ----------
-                post_len = state.get_generated_length()
-                newly_accepted = post_len - pre_len
-                if newly_accepted and self.on_chunk_yielded_callback:
-                    try:
-                        self.on_chunk_yielded_callback("", newly_accepted)
-                    except Exception as e_cb:
-                        logger.error(
-                            f"Throughput callback failed: {e_cb}",
-                            exc_info=True,
-                        )
+            # record per-chunk stats
+            self._chunk_timings.append(
+                (chunk_nr, state.get_generated_length(), api_sec, val_sec)
+            )
+            chunk_nr += 1
 
-                # re-run loop (state may have been truncated/replaced)
-                continue
-
-            # ---------- clean chunk: count tokens & update tok/s ------------
+            # ── token-throughput bookkeeping ───────────────────────────────
             post_len = state.get_generated_length()
             newly_accepted = post_len - pre_len
             if newly_accepted and self.on_chunk_yielded_callback:
                 try:
                     self.on_chunk_yielded_callback("", newly_accepted)
                 except Exception as e_cb:
-                    logger.error(
-                        f"Throughput callback failed: {e_cb}",
-                        exc_info=True,
-                    )
+                    logger.error("Throughput callback failed: %s", e_cb, exc_info=True)
 
-            # ---------- safe-to-stream portion ------------------------------
+            # ── safe-to-stream part ────────────────────────────────────────
             safe_upto = max(0, post_len - self.tail_keep_tokens)
             if safe_upto > last_yield_idx:
                 safe_tokens = state.generated_token_strings[last_yield_idx : safe_upto]
                 text_to_yield = _tokens_to_text(safe_tokens)
                 if text_to_yield:
-                    yield text_to_yield            # callback already handled
+                    yield text_to_yield
                 last_yield_idx = safe_upto
 
-            # ---------- stop if model signalled completion ------------------
+            # stop if backend signalled completion
             if chunk.finish_reason and chunk.finish_reason != "length":
                 logger.info(f"finish_reason={chunk.finish_reason}")
                 break
 
-        # --------------------- flush residual tail --------------------------
+        # ── flush residual tail ────────────────────────────────────────────
         if state.get_generated_length() > last_yield_idx:
             residual = state.generated_token_strings[last_yield_idx :]
             text_to_yield = _tokens_to_text(residual)
             if text_to_yield:
-                yield text_to_yield                # final flush; no callback
+                yield text_to_yield
+
+        # ── write timing CSV ───────────────────────────────────────────────
+        try:
+            with open(self._timings_path, "w", newline="") as fh:
+                w = csv.writer(fh)
+                w.writerow(["chunk", "ctx_len", "api_sec", "validators_sec"])
+                w.writerows(self._chunk_timings)
+            logger.info(f"Timing log written → {self._timings_path} "
+                        f"({len(self._chunk_timings)} rows)")
+        except Exception as e:
+            logger.error(f"Could not write timing CSV: {e}")
 
         logger.info(
-            f"Generation finished. Total tokens in state="
-            f"{state.get_generated_length()}"
+            "Generation finished. Total tokens in state=%d",
+            state.get_generated_length(),
         )
