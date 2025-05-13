@@ -440,20 +440,53 @@ def generate_for_prompt_worker(
     duration_prompt = end_time_prompt - start_time_prompt
     final_generated_text = "".join(full_response_parts)
 
+    tdpo_samples = sampler.tdpo_samples  # <- collect any chosen/rejected pairs
+
     return {
-        "prompt_id": prompt_idx, "prompt": prompt_text,
+        "prompt_id": prompt_idx,
+        "prompt": prompt_text,
         "generation": final_generated_text if generation_successful else None,
         "status": "success" if generation_successful else "failed",
-        "error": error_message, "events": sampler.events,
+        "error": error_message,
+        "events": sampler.events,
         "duration_sec": duration_prompt,
         "tokens_generated_prompt": current_prompt_tokens_generated,
+        "tdpo_samples": tdpo_samples,
     }
 
 
-def handle_batch_generation(cfg: Dict[str, Any], args: argparse.Namespace, script_effective_log_level: int, main_logger: logging.Logger):
+
+def handle_batch_generation(
+    cfg: Dict[str, Any],
+    args: argparse.Namespace,
+    script_effective_log_level: int,
+    main_logger: logging.Logger
+):
     global overall_prompts_processed_count, overall_tokens_generated_count, overall_processing_start_time
     main_logger.debug("Running in batch data generation mode.")
 
+    # ──────────────────────────────────────────────────────────────────
+    #  tdpo-pair writer: enabled for iter_>0 and auto-names the file
+    # ──────────────────────────────────────────────────────────────────
+    from utils.tdpo_pairs_helper import TDPOPairWriter
+    # Resolve path precedence: CLI > config > None
+    tdpo_path = None
+    if hasattr(args, "tdpo_pairs_jsonl") and args.tdpo_pairs_jsonl is not None:
+        tdpo_path = args.tdpo_pairs_jsonl
+    elif cfg.get("tdpo_pairs_jsonl"):
+        tdpo_path = Path(cfg["tdpo_pairs_jsonl"])
+
+    if tdpo_path:
+        tdpo_writer = TDPOPairWriter(tdpo_path)
+        main_logger.info(f"tdpo-pair capture enabled → {tdpo_path}")
+    else:
+        tdpo_writer = None
+        main_logger.info("tdpo-pair capture disabled (no path specified in CLI or config).")
+
+
+    # -----------------------------------------------------------------
+    #  Prompt loading (unchanged)
+    # -----------------------------------------------------------------
     all_input_prompts_with_ids: List[Tuple[int, str]] = []
     source_prompts: List[str] = []
 
@@ -476,37 +509,51 @@ def handle_batch_generation(cfg: Dict[str, Any], args: argparse.Namespace, scrip
             return
         main_logger.debug(f"Loading prompts from HF dataset: {args.input_hf_dataset}")
         try:
-            # Suppress datasets library verbose logging unless script is in DEBUG
             if script_effective_log_level > logging.DEBUG:
                 logging.getLogger("datasets").setLevel(logging.ERROR)
                 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
-            dataset = load_dataset(args.input_hf_dataset, name=args.hf_dataset_config_name, split=args.hf_dataset_split, trust_remote_code=True)
+            dataset = load_dataset(
+                args.input_hf_dataset,
+                name=args.hf_dataset_config_name,
+                split=args.hf_dataset_split,
+                trust_remote_code=True
+            )
             disable_hf_tqdm = script_effective_log_level > logging.INFO
-            for item in tqdm(dataset, desc="Extracting HF prompts", unit="prompt", disable=disable_hf_tqdm, file=sys.stdout):
+            for item in tqdm(dataset, desc="Extracting HF prompts", unit="prompt",
+                             disable=disable_hf_tqdm, file=sys.stdout):
                 prompt_extracted = None
                 if "conversations" in item and isinstance(item["conversations"], list):
                     for turn in item["conversations"]:
                         if isinstance(turn, dict) and turn.get("from", "").lower() == "human" and "value" in turn:
                             prompt_extracted = str(turn["value"]); break
-                elif "prompt" in item and isinstance(item["prompt"], str): prompt_extracted = item["prompt"]
+                elif "prompt" in item and isinstance(item["prompt"], str):
+                    prompt_extracted = item["prompt"]
                 elif "text" in item and isinstance(item["text"], str):
                     if not any(kw in item["text"].lower() for kw in ["assistant:", "bot:", "gpt:", "\n\n"]):
-                         prompt_extracted = item["text"]
-                
+                        prompt_extracted = item["text"]
+
                 if prompt_extracted:
-                    prompt_extracted = f"Writing prompt: {prompt_extracted}\n\nWrite 1000 words to this prompt. Your response:\n"
+                    prompt_extracted = (
+                        f"Writing prompt: {prompt_extracted}\n\n"
+                        "Write 1000 words to this prompt. Your response:\n"
+                    )
                     source_prompts.append(prompt_extracted)
-                if args.max_prompts is not None and len(source_prompts) >= args.max_prompts: # Check against source_prompts length
-                    main_logger.debug(f"Reached max_prompts ({args.max_prompts}) from source during loading.")
+                if args.max_prompts is not None and len(source_prompts) >= args.max_prompts:
+                    main_logger.debug(f"Reached max_prompts ({args.max_prompts}) during loading.")
                     break
-            if not source_prompts: main_logger.warning(f"No prompts extracted from HF dataset '{args.input_hf_dataset}'.")
+            if not source_prompts:
+                main_logger.warning(f"No prompts extracted from HF dataset '{args.input_hf_dataset}'.")
         except Exception as e:
-            main_logger.error(f"Failed to load/process HF dataset {args.input_hf_dataset}: {e}", exc_info=(script_effective_log_level == logging.DEBUG)); return
-    
-    if not source_prompts: main_logger.error("No prompts to process from any source."); return
+            main_logger.error(f"Failed to load/process HF dataset {args.input_hf_dataset}: {e}",
+                              exc_info=(script_effective_log_level == logging.DEBUG))
+            return
+
+    if not source_prompts:
+        main_logger.error("No prompts to process from any source.")
+        return
     main_logger.debug(f"Total prompts loaded from source: {len(source_prompts)}.")
-    
+
     for original_idx, p_text in enumerate(source_prompts):
         all_input_prompts_with_ids.append((original_idx, p_text))
 
@@ -518,8 +565,10 @@ def handle_batch_generation(cfg: Dict[str, Any], args: argparse.Namespace, scrip
                 for line in f_in:
                     try:
                         existing_result = json.loads(line)
-                        if "prompt" in existing_result: processed_prompt_texts.add(existing_result["prompt"])
-                    except json.JSONDecodeError: main_logger.warning(f"Skipping malformed line: {line.strip()}")
+                        if "prompt" in existing_result:
+                            processed_prompt_texts.add(existing_result["prompt"])
+                    except json.JSONDecodeError:
+                        main_logger.warning(f"Skipping malformed line: {line.strip()}")
             main_logger.debug(f"Resuming. Found {len(processed_prompt_texts)} unique processed prompt texts.")
         except Exception as e:
             main_logger.error(f"Error reading existing output {args.output_jsonl}: {e}.")
@@ -535,9 +584,9 @@ def handle_batch_generation(cfg: Dict[str, Any], args: argparse.Namespace, scrip
 
     if not prompts_to_process_this_run:
         if script_effective_log_level <= logging.INFO:
-             print("All loaded prompts already processed or max_prompts limit met. Nothing new to do.")
+            print("All loaded prompts already processed or max_prompts limit met. Nothing new to do.")
         return
-    
+
     if script_effective_log_level <= logging.INFO:
         print(f"Preparing to process {len(prompts_to_process_this_run)} new prompts in this run.")
 
@@ -546,12 +595,22 @@ def handle_batch_generation(cfg: Dict[str, Any], args: argparse.Namespace, scrip
     overall_tokens_generated_count = 0
 
     try:
-        disable_main_tqdm = script_effective_log_level > logging.INFO 
+        disable_main_tqdm = script_effective_log_level > logging.INFO
         with args.output_jsonl.open("a", encoding="utf-8") as outfile:
-            with tqdm(total=len(prompts_to_process_this_run), desc="Batch Generating", unit="prompt", disable=disable_main_tqdm, file=sys.stdout) as pbar_global:
-                with ThreadPoolExecutor(max_workers=args.threads, thread_name_prefix="Generator") as executor:
+            with tqdm(total=len(prompts_to_process_this_run), desc="Batch Generating",
+                      unit="prompt", disable=disable_main_tqdm, file=sys.stdout) as pbar_global:
+                with ThreadPoolExecutor(max_workers=args.threads,
+                                        thread_name_prefix="Generator") as executor:
                     future_to_prompt_id = {
-                        executor.submit(generate_for_prompt_worker, prompt_idx, prompt_text, cfg, pbar_global, script_effective_log_level, main_logger): prompt_idx
+                        executor.submit(
+                            generate_for_prompt_worker,
+                            prompt_idx,
+                            prompt_text,
+                            cfg,
+                            pbar_global,
+                            script_effective_log_level,
+                            main_logger
+                        ): prompt_idx
                         for prompt_idx, prompt_text in prompts_to_process_this_run
                     }
                     for future in as_completed(future_to_prompt_id):
@@ -560,28 +619,43 @@ def handle_batch_generation(cfg: Dict[str, Any], args: argparse.Namespace, scrip
                             json.dump(result_data, outfile)
                             outfile.write("\n")
                             outfile.flush()
+
+                            # ── tdpo-pairs ───────────────────────────
+                            if tdpo_writer and result_data.get("tdpo_samples"):
+                                tdpo_writer.add_samples(result_data["tdpo_samples"])
+
                         except Exception as e_fut:
-                            main_logger.error(f"Critical error processing a prompt future: {e_fut}", exc_info=(script_effective_log_level == logging.DEBUG))
+                            main_logger.error(f"Critical error processing a prompt future: {e_fut}",
+                                              exc_info=(script_effective_log_level == logging.DEBUG))
                         finally:
                             with progress_lock:
-                                overall_prompts_processed_count +=1
+                                overall_prompts_processed_count += 1
                                 if not disable_main_tqdm:
                                     pbar_global.update(1)
     except IOError as e:
-        main_logger.error(f"Could not write to output file {args.output_jsonl}: {e}"); return
+        main_logger.error(f"Could not write to output file {args.output_jsonl}: {e}")
+        return
     except Exception as e:
-        main_logger.error(f"Unexpected error during batch execution: {e}", exc_info=(script_effective_log_level == logging.DEBUG)); return
+        main_logger.error(f"Unexpected error during batch execution: {e}",
+                          exc_info=(script_effective_log_level == logging.DEBUG))
+        return
 
     total_time_taken_run = time.perf_counter() - overall_processing_start_time
-    
+
+    # Flush tdpo-pairs after batch completes
+    if tdpo_writer:
+        tdpo_writer.flush()
+        main_logger.info(f"tdpo-pairs written to {tdpo_writer._outfile}")
+
     if script_effective_log_level <= logging.INFO:
         print(f"Finished processing {overall_prompts_processed_count} prompts in this run in {total_time_taken_run:.2f}s.")
         if total_time_taken_run > 0 and overall_tokens_generated_count > 0:
             avg_tok_per_sec_run = overall_tokens_generated_count / total_time_taken_run
             print(f"Overall average throughput for this run: {avg_tok_per_sec_run:.2f} tok/s.")
         print(f"Results appended to {args.output_jsonl}")
-    elif overall_prompts_processed_count > 0 :
-        main_logger.info(f"Batch run completed. Processed {overall_prompts_processed_count} prompts. Results in {args.output_jsonl}")
+    elif overall_prompts_processed_count > 0:
+        main_logger.info(f"Batch run completed. Processed {overall_prompts_processed_count} prompts. "
+                         f"Results in {args.output_jsonl}")
 
 
 def main_cli():
@@ -605,6 +679,9 @@ def main_cli():
     batch_mode_group.add_argument("--hf-dataset-config-name", type=str, default=None, help="Batch mode: Config name for HF dataset.")
     batch_mode_group.add_argument("--threads", type=int, default=1, help="Batch mode: Number of parallel generation threads.")
     batch_mode_group.add_argument("--max-prompts", type=int, default=None, help="Batch mode: Max new prompts to process from source per run.")
+    batch_mode_group.add_argument("--tdpo-pairs-jsonl", type=Path,
+                              help="Path to JSONL for tdpo chosen/rejected pairs.")
+
 
     temp_args_for_config, _ = parser.parse_known_args()
     base_cfg_path = temp_args_for_config.config if hasattr(temp_args_for_config, 'config') and temp_args_for_config.config else "config.yaml"

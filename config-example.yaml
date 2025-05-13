@@ -53,5 +53,8 @@ ngram_validator:
 # optional:
 regex_blocklist_file: "banlists/regex_not_x_but_y.json"
 
+# optional: output tokenwise dpo pairs
+#tdpo_pairs_jsonl: "results/tdpo_pairs_run1.jsonl"
+
 # Logging
 logging_level: INFO

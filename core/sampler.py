@@ -79,6 +79,10 @@ class ApiAntiSlopSampler:
         self.on_ban_event_callback = on_ban_event_callback
         self.on_chunk_yielded_callback = on_chunk_yielded_callback
 
+        # ── tokenwise-dpo-pair capture ─────────────────────────────────────────
+        self.tdpo_samples: List[Dict[str, Any]] = []
+
+
         # Tiktoken encoding for internal token counting
         # Use the provided model name or default to cl100k_base
         _tiktoken_encoding_name = tiktoken_model_name_for_counting or "cl100k_base"
@@ -389,6 +393,51 @@ class ApiAntiSlopSampler:
             f"(pool={len(tokens)}, T={self.temperature}, "
             f"min_p={self.min_p}, top_p={self.top_p}, top_k={self.top_k})"
         )
+
+        # ───────────────────────────────────────────────────────────
+        #  Record tokenwise-dpo-completion pair for training
+        # ───────────────────────────────────────────────────────────
+        try:
+            # Prompt + generation so far *before* either token
+            gen_so_far_tokens = state.generated_token_strings[:idx]
+            gen_so_far_text   = _tokens_to_text(gen_so_far_tokens)
+
+            # Chat-template context (no chosen/rejected token)
+            if self.chat_formatter is not None:
+                context_chat = self.chat_formatter.build_prompt(
+                    state.prompt_string, gen_so_far_text
+                )
+            else:
+                context_chat = state.prompt_string + gen_so_far_text
+
+            self.tdpo_samples.append({
+                "prompt_raw":       state.prompt_string,
+                "generation_raw":   gen_so_far_text,
+                "context_with_chat_template": context_chat,
+                "chosen_decoded":  _decode_token(choice),
+                "rejected_decoded": _decode_token(vio.original_token_string),
+                "chosen_raw":      choice,
+                "rejected_raw":    vio.original_token_string,
+                "validator": {
+                    "class": vio.validator_type,
+                    "rule":  (
+                        vio.details.get("phrase")
+                        or vio.details.get("ngram_string")
+                        or vio.details.get("pattern")
+                        or ""
+                    ),
+                    # quick subtype derivation
+                    "subtype": vio.validator_type if vio.validator_type != "ngram" else (
+                        f"{'trigram' if len(vio.details.get('ngram_tuple', []))==3 else 'bigram'}"
+                        #f"{'dict' if vio.details.get('remove_stopwords_active') else 'nondict'}"
+                    ),
+                },
+                # stats can be filled in post-hoc if desired
+                "stats": {},
+            })
+        except Exception as e_log:
+            logger.error(f"TDPO-pair capture failed: {e_log}", exc_info=True)
+
         return True
 
 

@@ -204,7 +204,7 @@ def merge_configs(base_cfg: Dict[str, Any], cli_args: argparse.Namespace) -> Dic
 # Keep setup_cli_args for stress_test.py or other simple scripts if needed.
 def setup_cli_args(base_cfg: Dict[str, Any], prompt_required: bool = True) -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="API AntiSlop Sampler (no local tokenizer).",
+        description="API AntiSlop Sampler.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--prompt", type=str, required=prompt_required, help="Prompt text.")
