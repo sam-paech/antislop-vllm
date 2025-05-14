@@ -112,7 +112,7 @@ def add_common_generation_cli_args(parser: argparse.ArgumentParser, base_cfg: Di
 
     ngram_group = parser.add_argument_group('N-Gram Validator Options (override config.yaml)')
     ngram_group.add_argument("--ngram-banned-list", type=str, help="Comma-separated list of n-grams to ban (e.g., \"this is one,another one\"). Each n-gram string will be tokenized. Overrides file and config list.")
-    ngram_group.add_argument("--ngram-banned-file", type=Path, default=ngram_default.get("banned_file"), help="Path to JSON file with banned n-grams (list of strings or list of lists of strings).")
+    ngram_group.add_argument("--ngram-banned-file", type=str, default=ngram_default.get("banned_file"), help="Path to JSON file with banned n-grams (list of strings or list of lists of strings).")
     ngram_group.add_argument("--ngram-remove-stopwords", type=lambda x: (str(x).lower() == 'true'), default=ngram_default.get("remove_stopwords", True), choices=[True, False], help="Remove stopwords before n-gram checking (true/false).")
     ngram_group.add_argument("--ngram-language", type=str, default=ngram_default.get("language", "english"), help="Language for n-gram stopwords.")
 
