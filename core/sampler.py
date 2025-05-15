@@ -579,15 +579,16 @@ class ApiAntiSlopSampler:
                 yield text_to_yield
 
         # ── write timing CSV ───────────────────────────────────────────────
-        try:
-            with open(self._timings_path, "w", newline="") as fh:
-                w = csv.writer(fh)
-                w.writerow(["chunk", "ctx_len", "api_sec", "validators_sec"])
-                w.writerows(self._chunk_timings)
-            logger.info(f"Timing log written → {self._timings_path} "
-                        f"({len(self._chunk_timings)} rows)")
-        except Exception as e:
-            logger.error(f"Could not write timing CSV: {e}")
+        if False: # for perf profiling
+            try:
+                with open(self._timings_path, "w", newline="") as fh:
+                    w = csv.writer(fh)
+                    w.writerow(["chunk", "ctx_len", "api_sec", "validators_sec"])
+                    w.writerows(self._chunk_timings)
+                logger.info(f"Timing log written → {self._timings_path} "
+                            f"({len(self._chunk_timings)} rows)")
+            except Exception as e:
+                logger.error(f"Could not write timing CSV: {e}")
 
         logger.info(
             "Generation finished. Total tokens in state=%d",
