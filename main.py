@@ -616,7 +616,9 @@ def handle_batch_generation(
                     for future in as_completed(future_to_prompt_id):
                         try:
                             result_data = future.result()
-                            json.dump(result_data, outfile)
+                            # write only the generation record
+                            rec = {k: v for k, v in result_data.items() if k != "tdpo_samples"}
+                            json.dump(rec, outfile)
                             outfile.write("\n")
                             outfile.flush()
 
