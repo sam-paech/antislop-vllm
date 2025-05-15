@@ -440,7 +440,7 @@ def generate_for_prompt_worker(
     duration_prompt = end_time_prompt - start_time_prompt
     final_generated_text = "".join(full_response_parts)
 
-    tdpo_samples = sampler.tdpo_samples  # <- collect any chosen/rejected pairs
+    tdpo_samples = list(sampler.tdpo_samples.values())  # <- collect any chosen/rejected pairs
 
     return {
         "prompt_id": prompt_idx,

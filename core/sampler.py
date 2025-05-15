@@ -80,7 +80,7 @@ class ApiAntiSlopSampler:
         self.on_chunk_yielded_callback = on_chunk_yielded_callback
 
         # ── tokenwise-dpo-pair capture ─────────────────────────────────────────
-        self.tdpo_samples: List[Dict[str, Any]] = []
+        self.tdpo_samples: Dict[str, Dict[str, Any]] = {}
 
 
         # Tiktoken encoding for internal token counting
@@ -410,7 +410,7 @@ class ApiAntiSlopSampler:
             else:
                 context_chat = state.prompt_string + gen_so_far_text
 
-            self.tdpo_samples.append({
+            self.tdpo_samples[context_chat] = {
                 "prompt_raw":       state.prompt_string,
                 "generation_raw":   gen_so_far_text,
                 "context_with_chat_template": context_chat,
@@ -434,7 +434,7 @@ class ApiAntiSlopSampler:
                 },
                 # stats can be filled in post-hoc if desired
                 "stats": {},
-            })
+            }
         except Exception as e_log:
             logger.error(f"TDPO-pair capture failed: {e_log}", exc_info=True)
 
