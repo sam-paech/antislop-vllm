@@ -1,6 +1,6 @@
 # validators/regex_validator.py
 import logging
-import re
+import regex as re
 from typing import List, Optional, Tuple, Dict
 
 from .base_validator import BaseValidator
