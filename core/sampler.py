@@ -167,6 +167,37 @@ class ApiAntiSlopSampler:
             f"tail_keep_tokens={self.tail_keep_tokens}"
         )
 
+        self.request_mode = config.get("generation_params", {}).get("request_mode", "chunk")
+        self.regex_interval = int(config.get("regex_validation_interval", 20))
+
+        if self.request_mode == "stream":
+            logger.info("Probing backend for streamed logprobs…")
+            ok = self._probe_stream_logprobs()
+            if not ok:
+                raise RuntimeError(
+                    "request_mode=stream but backend did not return logprobs in SSE "
+                    "events.  Use --request-mode=chunk instead."
+                )
+
+    def _probe_stream_logprobs(self) -> bool:
+        try:
+            probe = next(self.api_client.generate_stream(
+                prompt_text="Hello",
+                max_tokens=1,
+                top_logprobs=self.top_logprobs_count,
+                temperature=self.temperature,
+                top_p=self.top_p,
+                top_k=self.top_k,
+                min_p=self.min_p,
+                timeout=15,
+                stop_sequences=None,
+            ))
+            return bool(probe.logprobs)
+        except Exception as e:
+            logger.error("Probe failed: %s", e)
+            return False
+
+
     def _run_validators(self, state: GenerationState) -> Optional[ViolationInfo]:
         """
         Query every validator and return the violation that starts at the
@@ -457,7 +488,150 @@ class ApiAntiSlopSampler:
                 logger.error(f"Error in on_chunk_yielded_callback: {e_cb}", exc_info=True)
         return text_to_yield
 
-    def generate(self, prompt: str) -> Generator[str, None, None]:
+    def _run_validators_skip_regex(self, state):
+        earliest = None
+        for v in self.validators:
+            if v.__class__.__name__ == "RegexValidator":
+                continue
+            vio = v.check(state)
+            if vio and (earliest is None or vio.violation_index < earliest.violation_index):
+                earliest = vio
+        return earliest
+
+
+    def generate(self, prompt: str):
+        if self.request_mode == "stream":
+            yield from self._generate_streamwise(prompt)
+        else:
+            yield from self._generate_chunkwise(prompt)   # existing logic renamed
+
+    # ------------------------------------------------------------------ #
+    #  Streaming generation with proper restart on back-track            #
+    # ------------------------------------------------------------------ #
+    def _generate_streamwise(self, prompt: str):
+        state = GenerationState(prompt)
+        last_yield  = 0
+        regex_since = 0
+
+        while state.get_generated_length() < self.max_new_tokens:
+
+            restart_stream = False
+            natural_end    = False
+
+            remaining = self.max_new_tokens - state.get_generated_length()
+            api_prompt = (
+                state.get_full_text() if self.chat_formatter is None
+                else self.chat_formatter.build_prompt(
+                        state.prompt_string,
+                        state.get_generated_text())
+            )
+
+            stream = self.api_client.generate_stream(
+                prompt_text     = api_prompt,
+                max_tokens      = remaining,
+                top_logprobs    = self.top_logprobs_count,
+                temperature     = self.temperature,
+                top_p           = self.top_p,
+                top_k           = self.top_k,
+                min_p           = self.min_p,
+                timeout         = self.timeout,
+                stop_sequences  = self.stop_sequences,
+            )
+
+            for chunk in stream:
+                if not chunk.token_strings:
+                    if chunk.finish_reason and chunk.finish_reason != "length":
+                        natural_end = True
+                        break
+                    continue
+
+                pre_len = state.get_generated_length()
+                state.append_chunk(chunk)
+                delta = state.get_generated_length() - pre_len
+                regex_since += delta
+
+                if delta and self.on_chunk_yielded_callback:
+                    try:
+                        # empty text → caller knows this count is “accepted, not yet flushed”
+                        self.on_chunk_yielded_callback("", delta)
+                    except Exception as e_cb:
+                        logger.error("Throughput callback failed: %s", e_cb, exc_info=True)
+
+                run_regex = regex_since >= self.regex_interval
+                vio = (
+                    self._run_validators(state)
+                    if run_regex
+                    else self._run_validators_skip_regex(state)
+                )
+
+                # ---------- violation handling ------------------------------
+                if vio:
+                    if vio.validator_type != "regex":
+                        vio_full = self._run_validators(state)  # make sure regex ran
+                        vio = vio_full or vio
+
+                    self.api_client.cancel_current_stream()
+
+                    fixed = self._perform_backtrack(state, vio)
+
+                    # ---------- NEW: event bookkeeping & callback ----------
+                    event = {
+                        "type":  vio.validator_type,
+                        "index": vio.violation_index,
+                        "details": vio.details,
+                        "original_token_string": vio.original_token_string,
+                        "fixed": fixed,
+                    }
+                    self.events.append(event)
+                    if self.on_ban_event_callback:
+                        try:
+                            self.on_ban_event_callback(event)
+                        except Exception as e_cb:
+                            logger.error("Error in on_ban_event_callback: %s", e_cb, exc_info=True)
+                    # --------------------------------------------------------
+
+                    if not fixed:
+                        self._suppress_violation(vio)
+
+                    restart_stream = True
+                    regex_since = 0
+                    break
+
+
+                # ---------- yield safe prefix -------------------------------
+                safe_upto = max(0, state.get_generated_length() - self.tail_keep_tokens)
+                if safe_upto > last_yield:
+                    text_out = _tokens_to_text(
+                        state.generated_token_strings[last_yield : safe_upto])
+                    if text_out:
+                        yield self._yield_text_and_callback(text_out)
+                    last_yield = safe_upto
+
+                # ---------- natural termination inside stream --------------
+                if chunk.finish_reason and chunk.finish_reason != "length":
+                    natural_end = True
+                    break
+
+                if run_regex:
+                    regex_since = 0
+
+            # ~~~~~~~~~ end of inner for-loop ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            if restart_stream:
+                continue                    # repaired → open a new HTTP stream
+            if natural_end:
+                break                       # server said “done”
+            # else: ended by length, outer while will loop if we still want more
+
+        # ---------------- flush tail --------------------------------------
+        if state.get_generated_length() > last_yield:
+            residual = _tokens_to_text(
+                state.generated_token_strings[last_yield:])
+            if residual:
+                yield self._yield_text_and_callback(residual)
+
+
+
+    def _generate_chunkwise(self, prompt: str) -> Generator[str, None, None]:
         """
         Stream text while validating the *entire* prompt + generation after
         every chunk, and log per-chunk timing data to CSV so throughput

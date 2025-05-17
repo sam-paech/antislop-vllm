@@ -43,6 +43,7 @@ overall_processing_start_time = 0.0
 from collections import deque
 
 TOK_WINDOW_SIZE = 160           # how many recent chunks to smooth across
+RATE_WINDOW_SEC   = 5.0
 token_history   = deque(maxlen=TOK_WINDOW_SIZE)   # (timestamp, num_tokens)
 history_lock    = Lock()
 
@@ -375,29 +376,46 @@ def generate_for_prompt_worker(
         nonlocal current_prompt_tokens_generated
         global overall_tokens_generated_count
 
-        # Update per-prompt counters first
+        # --------------------------------------------------------------
+        #  Update counters (prompt + overall)                           #
+        # --------------------------------------------------------------
         current_prompt_tokens_generated += num_tokens
         now = time.perf_counter()
-
         with progress_lock:
             overall_tokens_generated_count += num_tokens
 
-        # Record this chunk in the rolling window
-        with history_lock:
-            token_history.append((now, num_tokens))
-            if len(token_history) < 2:
-                return                        # need at least one interval
+        # --------------------------------------------------------------
+        #  Smoothed token-per-second display                            #
+        # --------------------------------------------------------------
+        WITHIN_BURST_MS  = 5            # merge events ≤ 5 ms apart
+        WINDOW_SEC       = 5.0          # how far back we look
 
-            earliest_t = token_history[0][0]
-            tok_sum    = sum(t for _, t in token_history)
+        with history_lock:
+            if token_history and (now - token_history[-1][0]) * 1000 <= WITHIN_BURST_MS:
+                # Same burst ⇒ just add to the last entry’s count
+                old_t, old_n = token_history[-1]
+                token_history[-1] = (old_t, old_n + num_tokens)
+            else:
+                # New burst
+                token_history.append((now, num_tokens))
+
+            # Drop anything older than WINDOW_SEC
+            cutoff = now - WINDOW_SEC
+            while token_history and token_history[0][0] < cutoff:
+                token_history.popleft()
+
+            tok_sum    = sum(n for _, n in token_history)
+            earliest_t = token_history[0][0] if token_history else now
 
         dt = now - earliest_t
-        if dt <= 0:
-            return                           # avoid div-zero / bogus interval
+        if dt <= 1e-6:                      # safety for extremely short spans
+            return
 
-        smoothed_rate = tok_sum / dt         # tokens per second over the window
+        smoothed_rate = tok_sum / dt
         if not pbar_global.disable:
-            pbar_global.set_postfix_str(f"{smoothed_rate:.1f} tok/s", refresh=True)
+            pbar_global.set_postfix_str(f"{smoothed_rate:.1f} tok/s",
+                                        refresh=True)
+
 
 
     thread_cfg = copy.deepcopy(config)

@@ -91,6 +91,12 @@ def add_common_generation_cli_args(parser: argparse.ArgumentParser, base_cfg: Di
         help="HF model ID whose chat template should be prepended before "
              "calling the /v1/completions endpoint."
     )
+    common_group.add_argument(
+        "--request-mode",
+        choices=["chunk", "stream"],
+        help="How we contact the backend: classic chunk polling or true streaming."
+    )
+
 
 
     gen_param_group = parser.add_argument_group('Generation Parameters (override config.yaml)')
@@ -126,7 +132,7 @@ def merge_configs(base_cfg: Dict[str, Any], cli_args: argparse.Namespace) -> Dic
         "prompt", "api_key", "api_base_url", "model_name",
         "slop_phrases_file", "top_n_slop_phrases",
         "regex_blocklist_file", "logging_level",
-        "chat_template_model_id"
+        "chat_template_model_id", "request_mode",
     ]
 
     for key in scalar_keys:

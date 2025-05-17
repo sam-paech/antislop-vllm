@@ -15,7 +15,9 @@ top_n_slop_phrases: 200 # Use top N phrases from the file (assumes file is order
 
 # Generation Parameters
 generation_params:
-  chunk_size: 50
+  threads: 40
+  request_mode: chunk      # chunk | stream (stream might be buggy)
+  chunk_size: 50  # if using chunk request_mode
   top_logprobs_count: 20
   max_new_tokens: 600
   temperature: 0.7

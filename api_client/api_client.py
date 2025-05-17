@@ -31,6 +31,8 @@ class ApiClient(BaseApiClient):
         base_url: str,
         pool_size: int,
     ):
+        self._cancel_stream = False      # sampler sets this to abort
+
         if not base_url.endswith("/v1"):
             base_url = base_url.rstrip("/") + "/v1"
 
@@ -74,6 +76,147 @@ class ApiClient(BaseApiClient):
         s.mount("http://", adapter)
         s.mount("https://", adapter)
         return s
+
+    def cancel_current_stream(self):
+        self._cancel_stream = True
+
+    # ------------------------------------------------------------------ #
+    #  NEW: streaming generator                                          #
+    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------ #
+    #  NEW: streaming generator                                          #
+    # ------------------------------------------------------------------ #
+    def generate_stream(
+        self,
+        prompt_text: str,
+        max_tokens: int,
+        top_logprobs: int,
+        temperature: float,
+        top_p: Optional[float],
+        top_k: Optional[int],
+        min_p: Optional[float],
+        timeout: int,
+        stop_sequences: Optional[List[str]],
+        **kwargs,
+    ):
+        """
+        Stream /v1/completions and yield one ApiChunkResult **per token**.
+
+        * Supports vLLM, OpenAI, and OpenRouter.
+        * Keeps the same provider-specific payload tweaks used in
+        generate_chunk().
+        * Early-abort when self._cancel_stream is set by the sampler.
+        """
+
+        # ---------- build request payload ----------------------------------
+        payload: Dict[str, object] = {
+            "model":       self.model_name,
+            "prompt":      prompt_text,
+            "max_tokens":  max_tokens,
+            "temperature": temperature,
+            "top_p":       top_p,
+            "top_k":       top_k,
+            "stream":      True,
+            **kwargs,
+        }
+        if stop_sequences:
+            payload["stop"] = stop_sequences
+
+        # -- provider switches (mirror of generate_chunk) -------------------
+        if self.base_url == self.OPENAI_V1:
+            payload["logprobs"] = top_logprobs                 # OpenAI wants int
+        elif self.base_url == "https://openrouter.ai/api/v1":
+            payload.update({
+                "min_p":        min_p,
+                "logprobs":     True,
+                "top_logprobs": top_logprobs,
+                "provider": {
+                    "order": ["Fireworks"],
+                    "allow_fallbacks": False,
+                },
+            })
+        else:                                                  # vLLM family
+            payload.update({
+                "min_p":        min_p,
+                "logprobs":     top_logprobs,                  # ← vLLM wants int
+                "top_logprobs": top_logprobs,
+            })
+
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        logger.debug(f"STREAM POST {self.completion_endpoint}")
+        logger.debug(f"Payload: {json.dumps(payload)[:500]}")
+
+        # ---------- open HTTP stream ---------------------------------------
+        with self._session.post(
+            self.completion_endpoint,
+            headers=headers,
+            json=payload,
+            stream=True,
+            timeout=timeout,
+        ) as resp:
+            resp.raise_for_status()
+
+            for raw in resp.iter_lines(decode_unicode=True):
+
+                # ---- sampler asked to abort? ------------------------------
+                if self._cancel_stream:
+                    resp.close()
+                    self._cancel_stream = False
+                    break
+
+                if not raw or raw == "\n":
+                    continue
+
+                if raw.startswith("data: "):
+                    raw = raw[6:]
+
+                if raw.strip() == "[DONE]":
+                    # signal natural end-of-stream
+                    yield ApiChunkResult(
+                        generated_text="",
+                        finish_reason="stream_end",
+                    )
+                    break
+
+                # ---------- parse SSE JSON ---------------------------------
+                try:
+                    obj = json.loads(raw)
+                except json.JSONDecodeError:
+                    logger.warning("Malformed SSE line: %s", raw[:160])
+                    continue
+
+                if not obj.get("choices"):
+                    continue
+                choice = obj["choices"][0]
+
+                # -- incremental text fragment ------------------------------
+                generated_text = choice.get("text", "")
+                # (some providers use .delta.content / .message.content – those
+                # branches are left in generate_chunk; for vLLM we only need .text)
+
+                # -- extract logprobs --------------------------------------
+                token_strings: List[str] = []
+                rel_logprobs: Dict[int, List[Tuple[str, float]]] = {}
+
+                lp_obj = choice.get("logprobs")
+                if lp_obj and isinstance(lp_obj, dict):
+                    token_strings = lp_obj.get("tokens", [])
+                    # vLLM: top_logprobs is list[dict] aligned with tokens
+                    for idx, alt_dict in enumerate(lp_obj.get("top_logprobs", [])):
+                        if isinstance(alt_dict, dict):
+                            rel_logprobs[idx] = list(alt_dict.items())
+
+                yield ApiChunkResult(
+                    generated_text=generated_text,
+                    token_strings=token_strings,
+                    logprobs=rel_logprobs,
+                    finish_reason=choice.get("finish_reason"),
+                )
+
+
 
     # ------------------------------------------------------------------ #
     #  Core call                                                         #
