@@ -29,7 +29,7 @@ from typing import Dict, Generator, List, Optional, Tuple, Callable, Any
 import tiktoken # Added tiktoken
 
 from api_client.base_client import BaseApiClient
-from core.models import ApiChunkResult, ViolationInfo
+from core.models import ViolationInfo
 from state.generation_state import (
     GenerationState,
     _decode_token,
@@ -37,8 +37,7 @@ from state.generation_state import (
 )
 from validators.base_validator import BaseValidator
 from validators.slop_phrase_validator import SlopPhraseValidator
-from utils.slop_helpers import detect_disallowed_sequence
-from utils.profile_helpers import profile_zone
+from utils.sampler_helpers import select_tail_tokens
 import csv, time, datetime, os
 
 logger = logging.getLogger(__name__)
@@ -107,6 +106,7 @@ class ApiAntiSlopSampler:
 
 
         gen = config.get("generation_params", {})
+        self.gen_config = config.get("generation_params", {})
         self.chunk_size = gen.get("chunk_size", 50)
         self.top_logprobs_count = gen.get("top_logprobs_count", 1)
         self.max_new_tokens = gen.get("max_new_tokens", 600)
@@ -281,107 +281,60 @@ class ApiAntiSlopSampler:
     #  Back-tracking                                                     #
     # ------------------------------------------------------------------ #
     def _perform_backtrack(self, state: GenerationState, vio: ViolationInfo) -> bool:
-        idx       = vio.violation_index
-        original  = vio.original_token_string
-        lp_list   = state.get_logprobs(idx)
+        idx         = vio.violation_index
+        banned_id   = vio.original_token_string
+        lp_list     = state.get_logprobs(idx)                         # [(token, logp)]
 
         if not lp_list:
             logger.error("Back-track failed — no logprobs available.")
             return False
 
-        # -------------------------------------------------------------- #
-        #  Keep track of what we have already tried at this position     #
-        # -------------------------------------------------------------- #
-        tried_here = self._tried_alternatives.setdefault(idx, set())
+        tried_here   = self._tried_alternatives.setdefault(idx, set())
+        invert_probs = bool(getattr(self, "gen_config", {}).get("invert_probs", True))
 
         logger.warning(
-            f"Back-tracking @tok={idx} orig='{original}' ban='{vio.details}'."
+            f"Back-tracking @tok={idx} orig='{banned_id}' ban='{vio.details}'."
         )
 
-        banned_raw = (
-            vio.details.get("phrase")
-            or vio.details.get("match")
-            or vio.details.get("ngram_string")
-            or ""
-        )
-        banned_lower = banned_raw.lstrip().lower()
+        # ── utility: validate a single token once per call ───────────────
+        validation_cache = {}              # tok_id -> bool
+        def _is_valid(tok_id: str) -> bool:
+            if tok_id in validation_cache:
+                return validation_cache[tok_id]
+            ok, _ = self._check_hypothetical_state(state, idx, tok_id)
+            validation_cache[tok_id] = ok
+            return ok
 
-        # rank by descending log-prob
-        lp_sorted = sorted(lp_list, key=lambda t: t[1], reverse=True)
-        candidates: List[Tuple[str, float]] = []
+        # ── build base (token, prob) list after temperature softmax ──────
+        logits         = [lp for _, lp in lp_list]
+        raw_p          = [math.exp(l) for l in logits]
+        tempered       = [p ** (1 / self.temperature) for p in raw_p]
+        Z              = sum(tempered)
+        base_pairs     = [(tok, pt / Z if Z > 0 else 1 / len(tempered))
+                        for (tok, _), pt in zip(lp_list, tempered)
+                        if tok != banned_id]                         # banned removed
 
-        orig_dec = _decode_token(original).lstrip().lower()
-
-        reasons = []                 # (token, reason) tuples for debug
-
-        for tok, lp in lp_sorted:
-            dec = _decode_token(tok).lstrip().lower()
-
-            if dec == orig_dec:
-                reasons.append((tok, "identical"))
-                continue
-
-            if dec and banned_lower.startswith(dec):
-                reasons.append((tok, "banned-prefix"))
-                continue
-
-            if tok in tried_here:
-                reasons.append((tok, "already-tried"))
-                continue
-
-            ok, bad = self._check_hypothetical_state(state, idx, tok)
-            if not ok:
-                vname, detail = bad
-                reasons.append((tok, f"{vname}:{detail}"))
-                continue
-
-
-            candidates.append((tok, lp))
-            if len(candidates) >= self.max_retries_per_position:
-                break
-
-        if not candidates:
-            logger.error(
-                "Back-track: no alternative tokens pass filters.  Details: %s",
-                ", ".join(f"{t!r}:{r}" for t, r in reasons[:20])  # cap to 20 entries
-            )
+        if not base_pairs:
+            logger.error("Back-track: after removing banned token no candidates left.")
             return False
 
-        if not candidates:
-            logger.error(
-                "Back-track debug @tok=%d – banned='%s'  tried=%s  lp_top=%s",
-                idx,
-                banned_raw,
-                sorted(tried_here)[:10],                 # first few we’ve tried
-                [(t, round(lp, 2)) for t, lp in lp_sorted[:10]]  # top-10 raw list
-            )
-            return False
+        # ─────────────────────────────────────────────────────────────────
+        #  1. NEXT-TOKEN SELECTION
+        # ─────────────────────────────────────────────────────────────────
+        pairs = base_pairs.copy()
 
-
-
-        if not candidates:
-            logger.error("Back-track: no alternative tokens pass filters.")
-            return False
-
-        # -------------------------------------------------------------- #
-        #  Build initial (token, prob) list                              #
-        # -------------------------------------------------------------- #
-        logits = [lp for _, lp in candidates]
-        raw_probs = [math.exp(l) for l in logits]
-        tempered = [p ** (1 / self.temperature) for p in raw_probs]
-        Z = sum(tempered)
-        pairs = [(tok, pt / Z if Z > 0 else 1 / len(tempered))
-                 for (tok, _), pt in zip(candidates, tempered)]
-
-        # min-p filter
+        # min-p
         if self.min_p is not None:
-            floor = self.min_p * max(pt for _, pt in pairs)
+            # hard set min_p here to make resampling success more likely
+            #floor = self.min_p * max(pt for _, pt in pairs)
+            floor = 0.01 * max(pt for _, pt in pairs)
             pairs = [(tok, pt) for tok, pt in pairs if pt >= floor]
             if not pairs:
-                logger.error("Back-track: all alternatives removed by min_p.")
+                logger.error("Back-track: min_p removed all next-token candidates.")
+                print("Back-track: min_p removed all next-token candidates.", banned_id)
                 return False
 
-        # top-p (nucleus) filter
+        # top-p
         if self.top_p is not None:
             pairs.sort(key=lambda tp: tp[1], reverse=True)
             nucleus, cum = [], 0.0
@@ -392,84 +345,147 @@ class ApiAntiSlopSampler:
                     break
             pairs = nucleus
 
-        # top-k filter
+        # top-k
         if self.top_k is not None and len(pairs) > self.top_k:
             pairs = sorted(pairs, key=lambda tp: tp[1], reverse=True)[: self.top_k]
 
         if not pairs:
-            logger.error("Back-track: all alternatives removed by top_p/top_k.")
+            logger.error("Back-track: top_p/top_k removed all next-token candidates.")
+            print("Back-track: top_p/top_k removed all next-token candidates.", banned_id)
             return False
 
-        # -------------------------------------------------------------- #
-        #  Sample replacement token                                      #
-        # -------------------------------------------------------------- #
-        tokens, probs_final = zip(*pairs)
-        choice = random.choices(tokens, weights=probs_final, k=1)[0]
+        # optional probability inversion (only for next token)
+        if invert_probs:
+            p_vals = [pt for _, pt in pairs]
+            p_max, p_min = max(p_vals), min(p_vals)
+            pairs = [(tok, (p_max - pt) + p_min) for tok, pt in pairs]
+            Z_inv = sum(pt for _, pt in pairs)
+            pairs = [(tok, pt / Z_inv) for tok, pt in pairs]
 
+        # validation + “already tried” filters
+        valid_pairs = [
+            (tok, pt)
+            for tok, pt in pairs
+            if tok not in tried_here
+            and _is_valid(tok)
+        ]
 
-        # -------------------------------------------------------------- #
-        #  Commit replacement & housekeeping                             #
-        # -------------------------------------------------------------- #
-        tried_here.add(choice)                  # remember this attempt
+        if not valid_pairs:
+            logger.error("Back-track: no valid next-token candidates survived.")
+            print("Back-track: no valid next-token candidates survived.", banned_id)
+            return False
+
+        # sample replacement
+        tokens, probs = zip(*valid_pairs)
+        choice = random.choices(tokens, weights=probs, k=1)[0]
+
+        # ─────────────────────────────────────────────────────────────────
+        # 2. TAIL-CANDIDATE SELECTION  (independent knobs)
+        # ─────────────────────────────────────────────────────────────────
+        max_tail   = getattr(self, "max_chosen_tokens", 8)
+        tail_min_p = getattr(self, "tail_min_p", 0.0)
+        tail_top_k = getattr(self, "tail_top_k", 50)
+
+        tail_ids: list[str] = []
+        if max_tail > 0:
+            # re-apply tail-specific filters on **base_pairs** (no inversion!)
+            tail_pairs = base_pairs.copy()
+
+            if tail_min_p is not None:
+                floor = tail_min_p * max(pt for _, pt in tail_pairs)
+                tail_pairs = [(tok, pt) for tok, pt in tail_pairs if pt >= floor]
+
+            if tail_top_k is not None and len(tail_pairs) > tail_top_k:
+                tail_pairs = sorted(tail_pairs, key=lambda tp: tp[1], reverse=True)[: tail_top_k]
+
+            # sort ascending prob ⇒ lowest-prob tokens first
+            tail_pairs.sort(key=lambda tp: tp[1])
+
+            for tok, _ in tail_pairs:
+                if tok == banned_id or tok in tried_here:
+                    continue
+                if not _is_valid(tok):
+                    continue
+                tail_ids.append(tok)
+                if len(tail_ids) >= max_tail:
+                    break
+
+            # fallback: if nothing survived, keep at least the replacement token
+            if not tail_ids:
+                tail_ids = [choice]
+
+        multi_chosen_decoded = [_decode_token(t) for t in tail_ids]
+
+        # ── commit replacement ───────────────────────────────────────────
+        tried_here.add(choice)
         state.truncate(idx + 1)
         state.replace_token_string(idx, choice)
 
-        # purge tried-alt caches for any indices that no longer exist
+        # purge caches beyond idx
         for k in list(self._tried_alternatives):
             if k > idx:
                 del self._tried_alternatives[k]
 
         logger.warning(
             f"    ✓ replacement='{choice}' "
-            f"(pool={len(tokens)}, T={self.temperature}, "
-            f"min_p={self.min_p}, top_p={self.top_p}, top_k={self.top_k})"
+            f"(T={self.temperature}, min_p={self.min_p}, "
+            f"top_p={self.top_p}, top_k={self.top_k}, invert={invert_probs})"
         )
 
-        # ───────────────────────────────────────────────────────────
-        #  Record tokenwise-dpo-completion pair for training
-        # ───────────────────────────────────────────────────────────
+        # ── TDPO sample capture (legacy + new multi-fields) ──────────────
         try:
-            # Prompt + generation so far *before* either token
             gen_so_far_tokens = state.generated_token_strings[:idx]
             gen_so_far_text   = _tokens_to_text(gen_so_far_tokens)
 
-            # Chat-template context (no chosen/rejected token)
-            if self.chat_formatter is not None:
-                context_chat = self.chat_formatter.build_prompt(
-                    state.prompt_string, gen_so_far_text
-                )
-            else:
-                context_chat = state.prompt_string + gen_so_far_text
+            context_chat = (
+                self.chat_formatter.build_prompt(state.prompt_string, gen_so_far_text)
+                if self.chat_formatter is not None
+                else state.prompt_string + gen_so_far_text
+            )
 
             self.tdpo_samples[context_chat] = {
                 "prompt_raw":       state.prompt_string,
                 "generation_raw":   gen_so_far_text,
                 "context_with_chat_template": context_chat,
-                "chosen_decoded":  _decode_token(choice),
-                "rejected_decoded": _decode_token(vio.original_token_string),
-                "chosen_raw":      choice,
-                "rejected_raw":    vio.original_token_string,
+
+                # legacy single-token keys
+                "chosen_decoded":   _decode_token(choice),
+                "rejected_decoded": _decode_token(banned_id),
+                "chosen_raw":       choice,
+                "rejected_raw":     banned_id,
+
+                # NEW multi-token keys
+                "multi_chosen_decoded":  multi_chosen_decoded,
+                "multi_chosen_raw":      tail_ids,
+                "multi_rejected_decoded": [_decode_token(banned_id)],
+                "multi_rejected_raw":     [banned_id],
+
                 "validator": {
                     "class": vio.validator_type,
-                    "rule":  (
+                    "rule": (
                         vio.details.get("phrase")
                         or vio.details.get("ngram_string")
                         or vio.details.get("pattern")
                         or ""
                     ),
-                    # quick subtype derivation
-                    "subtype": vio.validator_type if vio.validator_type != "ngram" else (
-                        f"{'trigram' if len(vio.details.get('ngram_tuple', []))==3 else 'bigram'}"
-                        #f"{'dict' if vio.details.get('remove_stopwords_active') else 'nondict'}"
+                    "subtype": (
+                        vio.validator_type
+                        if vio.validator_type != "ngram"
+                        else (
+                            "trigram"
+                            if len(vio.details.get("ngram_tuple", [])) == 3
+                            else "bigram"
+                        )
                     ),
                 },
-                # stats can be filled in post-hoc if desired
                 "stats": {},
             }
         except Exception as e_log:
             logger.error(f"TDPO-pair capture failed: {e_log}", exc_info=True)
 
         return True
+
+
 
 
     def _suppress_violation(self, vio: ViolationInfo) -> None:

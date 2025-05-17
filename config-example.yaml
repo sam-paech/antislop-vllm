@@ -20,10 +20,11 @@ generation_params:
   chunk_size: 50  # if using chunk request_mode
   top_logprobs_count: 20
   max_new_tokens: 600
-  temperature: 0.7
+  temperature: 1.0
   top_p: 1.0
   top_k: 50
-  min_p: 0.05
+  min_p: 0.03
+  invert_probs: true # inverts the probability distribution after other sampling modifications have been applied (encourages selection of the tail)
   timeout: 120        # seconds
   stop_sequences: []
 
