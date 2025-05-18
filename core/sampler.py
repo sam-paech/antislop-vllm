@@ -275,7 +275,7 @@ class ApiAntiSlopSampler:
 
 
 
-
+    
 
         # ------------------------------------------------------------------ #
     #  Back-tracking                                                     #
@@ -283,11 +283,15 @@ class ApiAntiSlopSampler:
     def _perform_backtrack(self, state: GenerationState, vio: ViolationInfo) -> bool:
         idx         = vio.violation_index
         banned_id   = vio.original_token_string
-        lp_list     = state.get_logprobs(idx)                         # [(token, logp)]
+        lp_list     = state.get_logprobs(idx)  
+        
+        def _abort() -> bool:
+            self._suppress_violation(vio)   # ← remember: vio is already in scope
+            return False                       # [(token, logp)]
 
         if not lp_list:
             logger.error("Back-track failed — no logprobs available.")
-            return False
+            return _abort()
 
         tried_here   = self._tried_alternatives.setdefault(idx, set())
         invert_probs = bool(getattr(self, "gen_config", {}).get("invert_probs", True))
@@ -316,7 +320,7 @@ class ApiAntiSlopSampler:
 
         if not base_pairs:
             logger.error("Back-track: after removing banned token no candidates left.")
-            return False
+            return _abort()
 
         # ─────────────────────────────────────────────────────────────────
         #  1. NEXT-TOKEN SELECTION
@@ -332,7 +336,7 @@ class ApiAntiSlopSampler:
             if not pairs:
                 logger.error("Back-track: min_p removed all next-token candidates.")
                 print("Back-track: min_p removed all next-token candidates.", banned_id)
-                return False
+                return _abort()
 
         # top-p
         if self.top_p is not None:
@@ -352,7 +356,7 @@ class ApiAntiSlopSampler:
         if not pairs:
             logger.error("Back-track: top_p/top_k removed all next-token candidates.")
             print("Back-track: top_p/top_k removed all next-token candidates.", banned_id)
-            return False
+            return _abort()
 
         # optional probability inversion (only for next token)
         if invert_probs:
@@ -373,7 +377,7 @@ class ApiAntiSlopSampler:
         if not valid_pairs:
             logger.error("Back-track: no valid next-token candidates survived.")
             print("Back-track: no valid next-token candidates survived.", banned_id)
-            return False
+            return _abort()
 
         # sample replacement
         tokens, probs = zip(*valid_pairs)
