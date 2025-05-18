@@ -701,14 +701,6 @@ def main_cli():
     batch_mode_group.add_argument("--max-prompts", type=int, default=None, help="Batch mode: Max new prompts to process from source per run.")
     batch_mode_group.add_argument("--tdpo-pairs-jsonl", type=Path,
                               help="Path to JSONL for tdpo chosen/rejected pairs.")
-    
-    parser.add_argument(
-        "--force-backtrack",
-        action="store_true",
-        help="When back-tracking finds no valid alternatives, progressively "
-            "relax the sampling filters (T→1.0 → drop min_p → drop top_p → "
-            "drop top_k) instead of giving up."
-    )
 
 
     temp_args_for_config, _ = parser.parse_known_args()

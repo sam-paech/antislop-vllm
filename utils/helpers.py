@@ -49,6 +49,15 @@ def _deep_merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
             out[k] = copy.deepcopy(v)
     return out
 
+def _str2bool(s: str) -> bool:
+    if isinstance(s, bool):
+        return s
+    if s.lower() in {"true", "1", "yes", "y"}:
+        return True
+    if s.lower() in {"false", "0", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError("expected true/false")
+
 # --------------------------------------------------------------------- #
 #  Public loader                                                        #
 # --------------------------------------------------------------------- #
@@ -97,6 +106,13 @@ def add_common_generation_cli_args(parser: argparse.ArgumentParser, base_cfg: Di
         help="How we contact the backend: classic chunk polling or true streaming."
     )
 
+    common_group.add_argument("--force-backtrack", type=_str2bool,
+        metavar="true/false",
+        default=None,
+        help="If true, progressively relax decoding filters when "
+            "back-tracking runs out of candidates."
+    )
+
 
 
     gen_param_group = parser.add_argument_group('Generation Parameters (override config.yaml)')
@@ -115,6 +131,14 @@ def add_common_generation_cli_args(parser: argparse.ArgumentParser, base_cfg: Di
                                  type=int,
                                  default=b_default.get("max_retries_per_position"),
                                  help="Max retries for backtracking at a single token position.")
+    
+    gen_param_group.add_argument(
+        "--invert-probs",
+        type=_str2bool,
+        default=g_default.get("invert_probs"),
+        metavar="true/false",
+        help="Invert probability mass before sampling (overrides config.yaml)."
+    )
 
     ngram_group = parser.add_argument_group('N-Gram Validator Options (override config.yaml)')
     ngram_group.add_argument("--ngram-banned-list", type=str, help="Comma-separated list of n-grams to ban (e.g., \"this is one,another one\"). Each n-gram string will be tokenized. Overrides file and config list.")
@@ -153,7 +177,8 @@ def merge_configs(base_cfg: Dict[str, Any], cli_args: argparse.Namespace) -> Dic
     gen_params_cfg = cfg.setdefault("generation_params", {})
     gen_param_keys = [
         "chunk_size", "top_logprobs_count", "max_new_tokens",
-        "temperature", "top_p", "top_k", "min_p", "timeout"
+        "temperature", "top_p", "top_k", "min_p", "timeout",
+        "invert_probs", 
     ]
     for key in gen_param_keys:
         if hasattr(cli_args, key) and getattr(cli_args, key) is not None:
