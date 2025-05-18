@@ -24,13 +24,24 @@ generation_params:
   top_p: 1.0
   top_k: 50
   min_p: 0.03
-  invert_probs: true # inverts the probability distribution after other sampling modifications have been applied (encourages selection of the tail)
+  
+  # Inverts the probability distribution after other sampling modifications have been applied
+  #    This encourages selection of the tail of the top n candidates, for more diverse outputs.
+  #    You should probably only use this if using min_p to constrain the distribution.
+  #    otherwise you will likely get incoherent completions.
+  invert_probs: true
   timeout: 120        # seconds
   stop_sequences: []
 
 # Backtracking Configuration
 backtracking:
   max_retries_per_position: 20
+  
+  # If set to true:
+  #   when resampling after backtracking, if we don't find a valid replacement token
+  #   we progressively disable sampling options (temp, then min_p, then top_p, then top_k)
+  #   until we find a non-banned replacement or run out of candidates.
+  force_backtrack: true 
 
 # N-Gram Validator Configuration (Optional)
 ngram_validator:

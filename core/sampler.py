@@ -117,6 +117,7 @@ class ApiAntiSlopSampler:
         self.stop_sequences = gen.get("stop_sequences")
         self.timeout = gen.get("timeout", 120)
         self.chat_formatter = chat_template_formatter
+        self.force_backtrack = bool(config.get("force_backtrack", False))
 
         back = config.get("backtracking", {})
         self.max_retries_per_position = back.get("max_retries_per_position", 20)
@@ -323,65 +324,80 @@ class ApiAntiSlopSampler:
             return _abort()
 
         # ─────────────────────────────────────────────────────────────────
-        #  1. NEXT-TOKEN SELECTION
+        #  1. NEXT-TOKEN SELECTION  (honours --force-backtrack)
         # ─────────────────────────────────────────────────────────────────
-        pairs = base_pairs.copy()
 
-        # min-p
-        if self.min_p is not None:
-            # hard set min_p here to make resampling success more likely
-            #floor = self.min_p * max(pt for _, pt in pairs)
-            floor = 0.01 * max(pt for _, pt in pairs)
-            pairs = [(tok, pt) for tok, pt in pairs if pt >= floor]
-            if not pairs:
-                logger.error("Back-track: min_p removed all next-token candidates.")
-                print("Back-track: min_p removed all next-token candidates.", banned_id)
-                return _abort()
+        def _build_pairs(temp, min_p, top_p, top_k):
+            """Return candidate list [(tok, prob)] after all filters."""
+            logits  = [lp for _, lp in lp_list]
+            raw_p   = [math.exp(l) for l in logits]
+            probs_t = [p ** (1.0 / max(temp, 1e-6)) for p in raw_p]
+            Z       = sum(probs_t)
+            pairs   = [(tok, pt / Z if Z else 1 / len(probs_t))
+                    for (tok, _), pt in zip(lp_list, probs_t)
+                    if tok != banned_id]
 
-        # top-p
-        if self.top_p is not None:
-            pairs.sort(key=lambda tp: tp[1], reverse=True)
-            nucleus, cum = [], 0.0
-            for tok, pt in pairs:
-                nucleus.append((tok, pt))
-                cum += pt
-                if cum >= self.top_p:
-                    break
-            pairs = nucleus
+            # min-p filter
+            if min_p is not None and pairs:
+                floor = min_p * max(pt for _, pt in pairs)
+                pairs = [(tok, pt) for tok, pt in pairs if pt >= floor]
 
-        # top-k
-        if self.top_k is not None and len(pairs) > self.top_k:
-            pairs = sorted(pairs, key=lambda tp: tp[1], reverse=True)[: self.top_k]
+            # top-p nucleus
+            if top_p is not None and pairs:
+                pairs.sort(key=lambda tp: tp[1], reverse=True)
+                nucleus, cum = [], 0.0
+                for tok, pt in pairs:
+                    nucleus.append((tok, pt))
+                    cum += pt
+                    if cum >= top_p:
+                        break
+                pairs = nucleus
 
-        if not pairs:
-            logger.error("Back-track: top_p/top_k removed all next-token candidates.")
-            print("Back-track: top_p/top_k removed all next-token candidates.", banned_id)
-            return _abort()
+            # top-k
+            if top_k is not None and len(pairs) > top_k:
+                pairs = sorted(pairs, key=lambda tp: tp[1], reverse=True)[:top_k]
 
-        # optional probability inversion (only for next token)
-        if invert_probs:
-            p_vals = [pt for _, pt in pairs]
-            p_max, p_min = max(p_vals), min(p_vals)
-            pairs = [(tok, (p_max - pt) + p_min) for tok, pt in pairs]
-            Z_inv = sum(pt for _, pt in pairs)
-            pairs = [(tok, pt / Z_inv) for tok, pt in pairs]
+            return pairs
 
-        # validation + “already tried” filters
-        valid_pairs = [
-            (tok, pt)
-            for tok, pt in pairs
-            if tok not in tried_here
-            and _is_valid(tok)
+        # ── attempt ladder: default ⇒ relax T ⇒ drop min_p ⇒ drop top_p ⇒ drop top_k
+        attempts = [
+            (self.temperature, self.min_p, self.top_p, self.top_k),
         ]
+        if getattr(self, "force_backtrack", False):
+            attempts += [
+                (1.0,              self.min_p, self.top_p, self.top_k),
+                (1.0,              None,       self.top_p, self.top_k),
+                (1.0,              None,       None,       self.top_k),
+                (1.0,              None,       None,       None),
+            ]
+
+        valid_pairs = []
+        for relax_idx, (temp, min_p, top_p, top_k) in enumerate(attempts):
+            pairs = _build_pairs(temp, min_p, top_p, top_k)
+            if not pairs:
+                continue
+
+            # Invert only while min_p still active (relax_idx 0 or 1)
+            if invert_probs and relax_idx < 2:
+                p_vals = [pt for _, pt in pairs]
+                p_max, p_min = max(p_vals), min(p_vals)
+                pairs = [(tok, (p_max - pt) + p_min) for tok, pt in pairs]
+                Z_inv = sum(pt for _, pt in pairs)
+                pairs = [(tok, pt / Z_inv) for tok, pt in pairs]
+
+            valid_pairs = [(tok, pt) for tok, pt in pairs
+                        if tok not in tried_here and _is_valid(tok)]
+            if valid_pairs:
+                break
 
         if not valid_pairs:
-            logger.error("Back-track: no valid next-token candidates survived.")
-            print("Back-track: no valid next-token candidates survived.", banned_id)
+            logger.error("Back-track: no valid next-token candidates survived even after relaxation.")
             return _abort()
 
         # sample replacement
         tokens, probs = zip(*valid_pairs)
         choice = random.choices(tokens, weights=probs, k=1)[0]
+
 
         # ─────────────────────────────────────────────────────────────────
         # 2. TAIL-CANDIDATE SELECTION  (independent knobs)

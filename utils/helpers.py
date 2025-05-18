@@ -133,6 +133,7 @@ def merge_configs(base_cfg: Dict[str, Any], cli_args: argparse.Namespace) -> Dic
         "slop_phrases_file", "top_n_slop_phrases",
         "regex_blocklist_file", "logging_level",
         "chat_template_model_id", "request_mode",
+        "force_backtrack",
     ]
 
     for key in scalar_keys:
