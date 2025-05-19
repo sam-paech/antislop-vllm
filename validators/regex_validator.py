@@ -19,17 +19,21 @@ REGEX_MAX_WORKERS: int   = 16             # keep this many “hot” workers ali
 # Create the process pool once – stays alive for the interpreter lifetime
 _REGEX_POOL = ProcessPoolExecutor(max_workers=REGEX_MAX_WORKERS)
 
-
 # --------------------------------------------------------------------------- #
 #  Helper run in a separate process                                           #
 # --------------------------------------------------------------------------- #
+_worker_cache = {}
 def _regex_search_worker(args: Tuple[str, int, str]) -> Optional[Tuple[str, int, str]]:
     """
     Compile the giant alternation and search the given text.
     Returns (group_name, start_char_idx, matched_segment) or None.
     """
     pattern_str, flags, text = args
-    compiled = re.compile(pattern_str, flags)
+    key = (pattern_str, flags)
+    compiled = _worker_cache.get(key)
+    if compiled is None:
+        compiled = re.compile(pattern_str, flags)
+        _worker_cache[key] = compiled
     m = compiled.search(text)
     if not m:
         return None
