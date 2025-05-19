@@ -728,9 +728,9 @@ class ApiAntiSlopSampler:
             state.append_chunk(chunk)
 
             t1 = time.perf_counter()
-            t = time.time()
+            #t = time.time()
             vio = self._run_validators(state)
-            print('val 1st run', time.time() - t)
+            #print('val 1st run', time.time() - t)
             if vio:
                 fixed = self._perform_backtrack(state, vio)
 
