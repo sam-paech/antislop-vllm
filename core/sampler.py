@@ -510,8 +510,7 @@ class ApiAntiSlopSampler:
 
     def _suppress_violation(self, vio: ViolationInfo) -> None:
         for v in self.validators:
-            v_name = v.__class__.__name__.lower()
-            if vio.validator_type in v_name and hasattr(v, "ignore_violation"):
+            if getattr(v, "validator_type", None) == vio.validator_type:
                 v.ignore_violation(vio)
 
     def _yield_text_and_callback(self, text_to_yield: str) -> str:

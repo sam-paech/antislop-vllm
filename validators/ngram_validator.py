@@ -56,6 +56,7 @@ class NGramValidator(BaseValidator):
     Hard-ban validator for specified N-grams.
     Can optionally remove stopwords before checking.
     """
+    validator_type = "ngram"
 
     def __init__(
         self,

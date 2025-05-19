@@ -54,6 +54,7 @@ class RegexValidator(BaseValidator):
     Mapping   group-name → raw-pattern   is kept so we still know which rule
     was violated.
     """
+    validator_type = "regex"
 
     _GROUP_PREFIX = "P"   # group names: P0, P1, …
 

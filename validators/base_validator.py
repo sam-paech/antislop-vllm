@@ -12,6 +12,7 @@ class BaseValidator(ABC):
     """
     Common interface for sequence validators.
     """
+    validator_type: str  # subclasses must set
 
     def __init__(self) -> None:
         # (token_index, str(details_key)) ⇒ suppressed

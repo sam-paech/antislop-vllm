@@ -14,6 +14,7 @@ class SlopPhraseValidator(BaseValidator):
     """
     Hard-ban validator for an explicit phrase list.
     """
+    validator_type = "slop_phrase"
 
     def __init__(self, slop_phrases_dict: Dict[str, float], app_config: Optional[Dict[str, Any]] = None) -> None:
         super().__init__()
