@@ -281,259 +281,229 @@ class ApiAntiSlopSampler:
         # ------------------------------------------------------------------ #
     #  Back-tracking                                                     #
     # ------------------------------------------------------------------ #
-
     def _perform_backtrack(self, state: GenerationState, vio: ViolationInfo) -> bool:
-        _do_profile = getattr(self, "profile_backtrack_timing", True)
-        _perf_timings = {}
-        _perf_start_total = 0.0
-        _current_section_start_time = 0.0
+        idx         = vio.violation_index
+        banned_id   = vio.original_token_string
+        lp_list     = state.get_logprobs(idx)  
+        
+        def _abort() -> bool:
+            self._suppress_violation(vio)   # ← remember: vio is already in scope
+            return False                       # [(token, logp)]
 
-        if _do_profile:
-            _perf_timings = {
-                "total": 0.0, "init_setup": 0.0,
-                "is_valid_total": 0.0, "is_valid_calls": 0,
-                "build_pairs_total": 0.0, "build_pairs_calls": 0,
-                "next_token_selection": 0.0, "tail_selection": 0.0,
-                "commit_and_cache": 0.0, "tdpo_capture": 0.0,
-            }
-            _perf_start_total = time.perf_counter()
-            _current_section_start_time = _perf_start_total
+        if not lp_list:
+            logger.error("Back-track failed — no logprobs available.")
+            return _abort()
 
+        tried_here   = self._tried_alternatives.setdefault(idx, set())
+        invert_probs = bool(getattr(self, "gen_config", {}).get("invert_probs", True))
+
+        logger.warning(
+            f"Back-tracking @tok={idx} orig='{banned_id}' ban='{vio.details}'."
+        )
+
+        # ── utility: validate a single token once per call ───────────────
+        validation_cache = {}              # tok_id -> bool
+        def _is_valid(tok_id: str) -> bool:
+            if tok_id in validation_cache:
+                return validation_cache[tok_id]
+            ok, _ = self._check_hypothetical_state(state, idx, tok_id)
+            validation_cache[tok_id] = ok
+            return ok
+
+        # ── build base (token, prob) list after temperature softmax ──────
+        logits         = [lp for _, lp in lp_list]
+        raw_p          = [math.exp(l) for l in logits]
+        tempered       = [p ** (1 / self.temperature) for p in raw_p]
+        Z              = sum(tempered)
+        base_pairs     = [(tok, pt / Z if Z > 0 else 1 / len(tempered))
+                        for (tok, _), pt in zip(lp_list, tempered)
+                        if tok != banned_id]                         # banned removed
+
+        if not base_pairs:
+            logger.error("Back-track: after removing banned token no candidates left.")
+            return _abort()
+
+        # ─────────────────────────────────────────────────────────────────
+        #  1. NEXT-TOKEN SELECTION  (honours --force-backtrack)
+        # ─────────────────────────────────────────────────────────────────
+
+        def _build_pairs(temp, min_p, top_p, top_k):
+            """Return candidate list [(tok, prob)] after all filters."""
+            logits  = [lp for _, lp in lp_list]
+            raw_p   = [math.exp(l) for l in logits]
+            probs_t = [p ** (1.0 / max(temp, 1e-6)) for p in raw_p]
+            Z       = sum(probs_t)
+            pairs   = [(tok, pt / Z if Z else 1 / len(probs_t))
+                    for (tok, _), pt in zip(lp_list, probs_t)
+                    if tok != banned_id]
+
+            # min-p filter
+            if min_p is not None and pairs:
+                floor = min_p * max(pt for _, pt in pairs)
+                pairs = [(tok, pt) for tok, pt in pairs if pt >= floor]
+
+            # top-p nucleus
+            if top_p is not None and pairs:
+                pairs.sort(key=lambda tp: tp[1], reverse=True)
+                nucleus, cum = [], 0.0
+                for tok, pt in pairs:
+                    nucleus.append((tok, pt))
+                    cum += pt
+                    if cum >= top_p:
+                        break
+                pairs = nucleus
+
+            # top-k
+            if top_k is not None and len(pairs) > top_k:
+                pairs = sorted(pairs, key=lambda tp: tp[1], reverse=True)[:top_k]
+
+            return pairs
+
+        # ── attempt ladder: default ⇒ relax T ⇒ drop min_p ⇒ drop top_p ⇒ drop top_k
+        attempts = [
+            (self.temperature, self.min_p, self.top_p, self.top_k),
+        ]
+        if getattr(self, "force_backtrack", False):
+            attempts += [
+                (1.0,              self.min_p, self.top_p, self.top_k),
+                (1.0,              None,       self.top_p, self.top_k),
+                (1.0,              None,       None,       self.top_k),
+                (1.0,              None,       None,       None),
+            ]
+
+        valid_pairs = []
+        for relax_idx, (temp, min_p, top_p, top_k) in enumerate(attempts):
+            pairs = _build_pairs(temp, min_p, top_p, top_k)
+            if not pairs:
+                continue
+
+            # Invert only while min_p still active (relax_idx 0 or 1)
+            if invert_probs and relax_idx < 2:
+                p_vals = [pt for _, pt in pairs]
+                p_max, p_min = max(p_vals), min(p_vals)
+                pairs = [(tok, (p_max - pt) + p_min) for tok, pt in pairs]
+                Z_inv = sum(pt for _, pt in pairs)
+                pairs = [(tok, pt / Z_inv) for tok, pt in pairs]
+
+            valid_pairs = [(tok, pt) for tok, pt in pairs
+                        if tok not in tried_here and _is_valid(tok)]
+            if valid_pairs:
+                break
+
+        if not valid_pairs:
+            logger.error("Back-track: no valid next-token candidates found.")
+            return _abort()
+
+        # sample replacement
+        tokens, probs = zip(*valid_pairs)
+        choice = random.choices(tokens, weights=probs, k=1)[0]
+
+
+        # ─────────────────────────────────────────────────────────────────
+        # 2. TAIL-CANDIDATE SELECTION  (independent knobs)
+        # ─────────────────────────────────────────────────────────────────
+        max_tail   = getattr(self, "max_chosen_tokens", 8)
+        tail_min_p = getattr(self, "tail_min_p", 0.0)
+        tail_top_k = getattr(self, "tail_top_k", 50)
+
+        tail_ids: list[str] = []
+        if max_tail > 0:
+            # re-apply tail-specific filters on **base_pairs** (no inversion!)
+            tail_pairs = base_pairs.copy()
+
+            if tail_min_p is not None:
+                floor = tail_min_p * max(pt for _, pt in tail_pairs)
+                tail_pairs = [(tok, pt) for tok, pt in tail_pairs if pt >= floor]
+
+            if tail_top_k is not None and len(tail_pairs) > tail_top_k:
+                tail_pairs = sorted(tail_pairs, key=lambda tp: tp[1], reverse=True)[: tail_top_k]
+
+            # sort ascending prob ⇒ lowest-prob tokens first
+            tail_pairs.sort(key=lambda tp: tp[1])
+
+            for tok, _ in tail_pairs:
+                if tok == banned_id or tok in tried_here:
+                    continue
+                if not _is_valid(tok):
+                    continue
+                tail_ids.append(tok)
+                if len(tail_ids) >= max_tail:
+                    break
+
+            # fallback: if nothing survived, keep at least the replacement token
+            if not tail_ids:
+                tail_ids = [choice]
+
+        multi_chosen_decoded = [_decode_token(t) for t in tail_ids]
+
+        # ── commit replacement ───────────────────────────────────────────
+        tried_here.add(choice)
+        state.truncate(idx + 1)
+        state.replace_token_string(idx, choice)
+
+        # purge caches beyond idx
+        for k in list(self._tried_alternatives):
+            if k > idx:
+                del self._tried_alternatives[k]
+
+        logger.warning(
+            f"    ✓ replacement='{choice}' "
+            f"(T={self.temperature}, min_p={self.min_p}, "
+            f"top_p={self.top_p}, top_k={self.top_k}, invert={invert_probs})"
+        )
+
+        # ── TDPO sample capture (legacy + new multi-fields) ──────────────
         try:
-            # ─── Initial setup and checks ────────────────────────────────────
-            idx         = vio.violation_index
-            banned_id   = vio.original_token_string
-            lp_list     = state.get_logprobs(idx)
+            gen_so_far_tokens = state.generated_token_strings[:idx]
+            gen_so_far_text   = _tokens_to_text(gen_so_far_tokens)
 
-            def _abort_profiled() -> bool:
-                self._suppress_violation(vio)
-                return False
-
-            if not lp_list:
-                logger.error("Back-track failed — no logprobs available.")
-                if _do_profile: _perf_timings["init_setup"] += time.perf_counter() - _current_section_start_time
-                return _abort_profiled()
-
-            tried_here   = self._tried_alternatives.setdefault(idx, set())
-            invert_probs = bool(getattr(self, "gen_config", {}).get("invert_probs", True))
-
-            logger.warning(
-                f"Back-tracking @tok={idx} orig='{banned_id}' ban='{vio.details}'."
-            )
-            if _do_profile:
-                _perf_timings["init_setup"] += time.perf_counter() - _current_section_start_time
-                _current_section_start_time = time.perf_counter() # Reset for base_pairs calc + _is_valid setup
-
-            # ── utility: validate a single token once per call ───────────────
-            validation_cache = {}
-            def _is_valid(tok_id: str) -> bool:
-                _is_valid_start_local = 0.0
-                if _do_profile: _is_valid_start_local = time.perf_counter()
-
-                if tok_id in validation_cache:
-                    if _do_profile:
-                        _perf_timings["is_valid_total"] += time.perf_counter() - _is_valid_start_local
-                        _perf_timings["is_valid_calls"] += 1
-                    return validation_cache[tok_id]
-                
-                ok, _ = self._check_hypothetical_state(state, idx, tok_id)
-                validation_cache[tok_id] = ok
-
-                if _do_profile:
-                    _perf_timings["is_valid_total"] += time.perf_counter() - _is_valid_start_local
-                    _perf_timings["is_valid_calls"] += 1
-                return ok
-
-            # ── build base (token, prob) list after temperature softmax ──────
-            logits         = [lp for _, lp in lp_list]
-            raw_p          = [math.exp(l) for l in logits]
-            tempered       = [p ** (1 / self.temperature) for p in raw_p]
-            Z              = sum(tempered)
-            base_pairs     = [(tok, pt / Z if Z > 0 else 1 / len(tempered))
-                            for (tok, _), pt in zip(lp_list, tempered)
-                            if tok != banned_id]
-
-            if not base_pairs:
-                logger.error("Back-track: after removing banned token no candidates left.")
-                if _do_profile: _perf_timings["init_setup"] += time.perf_counter() - _current_section_start_time
-                return _abort_profiled()
-            
-            if _do_profile:
-                _perf_timings["init_setup"] += time.perf_counter() - _current_section_start_time
-                _current_section_start_time = time.perf_counter() # Reset for NEXT-TOKEN SELECTION
-
-            # ─────────────────────────────────────────────────────────────────
-            #  1. NEXT-TOKEN SELECTION  (honours --force-backtrack)
-            # ─────────────────────────────────────────────────────────────────
-            def _build_pairs(temp, min_p, top_p, top_k):
-                _build_pairs_start_local = 0.0
-                if _do_profile: _build_pairs_start_local = time.perf_counter()
-
-                logits_bp  = [lp for _, lp in lp_list]
-                raw_p_bp   = [math.exp(l) for l in logits_bp]
-                probs_t = [p ** (1.0 / max(temp, 1e-6)) for p in raw_p_bp]
-                Z_bp       = sum(probs_t)
-                pairs   = [(tok, pt / Z_bp if Z_bp else 1 / len(probs_t))
-                        for (tok, _), pt in zip(lp_list, probs_t)
-                        if tok != banned_id]
-
-                if min_p is not None and pairs:
-                    floor = min_p * max(pt for _, pt in pairs)
-                    pairs = [(tok, pt) for tok, pt in pairs if pt >= floor]
-
-                if top_p is not None and pairs:
-                    pairs.sort(key=lambda tp: tp[1], reverse=True)
-                    nucleus, cum = [], 0.0
-                    for tok, pt in pairs:
-                        nucleus.append((tok, pt))
-                        cum += pt
-                        if cum >= top_p:
-                            break
-                    pairs = nucleus
-
-                if top_k is not None and len(pairs) > top_k:
-                    pairs = sorted(pairs, key=lambda tp: tp[1], reverse=True)[:top_k]
-
-                if _do_profile:
-                    _perf_timings["build_pairs_total"] += time.perf_counter() - _build_pairs_start_local
-                    _perf_timings["build_pairs_calls"] += 1
-                return pairs
-
-            attempts = [(self.temperature, self.min_p, self.top_p, self.top_k)]
-            if getattr(self, "force_backtrack", False):
-                attempts += [
-                    (1.0, self.min_p, self.top_p, self.top_k),
-                    (1.0, None, self.top_p, self.top_k),
-                    (1.0, None, None, self.top_k),
-                    (1.0, None, None, None),
-                ]
-
-            valid_pairs = []
-            for relax_idx, (temp, min_p, top_p, top_k) in enumerate(attempts):
-                pairs = _build_pairs(temp, min_p, top_p, top_k)
-                if not pairs: continue
-
-                if invert_probs and relax_idx < 2:
-                    p_vals = [pt for _, pt in pairs]
-                    p_max, p_min = max(p_vals), min(p_vals)
-                    pairs = [(tok, (p_max - pt) + p_min) for tok, pt in pairs]
-                    Z_inv = sum(pt for _, pt in pairs)
-                    pairs = [(tok, pt / Z_inv) for tok, pt in pairs]
-
-                valid_pairs = [(tok, pt) for tok, pt in pairs
-                            if tok not in tried_here and _is_valid(tok)]
-                if valid_pairs: break
-
-            if not valid_pairs:
-                logger.error("Back-track: no valid next-token candidates found.")
-                if _do_profile: _perf_timings["next_token_selection"] += time.perf_counter() - _current_section_start_time
-                return _abort_profiled()
-
-            tokens, probs = zip(*valid_pairs)
-            choice = random.choices(tokens, weights=probs, k=1)[0]
-            
-            if _do_profile:
-                _perf_timings["next_token_selection"] += time.perf_counter() - _current_section_start_time
-                _current_section_start_time = time.perf_counter()
-
-            # ─────────────────────────────────────────────────────────────────
-            # 2. TAIL-CANDIDATE SELECTION  (independent knobs)
-            # ─────────────────────────────────────────────────────────────────
-            max_tail   = getattr(self, "max_chosen_tokens", 8)
-            tail_min_p = getattr(self, "tail_min_p", 0.0)
-            tail_top_k = getattr(self, "tail_top_k", 50)
-
-            tail_ids: list[str] = []
-            if max_tail > 0:
-                tail_pairs = base_pairs.copy()
-                if tail_min_p is not None and tail_pairs:
-                    floor = tail_min_p * max(pt for _, pt in tail_pairs)
-                    tail_pairs = [(tok, pt) for tok, pt in tail_pairs if pt >= floor]
-
-                if tail_top_k is not None and len(tail_pairs) > tail_top_k:
-                    tail_pairs = sorted(tail_pairs, key=lambda tp: tp[1], reverse=True)[: tail_top_k]
-
-                tail_pairs.sort(key=lambda tp: tp[1])
-                for tok, _ in tail_pairs:
-                    if tok == banned_id or tok in tried_here: continue
-                    if not _is_valid(tok): continue
-                    tail_ids.append(tok)
-                    if len(tail_ids) >= max_tail: break
-                if not tail_ids: tail_ids = [choice]
-            
-            multi_chosen_decoded = [_decode_token(t) for t in tail_ids]
-            
-            if _do_profile:
-                _perf_timings["tail_selection"] += time.perf_counter() - _current_section_start_time
-                _current_section_start_time = time.perf_counter()
-
-            # ── commit replacement ───────────────────────────────────────────
-            tried_here.add(choice)
-            state.truncate(idx + 1)
-            state.replace_token_string(idx, choice)
-
-            for k in list(self._tried_alternatives):
-                if k > idx: del self._tried_alternatives[k]
-            
-            if _do_profile:
-                _perf_timings["commit_and_cache"] += time.perf_counter() - _current_section_start_time
-                _current_section_start_time = time.perf_counter()
-
-            logger.warning(
-                f"    ✓ replacement='{choice}' "
-                f"(T={self.temperature}, min_p={self.min_p}, "
-                f"top_p={self.top_p}, top_k={self.top_k}, invert={invert_probs})"
+            context_chat = (
+                self.chat_formatter.build_prompt(state.prompt_string, gen_so_far_text)
+                if self.chat_formatter is not None
+                else state.prompt_string + gen_so_far_text
             )
 
-            # ── TDPO sample capture ──────────────────────────────────────────
-            try:
-                gen_so_far_tokens = state.generated_token_strings[:idx]
-                gen_so_far_text   = _tokens_to_text(gen_so_far_tokens)
-                context_chat = (
-                    self.chat_formatter.build_prompt(state.prompt_string, gen_so_far_text)
-                    if self.chat_formatter is not None
-                    else state.prompt_string + gen_so_far_text
-                )
-                self.tdpo_samples[context_chat] = {
-                    "prompt_raw": state.prompt_string, "generation_raw": gen_so_far_text,
-                    "context_with_chat_template": context_chat,
-                    "chosen_decoded": _decode_token(choice), "rejected_decoded": _decode_token(banned_id),
-                    "chosen_raw": choice, "rejected_raw": banned_id,
-                    "multi_chosen_decoded": multi_chosen_decoded, "multi_chosen_raw": tail_ids,
-                    "multi_rejected_decoded": [_decode_token(banned_id)], "multi_rejected_raw": [banned_id],
-                    "validator": {
-                        "class": vio.validator_type,
-                        "rule": (vio.details.get("phrase") or vio.details.get("ngram_string") or vio.details.get("pattern") or ""),
-                        "subtype": (vio.validator_type if vio.validator_type != "ngram"
-                                    else ("trigram" if len(vio.details.get("ngram_tuple", [])) == 3 else "bigram")),
-                    }, "stats": {},
-                }
-            except Exception as e_log:
-                logger.error(f"TDPO-pair capture failed: {e_log}", exc_info=True)
-            
-            if _do_profile:
-                _perf_timings["tdpo_capture"] += time.perf_counter() - _current_section_start_time
-            
-            return True
+            self.tdpo_samples[context_chat] = {
+                "prompt_raw":       state.prompt_string,
+                "generation_raw":   gen_so_far_text,
+                "context_with_chat_template": context_chat,
 
-        finally:
-            if _do_profile:
-                _perf_timings["total"] = time.perf_counter() - _perf_start_total
-                
-                parts = [f"Total: {_perf_timings['total']:.4f}s"]
-                if _perf_timings['init_setup'] > 1e-6: parts.append(f"Setup: {_perf_timings['init_setup']:.4f}s")
-                if _perf_timings['build_pairs_calls'] > 0:
-                    avg = _perf_timings['build_pairs_total'] / _perf_timings['build_pairs_calls']
-                    parts.append(f"BuildPairs(x{_perf_timings['build_pairs_calls']}): {_perf_timings['build_pairs_total']:.4f}s (avg {avg:.4f}s)")
-                if _perf_timings['is_valid_calls'] > 0:
-                    avg = _perf_timings['is_valid_total'] / _perf_timings['is_valid_calls']
-                    parts.append(f"IsValid(x{_perf_timings['is_valid_calls']}): {_perf_timings['is_valid_total']:.4f}s (avg {avg:.4f}s)")
-                if _perf_timings['next_token_selection'] > 1e-6: parts.append(f"NextTokenSel: {_perf_timings['next_token_selection']:.4f}s")
-                if _perf_timings['tail_selection'] > 1e-6: parts.append(f"TailSel: {_perf_timings['tail_selection']:.4f}s")
-                if _perf_timings['commit_and_cache'] > 1e-6: parts.append(f"Commit: {_perf_timings['commit_and_cache']:.4f}s")
-                if _perf_timings['tdpo_capture'] > 1e-6: parts.append(f"TDPO: {_perf_timings['tdpo_capture']:.4f}s")
-                
-                print(f"Backtrack Perf: {' | '.join(parts)}")
+                # legacy single-token keys
+                "chosen_decoded":   _decode_token(choice),
+                "rejected_decoded": _decode_token(banned_id),
+                "chosen_raw":       choice,
+                "rejected_raw":     banned_id,
+
+                # NEW multi-token keys
+                "multi_chosen_decoded":  multi_chosen_decoded,
+                "multi_chosen_raw":      tail_ids,
+                "multi_rejected_decoded": [_decode_token(banned_id)],
+                "multi_rejected_raw":     [banned_id],
+
+                "validator": {
+                    "class": vio.validator_type,
+                    "rule": (
+                        vio.details.get("phrase")
+                        or vio.details.get("ngram_string")
+                        or vio.details.get("pattern")
+                        or ""
+                    ),
+                    "subtype": (
+                        vio.validator_type
+                        if vio.validator_type != "ngram"
+                        else (
+                            "trigram"
+                            if len(vio.details.get("ngram_tuple", [])) == 3
+                            else "bigram"
+                        )
+                    ),
+                },
+                "stats": {},
+            }
+        except Exception as e_log:
+            logger.error(f"TDPO-pair capture failed: {e_log}", exc_info=True)
+
+        return True
 
 
 
@@ -758,7 +728,9 @@ class ApiAntiSlopSampler:
             state.append_chunk(chunk)
 
             t1 = time.perf_counter()
+            t = time.time()
             vio = self._run_validators(state)
+            print('val 1st run', time.time() - t)
             if vio:
                 fixed = self._perform_backtrack(state, vio)
 
