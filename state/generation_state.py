@@ -9,26 +9,73 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------------- #
 #  Low-level helpers                                                          #
 # --------------------------------------------------------------------------- #
+def _build_u2b_full():
+    # GPT/OpenAI table
+    bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
+    cs = bs[:]
+    n = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b); cs.append(256 + n); n += 1
+    u2b = {ord(chr(c)): b for b, c in zip(bs, cs)}
+    # Qwen/Mistral table (bytes 0‑255 → U+2500+byte)
+    for b in range(256):
+        u2b[0x2500 + b] = b
+    return u2b
+
+_U2B = _build_u2b_full()
+
+def fix_mojibake(text: str) -> str:
+    buf, changed = bytearray(), False
+    for ch in text:
+        cp = ord(ch)
+        if cp in _U2B:
+            buf.append(_U2B[cp]); changed = True
+        else:
+            buf.extend(ch.encode('utf-8'))
+    if not changed:
+        return text
+    try:
+        return buf.decode('utf-8')
+    except UnicodeDecodeError:
+        return text
+
+def fix_mojibake_iter(text: str, max_rounds: int = 3) -> str:
+    prev = text
+    for _ in range(max_rounds):
+        cur = fix_mojibake(prev)
+        if cur == prev:
+            return cur
+        prev = cur
+    return prev
+
+
 def _decode_token(token: str) -> str:
+    """
+    • Handles newline / leading-space markers exactly as before.
+    • Then runs _repair_mojibake on the *rest* of the token string.
+    """
     if not token:
         return token
 
-    # 1) GPT-BPE newline marker
-    if token.startswith("Ċ"):
-        token = "\n" + token[1:]
+    if False:
+        lead = ""
+        if token.startswith("Ċ"):
+            lead, token = "\n", token[1:]
+        elif token.startswith("Ġ"):
+            lead, token = " ", token[1:]
+        elif token.startswith("▁"):
+            lead, token = " ", token[1:]
 
-    # 2) GPT-BPE / SentencePiece leading-space markers
-    if token.startswith("Ġ"):
-        token = " " + token[1:]
-    elif token.startswith("▁"):
-        token = " " + token[1:]
+        # Any stray markers still inside the string → normalise first
+        token = token.replace("Ċ", "\n").replace("Ġ", " ").replace("▁", " ")
 
-    # 3) Strip any that remain inside the token
-    return (
-        token.replace("Ċ", "\n")
-             .replace("Ġ", " ")
-             .replace("▁", " ")
-    )
+    # Repair mojibake that is wholly contained in this single token
+    token = fix_mojibake_iter(token)
+
+    #return lead + token
+    return token
+
 
 
 # Convenience wrapper (still used elsewhere in the project)
