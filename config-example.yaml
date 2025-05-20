@@ -38,10 +38,12 @@ generation_params:
   timeout: 120        # seconds
   stop_sequences: []
 
+# Refusal detection (batch mode only)
+# This avoids adding refused generations to the generated dpo dataset
+enable_refusal_detection: true
+
 # Backtracking Configuration
 backtracking:
-  max_retries_per_position: 20
-  
   # If set to true:
   #   when resampling after backtracking, if we don't find a valid replacement token
   #   we progressively disable sampling options (temp, then min_p, then top_p, then top_k)

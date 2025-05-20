@@ -120,7 +120,7 @@ class ApiAntiSlopSampler:
         self.force_backtrack = bool(config.get("force_backtrack", False))
 
         back = config.get("backtracking", {})
-        self.max_retries_per_position = back.get("max_retries_per_position", 20)
+        self.max_retries_per_position = back.get("max_retries_per_position", 100)
 
         self.slop_info: Optional[Dict[str, object]] = None
         for v in validators:

@@ -19,18 +19,18 @@ logger = logging.getLogger(__name__) # Logger for this module
 _BUILTIN_DEFAULT: Dict[str, Any] = {
     "logging_level": "INFO",
     "generation_params": {
-        "chunk_size":        50,
+        "chunk_size":        20,
         "top_logprobs_count": 20,
         "max_new_tokens":   1200,
-        "temperature":      0.7,
+        "temperature":      1.0,
         "top_p":            1.0,
         "top_k":              50,
-        "min_p":            0.05,
+        "min_p":            0.03,
         "timeout":           120,
         "stop_sequences":   [],
     },
     "backtracking": {
-        "max_retries_per_position": 20,
+        "max_retries_per_position": 100,
     },
     "ngram_validator": {
         # no banned list/file by default
@@ -119,7 +119,10 @@ def add_common_generation_cli_args(parser: argparse.ArgumentParser, base_cfg: Di
                               type=str,
                               help="System message to prepend when using a "
                                    "chat template.")
-
+    common_group.add_argument("--enable-refusal-detection",
+                              type=_str2bool,
+                              metavar="true/false",
+                              help="Detect refusals after each generation.")
 
     gen_param_group = parser.add_argument_group('Generation Parameters (override config.yaml)')
     gen_param_group.add_argument("--chunk-size", type=int, default=g_default.get("chunk_size"), help="Chunk size for API requests.")
@@ -164,7 +167,7 @@ def merge_configs(base_cfg: Dict[str, Any], cli_args: argparse.Namespace) -> Dic
         "regex_blocklist_file", "logging_level",
         "chat_template_model_id", "request_mode",
         "force_backtrack", "prompt_template",
-        "system_prompt",
+        "system_prompt", "enable_refusal_detection",
     ]
 
     for key in scalar_keys:

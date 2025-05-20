@@ -468,17 +468,58 @@ def generate_for_prompt_worker(
 
     tdpo_samples = list(sampler.tdpo_samples.values())  # <- collect any chosen/rejected pairs
 
+    # --- optional refusal detection ------------------------------------
+    refusal_detected = False
+    refusal_label    = None
+    refusal_conf     = None
+
+    if config.get("enable_refusal_detection", False):
+        try:
+            from utils.refusal_detector import RefusalDetector
+            detector = RefusalDetector.get(
+                config.get("refusal_model_id", "NousResearch/Minos-v1")
+            )
+            refusal_detected, refusal_conf, refusal_label = detector.is_refusal(
+                prompt_text,          # user message
+                final_generated_text, # assistant reply
+                threshold=float(config.get("refusal_threshold", 0.5))
+            )
+
+
+            if refusal_detected:
+                generation_successful  = False          # mark as failure
+                error_message          = (
+                    f"refusal detected ({refusal_label}, p={refusal_conf:.3f})"
+                )
+                #final_generated_text   = ""             # empty generation
+                tdpo_samples           = []             # none collected
+                main_logger.info(
+                    f"Prompt {prompt_idx} – refusal detected "
+                    f"({refusal_label}, {refusal_conf:.3f})."
+                )
+
+        except Exception as e_det:
+            main_logger.error(f"Refusal detection failed: {e_det}", exc_info=True)
+    
+
+    # results dict — add three new keys
     return {
         "prompt_id": prompt_idx,
         "prompt": prompt_text,
-        "generation": final_generated_text if generation_successful else None,
+        #"generation": final_generated_text if generation_successful else None,
+        "generation": final_generated_text,
         "status": "success" if generation_successful else "failed",
         "error": error_message,
         "events": sampler.events,
         "duration_sec": duration_prompt,
         "tokens_generated_prompt": current_prompt_tokens_generated,
         "tdpo_samples": tdpo_samples,
+        "refusal_detected": refusal_detected,
+        "refusal_label": refusal_label,
+        "refusal_confidence": refusal_conf,
     }
+
+
 
 
 
