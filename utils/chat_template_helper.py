@@ -1,83 +1,78 @@
 # utils/chat_template_helper.py
 """
-Light-weight wrapper that turns a Hugging Face *chat template* into a
-plain-text prompt suitable for the **completions** endpoint.
+Turns a Hugging-Face chat template into a plain-text prompt compatible
+with the **/v1/completions** endpoint.
 
-Call `build_prompt(user_prompt, assistant_so_far)` each time you want to
-hit the API.  The helper guarantees that the returned string ends **just
-after** the template’s assistant-header token(s) so the model can keep
-generating.
+If *system_prompt* is supplied it is injected as a system role message
+exactly once, before the user message.
 """
 import threading
 from typing import Tuple
-
 from transformers import AutoTokenizer
 
 
 class ChatTemplateFormatter:
     _cache = {}
-    _lock = threading.Lock()
+    _lock  = threading.Lock()
 
-    def __init__(self, model_id: str) -> None:
-        self.model_id = model_id
+    def __init__(self,
+                 model_id: str,
+                 system_prompt: str = "") -> None:
+        self.model_id      = model_id
+        self.system_prompt = system_prompt or ""
 
-        # ── one-time tokenizer download / cache ─────────────────────────
         with self._lock:
             tok = self._cache.get(model_id)
             if tok is None:
-                tok = AutoTokenizer.from_pretrained(
-                    model_id, trust_remote_code=True
-                )
+                tok = AutoTokenizer.from_pretrained(model_id,
+                                                    trust_remote_code=True)
                 self._cache[model_id] = tok
         self.tokenizer = tok
 
-        # ── dissect the template into   prefix + middle + suffix ───────
-        self._prefix, self._middle = self._extract_segments()
+        self._prefix, self._middle, self._sys_placeholder = \
+            self._extract_segments()
 
-    # ------------------------------------------------------------------ #
-    #  Internal helpers                                                  #
-    # ------------------------------------------------------------------ #
-    def _extract_segments(self) -> Tuple[str, str]:
-        """
-        Return `(prefix, middle)` such that
-
-            prompt = prefix + <user_prompt> + middle + <assistant_text>
-
-        `suffix` (anything the template adds *after* assistant text,
-        e.g. `<|end_of_turn|>`) is purposely discarded so the model keeps
-        writing.
-        """
+    # ------------------------------------------------------------- #
+    # internal helpers                                              #
+    # ------------------------------------------------------------- #
+    def _extract_segments(self) -> Tuple[str, str, str]:
         ph_user = "__PLACEHOLDER_USER__"
-        ph_ass  = "__PLACEHOLDER_ASST__"
+        ph_asst = "__PLACEHOLDER_ASST__"
+        ph_sys  = "__PLACEHOLDER_SYS__"
 
-        tpl = self.tokenizer.apply_chat_template(
-            [
-                {"role": "user", "content": ph_user},
-                {"role": "assistant", "content": ph_ass},
-            ],
-            tokenize=False,
-            add_generation_prompt=False,
-        )
+        messages = []
+        if self.system_prompt:
+            messages.append({"role": "system",    "content": ph_sys})
+        messages.extend([
+            {"role": "user",      "content": ph_user},
+            {"role": "assistant", "content": ph_asst},
+        ])
 
-        i_u = tpl.find(ph_user)
-        i_a = tpl.find(ph_ass)
-        if i_u == -1 or i_a == -1 or i_a <= i_u:
-            raise ValueError(
-                f"Cannot locate placeholders in chat template for {self.model_id}"
-            )
+        tpl = self.tokenizer.apply_chat_template(messages,
+                                                 tokenize=False,
+                                                 add_generation_prompt=False)
 
-        prefix  = tpl[:i_u]
-        middle  = tpl[i_u + len(ph_user) : i_a]
-        return prefix, middle
+        i_user = tpl.find(ph_user)
+        i_asst = tpl.find(ph_asst)
+        if i_user == -1 or i_asst == -1 or i_asst <= i_user:
+            raise ValueError("placeholders not found in template")
 
-    # ------------------------------------------------------------------ #
-    #  Public API                                                        #
-    # ------------------------------------------------------------------ #
-    def build_prompt(
-        self, user_prompt: str, assistant_so_far: str = ""
-    ) -> str:
+        prefix = tpl[:i_user]                       # up to user placeholder
+        middle = tpl[i_user + len(ph_user): i_asst] # between user & asst
+        return prefix, middle, ph_sys
+
+    # ------------------------------------------------------------- #
+    # public API                                                    #
+    # ------------------------------------------------------------- #
+    def build_prompt(self,
+                     user_prompt: str,
+                     assistant_so_far: str = "") -> str:
         """
-        Compose the prompt for the *completions* call.
+        Returns *prefix + user_prompt + middle + assistant_so_far*,
+        with the system prompt already inserted (if any).
         """
-        prompt = f"{self._prefix}{user_prompt}{self._middle}{assistant_so_far}"
-        return prompt
+        prefix = self._prefix
+        if self.system_prompt:
+            prefix = prefix.replace(self._sys_placeholder, self.system_prompt)
+
+        return f"{prefix}{user_prompt}{self._middle}{assistant_so_far}"

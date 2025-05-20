@@ -266,7 +266,15 @@ def handle_single_generation(cfg: Dict[str, Any], args: Any, script_effective_lo
     if not prompt:
         main_logger.error("Prompt missing for single generation mode.")
         return
-
+    
+    template = cfg.get("prompt_template", "")
+    if template:
+        try:
+            prompt = template.format(prompt=prompt)
+        except KeyError as e:
+            main_logger.error(f"Invalid prompt_template placeholder: {e}")
+            return
+    
     validators = _setup_validators(cfg, main_logger)
     api_client = _get_api_client(cfg, main_logger)
     if not api_client:
@@ -552,10 +560,16 @@ def handle_batch_generation(
                         prompt_extracted = item["text"]
 
                 if prompt_extracted:
-                    prompt_extracted = (
-                        f"Writing prompt: {prompt_extracted}\n\n"
-                        "Write 1000 words to this prompt. Your response:\n"
+                    template = cfg.get(
+                        "prompt_template",
+                        "{prompt}"
                     )
+
+                    try:
+                        prompt_extracted = template.format(prompt=prompt_extracted)
+                    except KeyError as e:
+                        main_logger.error(f"prompt_template is missing placeholder {e!s}")
+                        return
                     source_prompts.append(prompt_extracted)
                 if args.max_prompts is not None and len(source_prompts) >= args.max_prompts:
                     main_logger.debug(f"Reached max_prompts ({args.max_prompts}) during loading.")
@@ -715,12 +729,12 @@ def main_cli():
     if cfg.get("chat_template_model_id"):
         from utils.chat_template_helper import ChatTemplateFormatter
         try:
-            chat_formatter = ChatTemplateFormatter(cfg["chat_template_model_id"])
-        except Exception as e:
-            app_logger.error(
-                f"Failed to load chat template for "
-                f"{cfg['chat_template_model_id']}: {e}"
+            chat_formatter = ChatTemplateFormatter(
+                cfg["chat_template_model_id"],
+                system_prompt=cfg.get("system_prompt", "")
             )
+        except Exception as e:
+            app_logger.error(f"Failed to load chat template: {e}")
 
 
     # --- Configure Logging Based on Effective Level ---

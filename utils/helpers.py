@@ -105,14 +105,20 @@ def add_common_generation_cli_args(parser: argparse.ArgumentParser, base_cfg: Di
         choices=["chunk", "stream"],
         help="How we contact the backend: classic chunk polling or true streaming."
     )
-
     common_group.add_argument("--force-backtrack", type=_str2bool,
         metavar="true/false",
         default=None,
         help="If true, progressively relax decoding filters when "
             "back-tracking runs out of candidates."
     )
-
+    common_group.add_argument("--prompt-template",
+                              type=str,
+                              help="Python‐format string applied to --prompt "
+                                   "(uses {prompt} placeholder).")
+    common_group.add_argument("--system-prompt",
+                              type=str,
+                              help="System message to prepend when using a "
+                                   "chat template.")
 
 
     gen_param_group = parser.add_argument_group('Generation Parameters (override config.yaml)')
@@ -157,7 +163,8 @@ def merge_configs(base_cfg: Dict[str, Any], cli_args: argparse.Namespace) -> Dic
         "slop_phrases_file", "top_n_slop_phrases",
         "regex_blocklist_file", "logging_level",
         "chat_template_model_id", "request_mode",
-        "force_backtrack",
+        "force_backtrack", "prompt_template",
+        "system_prompt",
     ]
 
     for key in scalar_keys:
