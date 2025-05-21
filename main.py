@@ -628,29 +628,100 @@ def handle_batch_generation(
         return
     main_logger.debug(f"Total prompts loaded from source: {len(source_prompts)}.")
 
-    for original_idx, p_text in enumerate(source_prompts):
-        all_input_prompts_with_ids.append((original_idx, p_text))
+    # -----------------------------------------------------------------
+    #  Index all prompts by their stable id
+    # -----------------------------------------------------------------
+    all_input_prompts_with_ids: List[Tuple[int, str]] = [
+        (idx, p_text) for idx, p_text in enumerate(source_prompts)
+    ]
+    id2prompt: Dict[int, str] = {idx: txt for idx, txt in all_input_prompts_with_ids}
 
-    processed_prompt_texts = set()
+    # -----------------------------------------------------------------
+    #  1)  Already processed in THIS output_jsonl
+    # -----------------------------------------------------------------
+    existing_output_ids: set[str] = set()          # stringified ids
     if args.output_jsonl.exists():
         main_logger.debug(f"Output file {args.output_jsonl} exists. Attempting to resume.")
         try:
             with args.output_jsonl.open("r", encoding="utf-8") as f_in:
                 for line in f_in:
                     try:
-                        existing_result = json.loads(line)
-                        if "prompt" in existing_result:
-                            processed_prompt_texts.add(existing_result["prompt"])
+                        rec = json.loads(line)
                     except json.JSONDecodeError:
                         main_logger.warning(f"Skipping malformed line: {line.strip()}")
-            main_logger.debug(f"Resuming. Found {len(processed_prompt_texts)} unique processed prompt texts.")
+                        continue
+                    if "prompt_id" in rec:
+                        existing_output_ids.add(str(rec["prompt_id"]))
+            main_logger.debug(f"Resuming. Found {len(existing_output_ids)} unique prompt ids.")
         except Exception as e:
             main_logger.error(f"Error reading existing output {args.output_jsonl}: {e}.")
 
-    prompts_to_process_this_run = []
-    for original_idx, p_text in all_input_prompts_with_ids:
-        if p_text not in processed_prompt_texts:
-            prompts_to_process_this_run.append((original_idx, p_text))
+    # -----------------------------------------------------------------
+    #  2)  Refusals from --refusals-file
+    # -----------------------------------------------------------------
+    refused_ids: set[str] = set()                  # stringified ids
+    if getattr(args, "refusals_file", None):
+        ref_path: Path = args.refusals_file
+        if ref_path.exists():
+            try:
+                with ref_path.open("r", encoding="utf-8") as fh:
+                    for ln in fh:
+                        try:
+                            rec = json.loads(ln)
+                        except json.JSONDecodeError:
+                            continue
+
+                        if rec.get("refusal_detected") is True and "prompt_id" in rec:
+                            refused_ids.add(str(rec["prompt_id"]))
+            except Exception as e:
+                main_logger.error(f"Could not read refusals file {ref_path}: {e}")
+        else:
+            main_logger.warning(f"--refusals-file {ref_path} not found; ignored.")
+
+    # -----------------------------------------------------------------
+    #  3)  Combine: anything in either set is skipped
+    # -----------------------------------------------------------------
+    processed_ids: set[str] = existing_output_ids | refused_ids
+
+    # -----------------------------------------------------------------
+    #  4)  Write PLACEHOLDER records for newly-skipped refusals
+    #      (only those not already present in the current output file)
+    # -----------------------------------------------------------------
+    new_placeholders: List[int] = [
+        int(pid) for pid in refused_ids if pid not in existing_output_ids
+    ]
+    if new_placeholders:
+        try:
+            with args.output_jsonl.open("a", encoding="utf-8") as outfile:
+                for pid in new_placeholders:
+                    rec = {
+                        "prompt_id":               pid,
+                        "prompt":                  id2prompt.get(pid, ""),
+                        "generation":              None,
+                        "status":                  "skipped",
+                        "error":                   "skipped -- prior refusal",
+                        "events":                  [],
+                        "duration_sec":            0,
+                        "tokens_generated_prompt": 0,
+                        "refusal_detected":        True,
+                    }
+                    json.dump(rec, outfile)
+                    outfile.write("\n")
+            main_logger.debug(
+                f"Wrote {len(new_placeholders)} refusal placeholder records "
+                f"to {args.output_jsonl}."
+            )
+        except Exception as e:
+            main_logger.error(f"Could not append placeholder refusals: {e}")
+
+    # -----------------------------------------------------------------
+    #  5)  Decide which prompts to process for real
+    # -----------------------------------------------------------------
+    prompts_to_process_this_run: List[Tuple[int, str]] = [
+        (idx, p_text)
+        for idx, p_text in all_input_prompts_with_ids
+        if str(idx) not in processed_ids
+    ]
 
     if args.max_prompts is not None and len(prompts_to_process_this_run) > args.max_prompts:
         main_logger.debug(f"Limiting new prompts for this run to {args.max_prompts}.")

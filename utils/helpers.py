@@ -123,6 +123,12 @@ def add_common_generation_cli_args(parser: argparse.ArgumentParser, base_cfg: Di
                               type=_str2bool,
                               metavar="true/false",
                               help="Detect refusals after each generation.")
+    common_group.add_argument(
+        "--refusals-file",
+        type=str,
+        help="Path to a previous-iteration creative-writing JSONL. "
+             "Every record whose generation was a refusal will be skipped."
+    )
 
     gen_param_group = parser.add_argument_group('Generation Parameters (override config.yaml)')
     gen_param_group.add_argument("--chunk-size", type=int, default=g_default.get("chunk_size"), help="Chunk size for API requests.")
@@ -168,6 +174,7 @@ def merge_configs(base_cfg: Dict[str, Any], cli_args: argparse.Namespace) -> Dic
         "chat_template_model_id", "request_mode",
         "force_backtrack", "prompt_template",
         "system_prompt", "enable_refusal_detection",
+        "refusals_file", 
     ]
 
     for key in scalar_keys:
