@@ -391,7 +391,7 @@ class ApiAntiSlopSampler:
                 break
 
         if not valid_pairs:
-            logger.error("Back-track: no valid next-token candidates found.")
+            #logger.error("Back-track: no valid next-token candidates found.")
             return _abort()
 
         # sample replacement

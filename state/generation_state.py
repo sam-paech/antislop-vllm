@@ -58,20 +58,9 @@ def _decode_token(token: str) -> str:
     if not token:
         return token
 
-    if False:
-        lead = ""
-        if token.startswith("Ċ"):
-            lead, token = "\n", token[1:]
-        elif token.startswith("Ġ"):
-            lead, token = " ", token[1:]
-        elif token.startswith("▁"):
-            lead, token = " ", token[1:]
-
-        # Any stray markers still inside the string → normalise first
-        token = token.replace("Ċ", "\n").replace("Ġ", " ").replace("▁", " ")
-
     # Repair mojibake that is wholly contained in this single token
     token = fix_mojibake_iter(token)
+    token = token.replace("Ċ", "\n").replace("Ġ", " ").replace("▁", " ")
 
     #return lead + token
     return token

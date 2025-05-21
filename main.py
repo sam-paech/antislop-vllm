@@ -479,6 +479,7 @@ def generate_for_prompt_worker(
             detector = RefusalDetector.get(
                 config.get("refusal_model_id", "NousResearch/Minos-v1")
             )
+            print("detector id:", id(detector))
             refusal_detected, refusal_conf, refusal_label = detector.is_refusal(
                 prompt_text,          # user message
                 final_generated_text, # assistant reply
