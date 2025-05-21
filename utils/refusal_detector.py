@@ -51,7 +51,7 @@ class RefusalDetector:
         self.id2label: dict[int, str] = {}
         self._failed     = False
         self._error: str | None = None
-        self._tok_lock = threading.Lock()
+        self._tok_lock = threading.RLock()
 
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -142,9 +142,10 @@ class RefusalDetector:
         """
         tok = self.tokenizer  # shorthand
         # token counts without special tokens
-        user_ids       = tok.encode(user_text, add_special_tokens=False)
-        assistant_ids  = tok.encode(assistant_text, add_special_tokens=False)
-        static_ids     = tok.encode(self._chat_wrap("", ""), add_special_tokens=False)
+        with self._tok_lock:
+            user_ids      = tok.encode(user_text, add_special_tokens=False)
+            assistant_ids = tok.encode(assistant_text, add_special_tokens=False)
+            static_ids    = tok.encode(self._chat_wrap("", ""), add_special_tokens=False)
 
         total_len = len(static_ids) + len(user_ids) + len(assistant_ids)
         if total_len <= self.max_len:
@@ -154,8 +155,9 @@ class RefusalDetector:
         # How many user tokens can we drop while respecting MIN_USER_TOKENS?
         drop = min(excess, max(0, len(user_ids) - MIN_USER_TOKENS))
         if drop:
-            user_ids = user_ids[:-drop]
-            user_text = tok.decode(user_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+            with self._tok_lock:
+                user_text = tok.decode(user_ids[:-drop], skip_special_tokens=True,
+                                    clean_up_tokenization_spaces=False)
             excess -= drop
 
         # Any remaining excess will be handled by the tokenizer's own truncation.
