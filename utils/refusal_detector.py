@@ -16,7 +16,7 @@ from transformers import (
 # ---------------------------------------------------------------------- #
 #  Tunables                                                              #
 # ---------------------------------------------------------------------- #
-MAX_LEN          = 256   # overall sequence budget (change to 200 if desired)
+MAX_LEN          = 512   # overall sequence budget (change to 200 if desired)
 MIN_USER_TOKENS  = 40    # never shorten user_text below this many tokens
 
 class RefusalDetector:
@@ -184,6 +184,9 @@ class RefusalDetector:
 
         # --- 2. tokenise & run -----------------------------------------
         text = self._chat_wrap(user_text, assistant_text)
+
+        print(text)
+
         with self._tok_lock:
             inputs = self.tokenizer(
                 text,
@@ -222,4 +225,5 @@ class RefusalDetector:
 
         label, _id, conf = self.classify(user_text, assistant_text)
         is_ref = (label.lower().strip() == "refusal") and conf >= threshold
+        print(is_ref, conf, label)
         return is_ref, conf, label
