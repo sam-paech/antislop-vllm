@@ -483,7 +483,7 @@ def generate_for_prompt_worker(
             refusal_detected, refusal_conf, refusal_label = detector.is_refusal(
                 prompt_text,          # user message
                 final_generated_text, # assistant reply
-                threshold=float(config.get("refusal_threshold", 0.5))
+                threshold=float(config.get("refusal_threshold", 0.8))
             )
 
 
@@ -660,15 +660,15 @@ def handle_batch_generation(
     #  2)  Refusals from --refusals-file
     # -----------------------------------------------------------------
     refused_ids: set[str] = set()                  # stringified ids
-    if getattr(args, "refusals_file", None):
-        ref_path: Path = args.refusals_file
+    if getattr(args, "refusals_file", None):        
+        ref_path: Path = Path(args.refusals_file)
         if ref_path.exists():
-            try:
+            try:                
                 with ref_path.open("r", encoding="utf-8") as fh:
                     for ln in fh:
                         try:
                             rec = json.loads(ln)
-                        except json.JSONDecodeError:
+                        except json.JSONDecodeError:                            
                             continue
 
                         if rec.get("refusal_detected") is True and "prompt_id" in rec:

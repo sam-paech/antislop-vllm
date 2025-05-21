@@ -207,7 +207,7 @@ class RefusalDetector:
         self,
         user_text: str,
         assistant_text: str,
-        threshold: float = 0.5,
+        threshold: float = 0.8,
     ) -> Tuple[bool, float, str]:
         """
         Returns (is_refusal, confidence, raw_label).  If the detector failed
