@@ -191,7 +191,9 @@ class RefusalDetector:
             inputs = self.tokenizer(
                 text,
                 return_tensors="pt",
-                padding=False,          # truncation already enabled globally
+                padding=False,
+                truncation=True,          # ← ensure truncation
+                max_length=self.max_len,  # ← limit to model capacity
             ).to(self.device)
 
             with torch.no_grad():
