@@ -479,7 +479,7 @@ def generate_for_prompt_worker(
             detector = RefusalDetector.get(
                 config.get("refusal_model_id", "NousResearch/Minos-v1")
             )
-            print("detector id:", id(detector))
+            #print("detector id:", id(detector))
             refusal_detected, refusal_conf, refusal_label = detector.is_refusal(
                 prompt_text,          # user message
                 final_generated_text, # assistant reply
@@ -676,7 +676,8 @@ def handle_batch_generation(
             except Exception as e:
                 main_logger.error(f"Could not read refusals file {ref_path}: {e}")
         else:
-            main_logger.warning(f"--refusals-file {ref_path} not found; ignored.")
+            main_logger.error(f"--refusals-file {ref_path} not found.")
+            raise FileNotFoundError(f"--refusals-file {ref_path} not found.")
 
     # -----------------------------------------------------------------
     #  3)  Combine: anything in either set is skipped
