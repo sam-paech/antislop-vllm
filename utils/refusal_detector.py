@@ -193,7 +193,8 @@ class RefusalDetector:
         # --- 2. tokenise & run -----------------------------------------
         text = self._chat_wrap(user_text, assistant_text)
 
-        truncated_text = self.tokenizer.decode(self.tokenizer.encode(text, add_special_tokens=False)[:MAX_LEN])
+        with self._tok_lock:
+            truncated_text = self.tokenizer.decode(self.tokenizer.encode(text, add_special_tokens=False)[:MAX_LEN])
 
         print(truncated_text)
 
