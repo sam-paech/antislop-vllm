@@ -18,6 +18,7 @@ from transformers import (
 # ---------------------------------------------------------------------- #
 MAX_LEN          = 512   # overall sequence budget (change to 200 if desired)
 MIN_USER_TOKENS  = 40    # never shorten user_text below this many tokens
+MAX_USER_TOKENS  = 120
 
 class RefusalDetector:
     """
@@ -143,7 +144,7 @@ class RefusalDetector:
         tok = self.tokenizer  # shorthand
         # token counts without special tokens
         with self._tok_lock:
-            user_ids      = tok.encode(user_text, add_special_tokens=False)
+            user_ids      = tok.encode(user_text, add_special_tokens=False)[:MAX_USER_TOKENS]
             assistant_ids = tok.encode(assistant_text, add_special_tokens=False)
             static_ids    = tok.encode(self._chat_wrap("", ""), add_special_tokens=False)
 
@@ -187,7 +188,9 @@ class RefusalDetector:
         # --- 2. tokenise & run -----------------------------------------
         text = self._chat_wrap(user_text, assistant_text)
 
-        print(text)
+        truncated_text = self.tokenizer.decode(self.tokenizer.encode(text, add_special_tokens=False)[:MAX_LEN])
+
+        print(truncated_text)
 
         with self._tok_lock:
             inputs = self.tokenizer(
