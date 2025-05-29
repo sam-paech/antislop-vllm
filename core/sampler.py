@@ -39,6 +39,7 @@ from validators.base_validator import BaseValidator
 from validators.slop_phrase_validator import SlopPhraseValidator
 from utils.sampler_helpers import select_tail_tokens
 import csv, time, datetime, os
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -714,8 +715,31 @@ class ApiAntiSlopSampler:
                     timeout         = self.timeout,
                     stop_sequences  = self.stop_sequences,
                 )
+            # ── friendly handling of “context length” overflow ───────────
+            except requests.exceptions.HTTPError as e:
+                resp_json = {}
+                if e.response is not None:
+                    try:
+                        resp_json = e.response.json()
+                    except Exception:
+                        pass
+
+                if (
+                    e.response is not None
+                    and e.response.status_code == 400
+                    and "maximum context length" in resp_json.get("message", "").lower()
+                ):
+                    logger.warning(
+                        "Generation aborted for this prompt – the model’s "
+                        "context window was exceeded: %s",
+                        resp_json.get("message", "").rstrip()
+                    )
+                else:
+                    logger.error("API call failed: %s", e, exc_info=True)
+                break   # keep the existing control-flow (skip further chunks)
+
             except Exception as e:
-                logger.error(f"API call failed: {e}", exc_info=True)
+                logger.error("API call failed: %s", e, exc_info=True)
                 break
             api_sec = time.perf_counter() - t0
 
