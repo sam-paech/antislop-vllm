@@ -671,7 +671,9 @@ def handle_batch_generation(
                         except json.JSONDecodeError:                            
                             continue
 
-                        if rec.get("refusal_detected") is True and "prompt_id" in rec:
+                        if rec.get("refusal_detected") is True \
+                                or rec.get("status") == "failed" \
+                                or not rec.get("generation", None):
                             refused_ids.add(str(rec["prompt_id"]))
             except Exception as e:
                 main_logger.error(f"Could not read refusals file {ref_path}: {e}")
