@@ -473,7 +473,10 @@ def generate_for_prompt_worker(
     refusal_label    = None
     refusal_conf     = None
 
-    if config.get("enable_refusal_detection", False):
+    if (
+        config.get("enable_refusal_detection", False)
+        and final_generated_text.strip()            # ← skip when empty
+    ):
         try:
             from utils.refusal_detector import RefusalDetector
             detector = RefusalDetector.get(
