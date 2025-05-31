@@ -1,4 +1,4 @@
-# utils/tdpo_pairs_helper.py
+# utils/ftpo_pairs_helper.py
 """
 Very small, thread-safe writer for token-wise-DPO training pairs.
 
@@ -12,7 +12,7 @@ from pathlib import Path
 from typing  import List, Dict, Any
 
 
-class TDPOPairWriter:
+class ftpoPairWriter:
     def __init__(self, outfile: Path) -> None:
         self._outfile = outfile
         self._lock    = threading.Lock()

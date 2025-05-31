@@ -80,7 +80,7 @@ class ApiAntiSlopSampler:
         self.on_chunk_yielded_callback = on_chunk_yielded_callback
 
         # ── tokenwise-dpo-pair capture ─────────────────────────────────────────
-        self.tdpo_samples: Dict[str, Dict[str, Any]] = {}
+        self.ftpo_samples: Dict[str, Dict[str, Any]] = {}
 
 
         # Tiktoken encoding for internal token counting
@@ -453,7 +453,7 @@ class ApiAntiSlopSampler:
             f"top_p={self.top_p}, top_k={self.top_k}, invert={invert_probs})"
         )
 
-        # ── TDPO sample capture (legacy + new multi-fields) ──────────────
+        # ── ftpo sample capture (legacy + new multi-fields) ──────────────
         try:
             gen_so_far_tokens = state.generated_token_strings[:idx]
             gen_so_far_text   = _tokens_to_text(gen_so_far_tokens)
@@ -464,7 +464,7 @@ class ApiAntiSlopSampler:
                 else state.prompt_string + gen_so_far_text
             )
 
-            self.tdpo_samples[context_chat] = {
+            self.ftpo_samples[context_chat] = {
                 "prompt_raw":       state.prompt_string,
                 "generation_raw":   gen_so_far_text,
                 "context_with_chat_template": context_chat,
@@ -502,7 +502,7 @@ class ApiAntiSlopSampler:
                 "stats": {},
             }
         except Exception as e_log:
-            logger.error(f"TDPO-pair capture failed: {e_log}", exc_info=True)
+            logger.error(f"ftpo-pair capture failed: {e_log}", exc_info=True)
 
         return True
 

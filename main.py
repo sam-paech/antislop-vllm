@@ -466,7 +466,7 @@ def generate_for_prompt_worker(
     duration_prompt = end_time_prompt - start_time_prompt
     final_generated_text = "".join(full_response_parts)
 
-    tdpo_samples = list(sampler.tdpo_samples.values())  # <- collect any chosen/rejected pairs
+    ftpo_samples = list(sampler.ftpo_samples.values())  # <- collect any chosen/rejected pairs
 
     # --- optional refusal detection ------------------------------------
     refusal_detected = False
@@ -496,7 +496,7 @@ def generate_for_prompt_worker(
                     f"refusal detected ({refusal_label}, p={refusal_conf:.3f})"
                 )
                 #final_generated_text   = ""             # empty generation
-                tdpo_samples           = []             # none collected
+                ftpo_samples           = []             # none collected
                 main_logger.info(
                     f"Prompt {prompt_idx} – refusal detected "
                     f"({refusal_label}, {refusal_conf:.3f})."
@@ -517,7 +517,7 @@ def generate_for_prompt_worker(
         "events": sampler.events,
         "duration_sec": duration_prompt,
         "tokens_generated_prompt": current_prompt_tokens_generated,
-        "tdpo_samples": tdpo_samples,
+        "ftpo_samples": ftpo_samples,
         "refusal_detected": refusal_detected,
         "refusal_label": refusal_label,
         "refusal_confidence": refusal_conf,
@@ -537,22 +537,22 @@ def handle_batch_generation(
     main_logger.debug("Running in batch data generation mode.")
 
     # ──────────────────────────────────────────────────────────────────
-    #  tdpo-pair writer: enabled for iter_>0 and auto-names the file
+    #  ftpo-pair writer: enabled for iter_>0 and auto-names the file
     # ──────────────────────────────────────────────────────────────────
-    from utils.tdpo_pairs_helper import TDPOPairWriter
+    from utils.ftpo_pairs_helper import ftpoPairWriter
     # Resolve path precedence: CLI > config > None
-    tdpo_path = None
-    if hasattr(args, "tdpo_pairs_jsonl") and args.tdpo_pairs_jsonl is not None:
-        tdpo_path = args.tdpo_pairs_jsonl
-    elif cfg.get("tdpo_pairs_jsonl"):
-        tdpo_path = Path(cfg["tdpo_pairs_jsonl"])
+    ftpo_path = None
+    if hasattr(args, "ftpo_pairs_jsonl") and args.ftpo_pairs_jsonl is not None:
+        ftpo_path = args.ftpo_pairs_jsonl
+    elif cfg.get("ftpo_pairs_jsonl"):
+        ftpo_path = Path(cfg["ftpo_pairs_jsonl"])
 
-    if tdpo_path:
-        tdpo_writer = TDPOPairWriter(tdpo_path)
-        main_logger.info(f"tdpo-pair capture enabled → {tdpo_path}")
+    if ftpo_path:
+        ftpo_writer = ftpoPairWriter(ftpo_path)
+        main_logger.info(f"ftpo-pair capture enabled → {ftpo_path}")
     else:
-        tdpo_writer = None
-        main_logger.info("tdpo-pair capture disabled (no path specified in CLI or config).")
+        ftpo_writer = None
+        main_logger.info("ftpo-pair capture disabled (no path specified in CLI or config).")
 
 
     # -----------------------------------------------------------------
@@ -768,14 +768,14 @@ def handle_batch_generation(
                         try:
                             result_data = future.result()
                             # write only the generation record
-                            rec = {k: v for k, v in result_data.items() if k != "tdpo_samples"}
+                            rec = {k: v for k, v in result_data.items() if k != "ftpo_samples"}
                             json.dump(rec, outfile)
                             outfile.write("\n")
                             outfile.flush()
 
-                            # ── tdpo-pairs ───────────────────────────
-                            if tdpo_writer and result_data.get("tdpo_samples"):
-                                tdpo_writer.add_samples(result_data["tdpo_samples"])
+                            # ── ftpo-pairs ───────────────────────────
+                            if ftpo_writer and result_data.get("ftpo_samples"):
+                                ftpo_writer.add_samples(result_data["ftpo_samples"])
 
                         except Exception as e_fut:
                             main_logger.error(f"Critical error processing a prompt future: {e_fut}",
@@ -795,10 +795,10 @@ def handle_batch_generation(
 
     total_time_taken_run = time.perf_counter() - overall_processing_start_time
 
-    # Flush tdpo-pairs after batch completes
-    if tdpo_writer:
-        tdpo_writer.flush()
-        main_logger.info(f"tdpo-pairs written to {tdpo_writer._outfile}")
+    # Flush ftpo-pairs after batch completes
+    if ftpo_writer:
+        ftpo_writer.flush()
+        main_logger.info(f"ftpo-pairs written to {ftpo_writer._outfile}")
 
     if script_effective_log_level <= logging.INFO:
         print(f"Finished processing {overall_prompts_processed_count} prompts in this run in {total_time_taken_run:.2f}s.")
@@ -832,8 +832,8 @@ def main_cli():
     batch_mode_group.add_argument("--hf-dataset-config-name", type=str, default=None, help="Batch mode: Config name for HF dataset.")
     batch_mode_group.add_argument("--threads", type=int, default=1, help="Batch mode: Number of parallel generation threads.")
     batch_mode_group.add_argument("--max-prompts", type=int, default=None, help="Batch mode: Max new prompts to process from source per run.")
-    batch_mode_group.add_argument("--tdpo-pairs-jsonl", type=Path,
-                              help="Path to JSONL for tdpo chosen/rejected pairs.")
+    batch_mode_group.add_argument("--ftpo-pairs-jsonl", type=Path,
+                              help="Path to JSONL for ftpo chosen/rejected pairs.")
 
 
     temp_args_for_config, _ = parser.parse_known_args()
