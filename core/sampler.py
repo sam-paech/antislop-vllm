@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 import random
 from typing import Dict, Generator, List, Optional, Tuple, Callable, Any
 
@@ -40,8 +41,52 @@ from validators.slop_phrase_validator import SlopPhraseValidator
 from utils.sampler_helpers import select_tail_tokens
 import csv, time, datetime, os
 import requests
+from threading import Lock
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+#  Global one-time cache for the “banned-prefix” token set
+#  key  = chat-template model-id   →   value = frozenset(str tokens)
+# ---------------------------------------------------------------------------
+_BANNED_PREFIX_CACHE: dict[str, frozenset[str]] = {}
+_BANNED_PREFIX_LOCK = Lock()
+
+
+def _build_banned_prefix_set(chat_tpl, validators) -> frozenset[str]:
+    """
+    Compute the prefix-token set *once* for a given chat template / tokenizer.
+    Called inside a cache guard, so it executes at most once per model-id.
+    """
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(chat_tpl.model_id)
+    sources: list[str] = []
+
+    for v in validators:
+        if v.__class__.__name__ == "SlopPhraseValidator":
+            sources.extend(v.slop_phrases_keys)
+        elif v.__class__.__name__ == "NGramValidator":
+            sources.extend(" ".join(t) for t in getattr(v, "banned_ngrams_tuples", []))
+
+    variants = []
+    for s in sources:
+        base = s.lstrip()
+        variants.append(base)
+        variants.append(" " + base)
+
+    encoded = tok(variants, add_special_tokens=False, return_attention_mask=False)
+    out: set[str] = set()
+    for ids in encoded["input_ids"]:
+        if ids:                                            # non-empty
+            t = tok.convert_ids_to_tokens(ids[0])
+            if t:
+                out.add(t.lower())
+
+    logging.getLogger(__name__).info(
+        "tail-prefix filter initialised – %d unique prefix tokens.", len(out)
+    )
+    return frozenset(out)
 
 
 class ApiAntiSlopSampler:
@@ -162,6 +207,36 @@ class ApiAntiSlopSampler:
                 tail_tokens = max(tail_tokens, est)
 
         self.tail_keep_tokens = tail_tokens
+
+
+        # ── tail prefix-filter (HF tokenizer only, parallel build) ──────────
+        self.filter_tail_banned_prefix_tokens = bool(
+            config.get("filter_tail_banned_prefix_tokens", True)
+        )
+        self._banned_prefix_token_strings: frozenset[str] = frozenset()
+
+        if self.filter_tail_banned_prefix_tokens:
+            if chat_template_formatter is None or not hasattr(chat_template_formatter, "model_id"):
+                logger.warning(
+                    "tail-prefix filter requested but no chat-template tokenizer available – skipping filter."
+                )
+                self.filter_tail_banned_prefix_tokens = False
+            else:
+                cache_key = chat_template_formatter.model_id
+                with _BANNED_PREFIX_LOCK:
+                    cached = _BANNED_PREFIX_CACHE.get(cache_key)
+                    if cached is None:                               # first time ever
+                        start = time.time()
+                        print('start prefix builder')
+                        cached = _build_banned_prefix_set(chat_template_formatter, self.validators)
+                        _BANNED_PREFIX_CACHE[cache_key] = cached
+                        print('built in', time.time() - start)
+                self._banned_prefix_token_strings = cached
+
+
+
+
+
         logger.info(
             f"ApiAntiSlopSampler ready — chunk={self.chunk_size}, "
             f"max_new_tokens={self.max_new_tokens}, T={self.temperature}, "
@@ -284,7 +359,7 @@ class ApiAntiSlopSampler:
     # ------------------------------------------------------------------ #
     def _perform_backtrack(self, state: GenerationState, vio: ViolationInfo) -> bool:
         idx         = vio.violation_index
-        banned_id   = vio.original_token_string
+        banned_token   = vio.original_token_string
         lp_list     = state.get_logprobs(idx)  
         
         def _abort() -> bool:
@@ -299,7 +374,7 @@ class ApiAntiSlopSampler:
         invert_probs = bool(getattr(self, "gen_config", {}).get("invert_probs", True))
 
         logger.warning(
-            f"Back-tracking @tok={idx} orig='{banned_id}' ban='{vio.details}'."
+            f"Back-tracking @tok={idx} orig='{banned_token}' ban='{vio.details}'."
         )
 
         # ── utility: validate a single token once per call ───────────────
@@ -318,7 +393,7 @@ class ApiAntiSlopSampler:
         Z              = sum(tempered)
         base_pairs     = [(tok, pt / Z if Z > 0 else 1 / len(tempered))
                         for (tok, _), pt in zip(lp_list, tempered)
-                        if tok != banned_id]                         # banned removed
+                        if tok != banned_token]                         # banned removed
 
         if not base_pairs:
             logger.error("Back-track: after removing banned token no candidates left.")
@@ -336,7 +411,7 @@ class ApiAntiSlopSampler:
             Z       = sum(probs_t)
             pairs   = [(tok, pt / Z if Z else 1 / len(probs_t))
                     for (tok, _), pt in zip(lp_list, probs_t)
-                    if tok != banned_id]
+                    if tok != banned_token]
 
             # min-p filter
             if min_p is not None and pairs:
@@ -401,10 +476,13 @@ class ApiAntiSlopSampler:
 
 
         # ─────────────────────────────────────────────────────────────────
-        # 2. TAIL-CANDIDATE SELECTION  (independent knobs)
+        # 2. TAIL-CANDIDATE SELECTION
+        #     Here we are choosing tokens from the (short) tail of the 
+        #     top_probs returned by the api. These become the "chosen"
+        #     tokens in the chosen/rejected pairs for the FTPO dataset.
         # ─────────────────────────────────────────────────────────────────
-        max_tail   = getattr(self, "max_chosen_tokens", 8)
-        tail_min_p = getattr(self, "tail_min_p", 0.0)
+        max_tail   = getattr(self, "max_chosen_tokens", 20)
+        tail_min_p = getattr(self, "tail_min_p", 0.03)
         tail_top_k = getattr(self, "tail_top_k", 50)
 
         tail_ids: list[str] = []
@@ -422,11 +500,17 @@ class ApiAntiSlopSampler:
             # sort ascending prob ⇒ lowest-prob tokens first
             tail_pairs.sort(key=lambda tp: tp[1])
 
+            print('filtering tail tokens for rejected token:', banned_token)
             for tok, _ in tail_pairs:
-                if tok == banned_id or tok in tried_here:
+                if (self.filter_tail_banned_prefix_tokens
+                    and (tok.lower() in self._banned_prefix_token_strings or _decode_token(tok).lower() in self._banned_prefix_token_strings)):
+                    print('skipping', tok)
+                    continue                      # skip prefixes of banned strings
+                if tok == banned_token or tok in tried_here:
                     continue
                 if not _is_valid(tok):
                     continue
+                print('adding', tok)
                 tail_ids.append(tok)
                 if len(tail_ids) >= max_tail:
                     break
@@ -471,15 +555,15 @@ class ApiAntiSlopSampler:
 
                 # legacy single-token keys
                 "chosen_decoded":   _decode_token(choice),
-                "rejected_decoded": _decode_token(banned_id),
+                "rejected_decoded": _decode_token(banned_token),
                 "chosen_raw":       choice,
-                "rejected_raw":     banned_id,
+                "rejected_raw":     banned_token,
 
                 # NEW multi-token keys
                 "multi_chosen_decoded":  multi_chosen_decoded,
                 "multi_chosen_raw":      tail_ids,
-                "multi_rejected_decoded": [_decode_token(banned_id)],
-                "multi_rejected_raw":     [banned_id],
+                "multi_rejected_decoded": [_decode_token(banned_token)],
+                "multi_rejected_raw":     [banned_token],
 
                 "validator": {
                     "class": vio.validator_type,

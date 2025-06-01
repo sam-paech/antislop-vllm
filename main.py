@@ -35,6 +35,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)-5.5s] [%(name)-20.20s]: %(message)s",
 )
 
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 progress_lock = Lock()
 overall_prompts_processed_count = 0
 overall_tokens_generated_count = 0
