@@ -514,17 +514,17 @@ class ApiAntiSlopSampler:
             # sort ascending prob ⇒ lowest-prob tokens first
             tail_pairs.sort(key=lambda tp: tp[1])
 
-            print('filtering tail tokens for rejected token:', banned_token)
+            #print('filtering tail tokens for rejected token:', banned_token)
             for tok, _ in tail_pairs:
                 if (self.filter_tail_banned_prefix_tokens
                     and (tok.lower() in self._banned_prefix_token_strings or _decode_token(tok).lower() in self._banned_prefix_token_strings)):
-                    print('skipping', tok)
+                    #print('skipping', tok)
                     continue                      # skip prefixes of banned strings
                 if tok == banned_token or tok in tried_here:
                     continue
                 if not _is_valid(tok):
                     continue
-                print('adding', tok)
+                #print('adding', tok)
                 tail_ids.append(tok)
                 if len(tail_ids) >= max_tail:
                     break
