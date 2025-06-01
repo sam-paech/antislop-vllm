@@ -55,30 +55,43 @@ _BANNED_PREFIX_LOCK = Lock()
 
 def _build_banned_prefix_set(chat_tpl, validators) -> frozenset[str]:
     """
-    Compute the prefix-token set *once* for a given chat template / tokenizer.
-    Called inside a cache guard, so it executes at most once per model-id.
+    Compute the prefix-token set once for a given chat template / tokenizer.
+    If the validators provide no phrases/ngrams, just return an empty set.
     """
     from transformers import AutoTokenizer
-
     tok = AutoTokenizer.from_pretrained(chat_tpl.model_id)
-    sources: list[str] = []
 
+    # 1. collect raw strings that *could* start a banned phrase/ngram
+    sources: list[str] = []
     for v in validators:
         if v.__class__.__name__ == "SlopPhraseValidator":
             sources.extend(v.slop_phrases_keys)
         elif v.__class__.__name__ == "NGramValidator":
             sources.extend(" ".join(t) for t in getattr(v, "banned_ngrams_tuples", []))
 
-    variants = []
+    # nothing to do – no banned prefixes for this model / run
+    if not sources:
+        logging.getLogger(__name__).info(
+            "tail-prefix filter initialised – no banned prefixes found."
+        )
+        return frozenset()
+
+    # 2. create “base” / “ base” variants and encode
+    variants: list[str] = []
     for s in sources:
         base = s.lstrip()
         variants.append(base)
         variants.append(" " + base)
 
-    encoded = tok(variants, add_special_tokens=False, return_attention_mask=False)
+    encoded = tok(
+        variants,
+        add_special_tokens=False,
+        return_attention_mask=False,
+    )
+
     out: set[str] = set()
     for ids in encoded["input_ids"]:
-        if ids:                                            # non-empty
+        if ids:                                        # skip empty encodings
             t = tok.convert_ids_to_tokens(ids[0])
             if t:
                 out.add(t.lower())
@@ -87,6 +100,7 @@ def _build_banned_prefix_set(chat_tpl, validators) -> frozenset[str]:
         "tail-prefix filter initialised – %d unique prefix tokens.", len(out)
     )
     return frozenset(out)
+
 
 
 class ApiAntiSlopSampler:
