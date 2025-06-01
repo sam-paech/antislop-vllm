@@ -530,8 +530,8 @@ class ApiAntiSlopSampler:
                     break
 
             # fallback: if nothing survived, keep at least the replacement token
-            if not tail_ids:
-                tail_ids = [choice]
+            #if not tail_ids:
+            #    tail_ids = [choice]
 
         multi_chosen_decoded = [_decode_token(t) for t in tail_ids]
 
@@ -552,55 +552,56 @@ class ApiAntiSlopSampler:
         )
 
         # ── ftpo sample capture (legacy + new multi-fields) ──────────────
-        try:
-            gen_so_far_tokens = state.generated_token_strings[:idx]
-            gen_so_far_text   = _tokens_to_text(gen_so_far_tokens)
+        if tail_ids:
+            try:
+                gen_so_far_tokens = state.generated_token_strings[:idx]
+                gen_so_far_text   = _tokens_to_text(gen_so_far_tokens)
 
-            context_chat = (
-                self.chat_formatter.build_prompt(state.prompt_string, gen_so_far_text)
-                if self.chat_formatter is not None
-                else state.prompt_string + gen_so_far_text
-            )
+                context_chat = (
+                    self.chat_formatter.build_prompt(state.prompt_string, gen_so_far_text)
+                    if self.chat_formatter is not None
+                    else state.prompt_string + gen_so_far_text
+                )
 
-            self.ftpo_samples[context_chat] = {
-                "prompt_raw":       state.prompt_string,
-                "generation_raw":   gen_so_far_text,
-                "context_with_chat_template": context_chat,
+                self.ftpo_samples[context_chat] = {
+                    "prompt_raw":       state.prompt_string,
+                    "generation_raw":   gen_so_far_text,
+                    "context_with_chat_template": context_chat,
 
-                # legacy single-token keys
-                "chosen_decoded":   _decode_token(choice),
-                "rejected_decoded": _decode_token(banned_token),
-                "chosen_raw":       choice,
-                "rejected_raw":     banned_token,
+                    # legacy single-token keys
+                    "chosen_decoded":   _decode_token(choice),
+                    "rejected_decoded": _decode_token(banned_token),
+                    "chosen_raw":       choice,
+                    "rejected_raw":     banned_token,
 
-                # NEW multi-token keys
-                "multi_chosen_decoded":  multi_chosen_decoded,
-                "multi_chosen_raw":      tail_ids,
-                "multi_rejected_decoded": [_decode_token(banned_token)],
-                "multi_rejected_raw":     [banned_token],
+                    # NEW multi-token keys
+                    "multi_chosen_decoded":  multi_chosen_decoded,
+                    "multi_chosen_raw":      tail_ids,
+                    "multi_rejected_decoded": [_decode_token(banned_token)],
+                    "multi_rejected_raw":     [banned_token],
 
-                "validator": {
-                    "class": vio.validator_type,
-                    "rule": (
-                        vio.details.get("phrase")
-                        or vio.details.get("ngram_string")
-                        or vio.details.get("pattern")
-                        or ""
-                    ),
-                    "subtype": (
-                        vio.validator_type
-                        if vio.validator_type != "ngram"
-                        else (
-                            "trigram"
-                            if len(vio.details.get("ngram_tuple", [])) == 3
-                            else "bigram"
-                        )
-                    ),
-                },
-                "stats": {},
-            }
-        except Exception as e_log:
-            logger.error(f"ftpo-pair capture failed: {e_log}", exc_info=True)
+                    "validator": {
+                        "class": vio.validator_type,
+                        "rule": (
+                            vio.details.get("phrase")
+                            or vio.details.get("ngram_string")
+                            or vio.details.get("pattern")
+                            or ""
+                        ),
+                        "subtype": (
+                            vio.validator_type
+                            if vio.validator_type != "ngram"
+                            else (
+                                "trigram"
+                                if len(vio.details.get("ngram_tuple", [])) == 3
+                                else "bigram"
+                            )
+                        ),
+                    },
+                    "stats": {},
+                }
+            except Exception as e_log:
+                logger.error(f"ftpo-pair capture failed: {e_log}", exc_info=True)
 
         return True
 
