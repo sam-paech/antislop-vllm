@@ -524,10 +524,20 @@ class ApiAntiSlopSampler:
                     # for some models, * is such a common continuation token that allowing
                     # it in chosen_ids leads to the model having major * repetition issues
                     continue
+                # skip tokens that are <= 1 char after stripping whitespace
+                if len(tok.strip()) <= 1:
+                    continue
+                
+                # skip tokens that don't contain any alphanumeric chars
+                if not any(c.isalnum() for c in tok):
+                    continue
                 if tok == banned_token or tok in tried_here:
                     continue
                 if not _is_valid(tok):
                     continue
+                
+
+                
                 #print('adding', tok)
                 tail_ids.append(tok)
                 if len(tail_ids) >= max_tail:
