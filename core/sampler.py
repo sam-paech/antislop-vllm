@@ -520,6 +520,10 @@ class ApiAntiSlopSampler:
                     and (tok.lower() in self._banned_prefix_token_strings or _decode_token(tok).lower() in self._banned_prefix_token_strings)):
                     #print('skipping', tok)
                     continue                      # skip prefixes of banned strings
+                if '*' in tok:
+                    # for some models, * is such a common continuation token that allowing
+                    # it in chosen_ids leads to the model having major * repetition issues
+                    continue
                 if tok == banned_token or tok in tried_here:
                     continue
                 if not _is_valid(tok):
@@ -528,10 +532,6 @@ class ApiAntiSlopSampler:
                 tail_ids.append(tok)
                 if len(tail_ids) >= max_tail:
                     break
-
-            # fallback: if nothing survived, keep at least the replacement token
-            #if not tail_ids:
-            #    tail_ids = [choice]
 
         multi_chosen_decoded = [_decode_token(t) for t in tail_ids]
 
