@@ -55,13 +55,30 @@ _BANNED_PREFIX_LOCK = Lock()
 
 def _build_banned_prefix_set(chat_tpl, validators) -> frozenset[str]:
     """
-    Compute the prefix-token set once for a given chat template / tokenizer.
-    If the validators provide no phrases/ngrams, just return an empty set.
+    Return a *lower-cased* set containing:
+
+    1. The first token (as produced by the HF tokenizer that your **model**
+       will actually use) of every banned phrase / n-gram.
+    2. All plain-text substrings that can *start* any banned phrase,
+       lengths 2‥15 chars, **both with and without a leading space**.
+
+    The caller later checks
+
+        tok.lower()                       ∈ set   (raw token string)
+        _decode_token(tok).lower()        ∈ set   (plain-text form)
+
+    so we need only ASCII space variants – special markers (Ġ▁) are handled
+    by the first check.
     """
     from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(chat_tpl.model_id)
 
-    # 1. collect raw strings that *could* start a banned phrase/ngram
+    tok = AutoTokenizer.from_pretrained(
+        chat_tpl.model_id, trust_remote_code=True
+    )
+
+    # ------------------------------------------------------------
+    # 1. collect source strings (banned phrases + banned n-grams)
+    # ------------------------------------------------------------
     sources: list[str] = []
     for v in validators:
         if v.__class__.__name__ == "SlopPhraseValidator":
@@ -69,37 +86,56 @@ def _build_banned_prefix_set(chat_tpl, validators) -> frozenset[str]:
         elif v.__class__.__name__ == "NGramValidator":
             sources.extend(" ".join(t) for t in getattr(v, "banned_ngrams_tuples", []))
 
-    # nothing to do – no banned prefixes for this model / run
     if not sources:
         logging.getLogger(__name__).info(
             "tail-prefix filter initialised – no banned prefixes found."
         )
         return frozenset()
 
-    # 2. create “base” / “ base” variants and encode
+    out: set[str] = set()         # final result (lower-cased)
+
+    # ------------------------------------------------------------
+    # 2. token-based prefixes (same logic as before)
+    # ------------------------------------------------------------
     variants: list[str] = []
     for s in sources:
         base = s.lstrip()
         variants.append(base)
         variants.append(" " + base)
 
-    encoded = tok(
+    enc = tok(
         variants,
         add_special_tokens=False,
         return_attention_mask=False,
     )
 
-    out: set[str] = set()
-    for ids in encoded["input_ids"]:
-        if ids:                                        # skip empty encodings
-            t = tok.convert_ids_to_tokens(ids[0])
-            if t:
-                out.add(t.lower())
+    for ids in enc["input_ids"]:
+        if not ids:
+            continue
+        first_tok = tok.convert_ids_to_tokens(ids[0])
+        if first_tok:
+            out.add(first_tok.lower())
+
+    # ------------------------------------------------------------
+    # 3. plain-text substring prefixes (2‥15 characters)
+    # ------------------------------------------------------------
+    MAX_SUBLEN = 15
+    MIN_SUBLEN = 2
+
+    for s in sources:
+        plain = s.lstrip().lower()
+        upto  = min(MAX_SUBLEN, len(plain))
+        for ln in range(MIN_SUBLEN, upto + 1):
+            sub = plain[:ln]
+            out.add(sub)           # no leading space
+            out.add(" " + sub)     # with leading space
 
     logging.getLogger(__name__).info(
-        "tail-prefix filter initialised – %d unique prefix tokens.", len(out)
+        "tail-prefix filter initialised – %d unique prefixes (token+substring).",
+        len(out),
     )
     return frozenset(out)
+
 
 
 
