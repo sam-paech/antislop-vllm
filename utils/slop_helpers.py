@@ -109,9 +109,6 @@ def detect_disallowed_sequence(
     window     = text_lower[win_start:]
     win_len    = len(window)
 
-    earliest_pos: Optional[int]   = None
-    earliest_phrase: Optional[str] = None
-
     for start in range(0, win_len - min_phrase_len + 1):
         max_len_here = min(max_phrase_len, win_len - start)
 
@@ -121,9 +118,8 @@ def detect_disallowed_sequence(
                 continue
 
             global_pos = win_start + start
-            right_pos  = global_pos + length      # index of first char *after* match
+            right_pos  = global_pos + length
 
-            # Which boundaries are actually required?
             need_left  = _is_word_char(cand[0])
             need_right = _is_word_char(cand[-1])
 
@@ -138,16 +134,7 @@ def detect_disallowed_sequence(
                 or not _is_word_char(text_lower[right_pos])
             )
 
-            if not (left_ok and right_ok):
-                continue  # embedded inside a larger word – ignore
+            if left_ok and right_ok:
+                return cand, global_pos        # ← EARLY EXIT
 
-            if (earliest_pos is None) or (global_pos < earliest_pos):
-                earliest_pos    = global_pos
-                earliest_phrase = cand
-            elif global_pos == earliest_pos and len(cand) > len(earliest_phrase):
-                earliest_phrase = cand
-
-            if earliest_pos == win_start:        # cannot get an earlier start
-                return earliest_phrase, earliest_pos
-
-    return earliest_phrase, earliest_pos
+    return None, None
