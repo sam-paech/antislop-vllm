@@ -83,6 +83,20 @@ def detect_disallowed_sequence(
     than one phrase begins at that earliest offset, the longest phrase is
     preferred so we block the full expression.
 
+    To trigger a ban, the sequence must not have a word-like character
+    (not punctuation or whitespace) directly on either side. That is to say, we
+    are not banning disallowed sequences that occur as substrings in longer
+    words. The exception is if the banned string is already bookended by
+    a non-word character.
+
+    Examples: 
+    banned string "cat"
+      - won't trigger a ban for "cation"
+      - will trigger a ban on "cat[morecat]"
+    banned string "cat["
+      - *will* trigger a ban on "cat[morecat]", because the banned string
+        ends with a non-word character.    
+
     If nothing is found, returns *(None, None)*.
     """
     if not text or not slop_phrases_keys or max_phrase_len == 0:
@@ -107,20 +121,25 @@ def detect_disallowed_sequence(
                 continue
 
             global_pos = win_start + start
-            right_pos  = global_pos + length
+            right_pos  = global_pos + length      # index of first char *after* match
+
+            # Which boundaries are actually required?
+            need_left  = _is_word_char(cand[0])
+            need_right = _is_word_char(cand[-1])
 
             left_ok  = (
-                global_pos == 0
+                True if not need_left
+                else global_pos == 0
                 or not _is_word_char(text_lower[global_pos - 1])
             )
             right_ok = (
-                right_pos >= text_len
+                True if not need_right
+                else right_pos >= text_len
                 or not _is_word_char(text_lower[right_pos])
             )
 
             if not (left_ok and right_ok):
-                # phrase is embedded in a longer token – skip it
-                continue
+                continue  # embedded inside a larger word – ignore
 
             if (earliest_pos is None) or (global_pos < earliest_pos):
                 earliest_pos    = global_pos
@@ -128,9 +147,7 @@ def detect_disallowed_sequence(
             elif global_pos == earliest_pos and len(cand) > len(earliest_phrase):
                 earliest_phrase = cand
 
-            # once we’ve found something that starts at the very first
-            # possible position, no later match can be earlier
-            if earliest_pos == win_start:
+            if earliest_pos == win_start:        # cannot get an earlier start
                 return earliest_phrase, earliest_pos
 
     return earliest_phrase, earliest_pos

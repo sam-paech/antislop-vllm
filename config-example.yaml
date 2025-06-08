@@ -10,6 +10,22 @@ model_name: "unsloth/gemma-3-1b-it"
 
 
 # Slop Configuration
+
+# slop phrases == list of strings to ban
+# - case insensitive
+# To trigger a ban, the sequence must not have a word-like character
+#    (not punctuation or whitespace) directly on either side. That is to say, we
+#    are not banning disallowed sequences that occur as substrings in longer
+#    words. The exception is if the banned string is already bookended by
+#    a non-word character.
+#
+#    Examples: 
+#    banned string "cat"
+#      - won't trigger a ban for "cation"
+#     - will trigger a ban on "cat[morecat]"
+#   banned string "cat["
+#     - *will* trigger a ban on "cat[morecat]", because the banned string
+#        ends with a non-word character.
 slop_phrases_file: "banlists/slop_phrases.json"
 top_n_slop_phrases: 200 # Use top N phrases from the file (assumes file is ordered)
 
