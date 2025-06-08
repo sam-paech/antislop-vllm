@@ -1,6 +1,7 @@
 # utils/slop_helpers.py
 import json
 import logging
+import unicodedata
 from typing import Dict, Set, Tuple, Optional
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,21 @@ def load_slop_phrases(filepath: str, top_n: Optional[int] = None) -> Dict[str, f
     logger.info(f"Loaded {len(phrases)} slop phrases from {filepath}.")
     return phrases
 
+# ------------------------------------------------------------- #
+#  Unicode-aware helpers                                        #
+# ------------------------------------------------------------- #
+def _is_word_char(ch: str) -> bool:
+    """
+    Return True iff *ch* should be considered part of a word in *any*
+    writing system:
+
+        • General Category starts with L (Letter), N (Number) or M (Mark)
+          – that covers diacritics and CJK ideographs.
+    """
+    if not ch:
+        return False
+    cat = unicodedata.category(ch)
+    return cat and cat[0] in {"L", "N", "M"}
 
 # ------------------------------------------------------------- #
 #  Earliest-hit matcher                                         #
@@ -72,13 +88,12 @@ def detect_disallowed_sequence(
     if not text or not slop_phrases_keys or max_phrase_len == 0:
         return None, None
 
-    text_lower  = text.lower()
-    text_len    = len(text_lower)
+    text_lower = text.lower()
+    text_len   = len(text_lower)
 
-    # Restrict to a sliding window at the end of the text
-    win_start   = max(0, text_len - check_n_chars_back)
-    window      = text_lower[win_start:]
-    win_len     = len(window)
+    win_start  = max(0, text_len - check_n_chars_back)
+    window     = text_lower[win_start:]
+    win_len    = len(window)
 
     earliest_pos: Optional[int]   = None
     earliest_phrase: Optional[str] = None
@@ -88,18 +103,34 @@ def detect_disallowed_sequence(
 
         for length in range(min_phrase_len, max_len_here + 1):
             cand = window[start : start + length]
-            if cand in slop_phrases_keys:
-                global_pos = win_start + start
+            if cand not in slop_phrases_keys:
+                continue
 
-                # First hit, or earlier than any previous hit
-                if earliest_pos is None or global_pos < earliest_pos:
-                    earliest_pos    = global_pos
-                    earliest_phrase = cand
+            global_pos = win_start + start
+            right_pos  = global_pos + length
 
-                # Same starting pos but longer phrase → keep the longer one
-                elif global_pos == earliest_pos and len(cand) > len(earliest_phrase):
-                    earliest_phrase = cand
-            if earliest_pos != None: # early return
+            left_ok  = (
+                global_pos == 0
+                or not _is_word_char(text_lower[global_pos - 1])
+            )
+            right_ok = (
+                right_pos >= text_len
+                or not _is_word_char(text_lower[right_pos])
+            )
+
+            if not (left_ok and right_ok):
+                # phrase is embedded in a longer token – skip it
+                continue
+
+            if (earliest_pos is None) or (global_pos < earliest_pos):
+                earliest_pos    = global_pos
+                earliest_phrase = cand
+            elif global_pos == earliest_pos and len(cand) > len(earliest_phrase):
+                earliest_phrase = cand
+
+            # once we’ve found something that starts at the very first
+            # possible position, no later match can be earlier
+            if earliest_pos == win_start:
                 return earliest_phrase, earliest_pos
 
     return earliest_phrase, earliest_pos
