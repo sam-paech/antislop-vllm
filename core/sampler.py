@@ -532,8 +532,12 @@ class ApiAntiSlopSampler:
         #     tokens in the chosen/rejected pairs for the FTPO dataset.
         # ─────────────────────────────────────────────────────────────────
         max_tail   = getattr(self, "max_chosen_tokens", 20)
-        tail_min_p = getattr(self, "tail_min_p", 0.03)
+        #tail_min_p = getattr(self, "tail_min_p", 0.03)
         tail_top_k = getattr(self, "tail_top_k", 50)
+        if self.min_p:
+            tail_min_p = self.min_p
+        else:
+            tail_min_p = 0.01
 
         tail_ids: list[str] = []
         if max_tail > 0:
