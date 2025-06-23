@@ -410,7 +410,7 @@ class ApiAntiSlopSampler:
     def _perform_backtrack(self, state: GenerationState, vio: ViolationInfo) -> bool:
         idx         = vio.violation_index
         banned_token   = vio.original_token_string
-        lp_list     = state.get_logprobs(idx)  
+        lp_list     = state.get_logprobs(idx)
         
         def _abort() -> bool:
             self._suppress_violation(vio)   # ← remember: vio is already in scope
@@ -517,7 +517,7 @@ class ApiAntiSlopSampler:
                     pairs = [(tok, pt / Z_inv) for tok, pt in pairs]
 
             valid_pairs = [(tok, pt) for tok, pt in pairs
-                        if tok not in tried_here and _is_valid(tok)]
+               if pt > 0 and tok not in tried_here and _is_valid(tok)]
             if valid_pairs:
                 break
 
