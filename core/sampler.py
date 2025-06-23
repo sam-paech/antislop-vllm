@@ -509,7 +509,12 @@ class ApiAntiSlopSampler:
                 p_max, p_min = max(p_vals), min(p_vals)
                 pairs = [(tok, (p_max - pt) + p_min) for tok, pt in pairs]
                 Z_inv = sum(pt for _, pt in pairs)
-                pairs = [(tok, pt / Z_inv) for tok, pt in pairs]
+                if Z_inv == 0.0:
+                    # fall back to a uniform distribution to avoid div by 0
+                    uniform = 1.0 / len(pairs) if pairs else 0.0
+                    pairs = [(tok, uniform) for tok, _ in pairs]
+                else:
+                    pairs = [(tok, pt / Z_inv) for tok, pt in pairs]
 
             valid_pairs = [(tok, pt) for tok, pt in pairs
                         if tok not in tried_here and _is_valid(tok)]
