@@ -257,6 +257,49 @@ def _get_api_client(cfg: Dict[str, Any], main_logger: logging.Logger) -> Optiona
     )
 
 
+def handle_server_mode(cfg: Dict[str, Any], args: argparse.Namespace, main_logger: logging.Logger):
+    """Initializes shared resources and starts the Uvicorn server."""
+    main_logger.info("Starting OpenAI-compatible API server...")
+
+    try:
+        import uvicorn
+        from api_server.server import app, setup_shared_resources
+    except ImportError:
+        main_logger.critical("Please install 'fastapi' and 'uvicorn' to run the server: pip install fastapi uvicorn[standard]")
+        sys.exit(1)
+
+    # Setup shared resources that will be available to all requests
+    # This avoids re-initializing models, validators, etc. on every call
+    main_logger.info("Initializing shared resources...")
+    validators = _setup_validators(cfg, main_logger)
+    api_client = _get_api_client(cfg, main_logger)
+    if not api_client:
+        main_logger.critical("Failed to initialize API client. Server cannot start.")
+        return
+
+    # The chat_formatter is already global, so it's available.
+    # We'll pass all necessary shared resources to the FastAPI app.
+    setup_shared_resources(
+        config=cfg,
+        validators=validators,
+        api_client=api_client,
+        chat_formatter=chat_formatter,
+        main_logger=main_logger
+    )
+
+    host = "0.0.0.0"
+    port = args.openai_api_port
+    main_logger.info(f"Server starting on http://{host}:{port}")
+    main_logger.info("See Uvicorn logs below for request details.")
+    
+    # Uvicorn will take over logging from here.
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_level=cfg.get("logging_level", "info").lower(),
+    )
+
 
 def handle_single_generation(cfg: Dict[str, Any], args: Any, script_effective_log_level: int, main_logger: logging.Logger):
     # In single mode, we still use the logger for its events for now,
@@ -822,9 +865,17 @@ def main_cli():
     )
     parser.add_argument("--config", type=Path, default=Path("config.yaml"), help="Path to base YAML config.")
     
-    single_mode_group = parser.add_argument_group('Single Prompt Mode (default if no batch args)')
+    # --- Mode Selection ---
+    # Server mode
+    server_mode_group = parser.add_argument_group('API Server Mode')
+    server_mode_group.add_argument("--openai-api", action="store_true", help="Run as an OpenAI-compatible API server.")
+    server_mode_group.add_argument("--openai-api-port", type=int, default=8000, help="Port for the API server.")
+
+    # Single prompt mode
+    single_mode_group = parser.add_argument_group('Single Prompt Mode')
     single_mode_group.add_argument("--prompt", type=str, help="Prompt text for single generation.")
 
+    # Batch mode
     batch_mode_group = parser.add_argument_group('Batch Data Generation Mode')
     batch_mode_group.add_argument("--output-jsonl", type=Path, help="Enable batch mode: Path to output JSONL file.")
     input_source_group = batch_mode_group.add_mutually_exclusive_group()
@@ -847,6 +898,8 @@ def main_cli():
     final_base_cfg = load_config(str(args.config)) 
     cfg = merge_configs(final_base_cfg, args)
     
+    app_logger = logging.getLogger() # Get root logger
+
     if cfg.get("chat_template_model_id"):
         from utils.chat_template_helper import ChatTemplateFormatter
         try:
@@ -859,79 +912,68 @@ def main_cli():
 
 
     # --- Configure Logging Based on Effective Level ---
-    # Determine the user's desired overall script output level
     user_desired_logging_level_str = cfg.get("logging_level", "INFO").upper()
     script_effective_log_level = getattr(logging, user_desired_logging_level_str, logging.INFO)
 
-    # Get the root logger, which all other loggers inherit from
-    app_logger = logging.getLogger()
-    
-    # Clear existing handlers from the root logger to prevent duplicate outputs
     for handler in app_logger.handlers[:]:
         app_logger.removeHandler(handler)
     
-    # Add a new stream handler for console output
     stream_handler = logging.StreamHandler(sys.stderr) 
     formatter = logging.Formatter("%(asctime)s [%(levelname)-5.5s] [%(name)-20.20s]: %(message)s")
     stream_handler.setFormatter(formatter)
-    
-    # Set the handler's level to DEBUG. This handler will process *any* message
-    # that gets past the logger's level filter. The logger's level is the primary control.
     stream_handler.setLevel(logging.DEBUG) 
-
     app_logger.addHandler(stream_handler)
     
-    # Set the root logger's level based on the desired script output level.
-    # This is the primary filter for all standard logging messages.
-    if script_effective_log_level == logging.DEBUG:
-        app_logger.setLevel(logging.DEBUG) # Allow all standard logs
-    elif script_effective_log_level in [logging.INFO, logging.WARNING]:
-        app_logger.setLevel(logging.ERROR) # Suppress standard logs below ERROR
-    else: # ERROR, CRITICAL
-        app_logger.setLevel(script_effective_log_level) # Only show errors or critical via standard logging
+    # Set the root logger's level. This is the primary filter.
+    # For server mode, we let Uvicorn handle its own logging, so we just set our app's logger.
+    if not args.openai_api:
+        if script_effective_log_level == logging.DEBUG:
+            app_logger.setLevel(logging.DEBUG)
+        elif script_effective_log_level in [logging.INFO, logging.WARNING]:
+            app_logger.setLevel(logging.ERROR)
+        else:
+            app_logger.setLevel(script_effective_log_level)
+    else:
+        # For server mode, set our logger to the desired level, but Uvicorn will also log.
+        app_logger.setLevel(script_effective_log_level)
 
-    # Control verbosity of specific library loggers
-    # This is done *after* setting the root logger's level.
-    # If the root level is ERROR, setting a library logger to WARNING is fine,
-    # but its WARNING/INFO/DEBUG messages won't show because the root logger filters them out.
-    # This is the desired behavior for INFO/WARNING script levels.
-    # For DEBUG script level, these settings allow finer control over library noise.
+
     if script_effective_log_level <= logging.DEBUG:
-        # In DEBUG mode, allow more verbose library logs, but maybe quiet down known noisy ones slightly
-        logging.getLogger("nltk").setLevel(logging.INFO) # NLTK can be noisy
-        # Other libraries will inherit DEBUG from root or use their own defaults if higher.
-    else: # INFO, WARNING, ERROR, CRITICAL for the script
-        # Quiet down common noisy libraries significantly.
+        logging.getLogger("nltk").setLevel(logging.INFO)
+    else:
         for lib_logger_name in ["openai", "httpx", "httpcore", "requests", "urllib3", "huggingface_hub", "datasets", "nltk"]:
             logging.getLogger(lib_logger_name).setLevel(logging.WARNING)
 
+    if not args.openai_api:
+        if script_effective_log_level == logging.DEBUG:
+            app_logger.info(f"Full DEBUG logging enabled. Effective script level: {user_desired_logging_level_str}")
+        elif script_effective_log_level == logging.INFO:
+            print(f"INFO mode: Progress bar and ban events will be printed. Most logs suppressed. Effective script level: {user_desired_logging_level_str}")
+        elif script_effective_log_level == logging.WARNING:
+            print(f"WARNING mode: Progress bar will be printed. Most logs suppressed. Effective script level: {user_desired_logging_level_str}")
 
-    # User-facing messages about the logging mode (using print for INFO/WARNING as per requirements)
-    # These messages are *not* filtered by the logging system levels we just set.
-    if script_effective_log_level == logging.DEBUG:
-        # For DEBUG, use the logger itself so it's formatted and part of the debug stream.
-        app_logger.info(f"Full DEBUG logging enabled. Effective script level: {user_desired_logging_level_str}")
-    elif script_effective_log_level == logging.INFO:
-        print(f"INFO mode: Progress bar and ban events will be printed. Most logs suppressed. Effective script level: {user_desired_logging_level_str}")
-    elif script_effective_log_level == logging.WARNING:
-        print(f"WARNING mode: Progress bar will be printed. Most logs suppressed. Effective script level: {user_desired_logging_level_str}")
-    # For ERROR/CRITICAL, actual error messages will be logged by app_logger.error/critical if they occur.
-
-    # Pass app_logger (the configured root logger) to functions that need to log standard messages.
-    # The `script_effective_log_level` is passed to control print vs log behavior inside those functions
-    # (specifically for the custom BANNED messages and tqdm disable).
-
+    # --- Mode Dispatching ---
+    is_server_mode = args.openai_api
     is_batch_mode = args.output_jsonl is not None
-    if is_batch_mode:
-        if not args.input_json and not args.input_hf_dataset:
-            app_logger.critical("For batch mode (--output-jsonl), either --input-json or --input-hf-dataset must be specified.")
-            parser.exit(2) 
+    is_single_mode = args.prompt is not None
+
+    # Validate mode selection
+    mode_count = sum([is_server_mode, is_batch_mode, is_single_mode])
+    if mode_count > 1:
+        app_logger.critical("You can only select one mode at a time: --openai-api, --output-jsonl, or --prompt.")
+        parser.exit(2)
+    if mode_count == 0:
+        app_logger.critical("You must specify a mode: --openai-api (server), --output-jsonl (batch), or --prompt (single).")
+        parser.exit(2)
+
+    # Execute the selected mode
+    if is_server_mode:
+        handle_server_mode(cfg, args, app_logger)
+    elif is_batch_mode:
         handle_batch_generation(cfg, args, script_effective_log_level, app_logger)
-    else:
-        if not args.prompt:
-            app_logger.critical("--prompt is required for single generation mode (when --output-jsonl is not used).")
-            parser.exit(2)
+    elif is_single_mode:
         handle_single_generation(cfg, args, script_effective_log_level, app_logger)
+
 
 if __name__ == "__main__":
     main_cli()
