@@ -67,7 +67,7 @@ def _build_banned_prefix_set(chat_tpl, validators) -> frozenset[str]:
         tok.lower()                       ∈ set   (raw token string)
         _decode_token(tok).lower()        ∈ set   (plain-text form)
 
-    so we need only ASCII space variants – special markers (Ġ▁) are handled
+    so we need only ASCII space variants – special markers (Ġ ) are handled
     by the first check.
     """
     from transformers import AutoTokenizer
@@ -689,26 +689,65 @@ class ApiAntiSlopSampler:
         return earliest
 
 
-    def generate(self, prompt: str):
+    def generate(
+        self,
+        prompt: str,
+        max_new_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        min_p: Optional[float] = None,
+    ) -> Generator[str, None, None]:
+        """
+        Generates text, handling validation and back-tracking.
+
+        Args:
+            prompt: The initial text to generate from.
+            max_new_tokens: Optional override for the maximum number of new tokens.
+            temperature: Optional override for the sampling temperature.
+            min_p: Optional override for the min_p sampling parameter.
+        """
+        # Determine effective generation parameters, overriding defaults if provided.
+        effective_max_new_tokens = self.max_new_tokens if max_new_tokens is None else max_new_tokens
+        effective_temperature = self.temperature if temperature is None else temperature
+        effective_min_p = self.min_p if min_p is None else min_p
+
+        # The rest of the parameters (top_p, top_k, etc.) still come from the instance config.
+        # This logic is now inside the generation methods.
+
         if self.request_mode == "stream":
-            yield from self._generate_streamwise(prompt)
+            yield from self._generate_streamwise(
+                prompt,
+                max_new_tokens=effective_max_new_tokens,
+                temperature=effective_temperature,
+                min_p=effective_min_p,
+            )
         else:
-            yield from self._generate_chunkwise(prompt)   # existing logic renamed
+            yield from self._generate_chunkwise(
+                prompt,
+                max_new_tokens=effective_max_new_tokens,
+                temperature=effective_temperature,
+                min_p=effective_min_p,
+            )
 
     # ------------------------------------------------------------------ #
     #  Streaming generation with proper restart on back-track            #
     # ------------------------------------------------------------------ #
-    def _generate_streamwise(self, prompt: str):
+    def _generate_streamwise(
+        self,
+        prompt: str,
+        max_new_tokens: int,
+        temperature: float,
+        min_p: Optional[float],
+    ):
         state = GenerationState(prompt)
         last_yield  = 0
         regex_since = 0
 
-        while state.get_generated_length() < self.max_new_tokens:
+        while state.get_generated_length() < max_new_tokens:
 
             restart_stream = False
             natural_end    = False
 
-            remaining = self.max_new_tokens - state.get_generated_length()
+            remaining = max_new_tokens - state.get_generated_length()
             api_prompt = (
                 state.get_full_text() if self.chat_formatter is None
                 else self.chat_formatter.build_prompt(
@@ -720,10 +759,10 @@ class ApiAntiSlopSampler:
                 prompt_text     = api_prompt,
                 max_tokens      = remaining,
                 top_logprobs    = self.top_logprobs_count,
-                temperature     = self.temperature,
+                temperature     = temperature,
                 top_p           = self.top_p,
                 top_k           = self.top_k,
-                min_p           = self.min_p,
+                min_p           = min_p,
                 timeout         = self.timeout,
                 stop_sequences  = self.stop_sequences,
             )
@@ -821,7 +860,13 @@ class ApiAntiSlopSampler:
 
 
 
-    def _generate_chunkwise(self, prompt: str) -> Generator[str, None, None]:
+    def _generate_chunkwise(
+        self,
+        prompt: str,
+        max_new_tokens: int,
+        temperature: float,
+        min_p: Optional[float],
+    ) -> Generator[str, None, None]:
         """
         Stream text while validating the *entire* prompt + generation after
         every chunk, and log per-chunk timing data to CSV so throughput
@@ -841,8 +886,8 @@ class ApiAntiSlopSampler:
         while True:
             # hard token limit
             if (
-                self.max_new_tokens is not None
-                and state.get_generated_length() >= self.max_new_tokens
+                max_new_tokens is not None
+                and state.get_generated_length() >= max_new_tokens
             ):
                 logger.info("Reached max_new_tokens.")
                 break
@@ -862,10 +907,10 @@ class ApiAntiSlopSampler:
                     prompt_text     = full_prompt,
                     max_tokens      = self.chunk_size,
                     top_logprobs    = self.top_logprobs_count,
-                    temperature     = self.temperature,
+                    temperature     = temperature,
                     top_p           = self.top_p,
                     top_k           = self.top_k,
-                    min_p           = self.min_p,
+                    min_p           = min_p,
                     timeout         = self.timeout,
                     stop_sequences  = self.stop_sequences,
                 )

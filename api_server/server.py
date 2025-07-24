@@ -85,15 +85,25 @@ def _run_generation_for_request(request_data: Dict[str, Any]) -> Dict[str, Any]:
         chat_template_formatter=chat_formatter
     )
 
-    # --- 3. Generate Response ---
+    # --- 3. Extract per-request generation parameters ---
+    max_tokens_req = request_data.get("max_tokens")
+    temperature_req = request_data.get("temperature")
+    min_p_req = request_data.get("min_p")
+
+    # --- 4. Generate Response ---
     try:
-        full_response_parts = list(sampler.generate(prompt_text))
+        full_response_parts = list(sampler.generate(
+            prompt=prompt_text,
+            max_new_tokens=max_tokens_req,
+            temperature=temperature_req,
+            min_p=min_p_req,
+        ))
         full_response = "".join(full_response_parts)
     except Exception as e:
         logger.error(f"Error during generation for a request: {e}", exc_info=True)
         return {"error": f"Generation failed: {e}"}
 
-    # --- 4. Token Counting for Usage ---
+    # --- 5. Token Counting for Usage ---
     prompt_tokens = 0
     completion_tokens = 0
     if sampler.tiktoken_encoding:
@@ -103,7 +113,7 @@ def _run_generation_for_request(request_data: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as e:
             logger.warning(f"Could not count tokens for usage stats: {e}")
 
-    # --- 5. Construct OpenAI-compatible response ---
+    # --- 6. Construct OpenAI-compatible response ---
     response_id = f"chatcmpl-{uuid.uuid4()}"
     created_timestamp = int(time.time())
     model_name = request_data.get("model", config.get("model_name", "antislop-model"))
