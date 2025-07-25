@@ -59,11 +59,7 @@ def _run_generation_for_request(request_data: Dict[str, Any]) -> Dict[str, Any]:
     if chat_formatter and hasattr(chat_formatter, 'tokenizer'):
         # Use the tokenizer's chat template application for robust formatting
         try:
-            prompt_text = chat_formatter.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True # Ensures the prompt ends correctly for the model to continue
-            )
+            prompt_text = chat_formatter.build_base_prompt_from_messages(messages)
         except Exception as e:
             logger.error(f"Error applying chat template: {e}", exc_info=True)
             return {"error": f"Failed to apply chat template: {e}"}

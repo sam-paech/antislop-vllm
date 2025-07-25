@@ -76,3 +76,30 @@ class ChatTemplateFormatter:
             prefix = prefix.replace(self._sys_placeholder, self.system_prompt)
 
         return f"{prefix}{user_prompt}{self._middle}{assistant_so_far}"
+    
+    def build_base_prompt_from_str(self, prompt: str) -> str:
+        messages = [{"role": "user", "content": prompt}]
+        
+        # Insert system prompt if we have one and there's no existing system message
+        if self.system_prompt and (not messages or messages[0]["role"] != "system"):
+            messages.insert(0, {"role": "system", "content": self.system_prompt})
+        
+        with self._lock:
+            templated_prompt = self.tokenizer.apply_chat_template(messages,
+                                                tokenize=False,
+                                                add_generation_prompt=True)
+            return templated_prompt
+
+    def build_base_prompt_from_messages(self, messages) -> str:
+        # Make a copy to avoid modifying the original
+        messages_copy = messages.copy()
+        
+        # Insert system prompt if we have one and there's no existing system message
+        if self.system_prompt and (not messages_copy or messages_copy[0]["role"] != "system"):
+            messages_copy.insert(0, {"role": "system", "content": self.system_prompt})
+        
+        with self._lock:
+            templated_prompt = self.tokenizer.apply_chat_template(messages_copy,
+                                                tokenize=False,
+                                                add_generation_prompt=True)
+            return templated_prompt

@@ -51,6 +51,26 @@ history_lock    = Lock()
 
 chat_formatter = None
 
+# ──────────────────────────────────────────────────────────────────────
+#  Helper: apply prompt‑level templating / chat template (priority)
+# ──────────────────────────────────────────────────────────────────────
+def _format_prompt(
+    raw_prompt: str,
+    cfg: Dict[str, Any],
+    chat_formatter: Optional[Any],
+) -> str:
+    # --- chat‑template wrapping -----------------------------------
+    if chat_formatter is not None:
+        try:
+            # build once; assistant part is left open for generation
+            return chat_formatter.build_base_prompt_from_str(raw_prompt)
+        except Exception as e:
+            raise RuntimeError(f"Chat template formatting failed: {e}")
+
+    # --- no formatting requested ----------------------------------
+    return raw_prompt
+
+
 def _setup_validators(cfg: Dict[str, Any], main_logger: logging.Logger) -> List[Any]:
     validators = []
 
@@ -268,6 +288,10 @@ def handle_server_mode(cfg: Dict[str, Any], args: argparse.Namespace, main_logge
         main_logger.critical("Please install 'fastapi' and 'uvicorn' to run the server: pip install fastapi uvicorn[standard]")
         sys.exit(1)
 
+    if not cfg["chat_template_model_id"]:
+        main_logger.critical("The API server requires chat_template_model_id to be specified in the config.")
+        sys.exit(1)
+
     # Setup shared resources that will be available to all requests
     # This avoids re-initializing models, validators, etc. on every call
     main_logger.info("Initializing shared resources...")
@@ -312,13 +336,12 @@ def handle_single_generation(cfg: Dict[str, Any], args: Any, script_effective_lo
         main_logger.error("Prompt missing for single generation mode.")
         return
     
-    template = cfg.get("prompt_template", "")
-    if template:
-        try:
-            prompt = template.format(prompt=prompt)
-        except KeyError as e:
-            main_logger.error(f"Invalid prompt_template placeholder: {e}")
-            return
+    # unified formatting helper (prompt_template > chat template > raw)
+    try:
+        prompt = _format_prompt(prompt, cfg, chat_formatter)
+    except Exception as e_fmt:
+        main_logger.error(f"Prompt formatting failed: {e_fmt}")
+        return
     
     validators = _setup_validators(cfg, main_logger)
     api_client = _get_api_client(cfg, main_logger)
@@ -472,6 +495,22 @@ def generate_for_prompt_worker(
 
 
     thread_cfg = copy.deepcopy(config)
+
+    try:
+        prompt_text = _format_prompt(prompt_text, thread_cfg, chat_formatter)
+    except Exception as e_fmt:
+        main_logger.error(f"Prompt formatting failed for idx {prompt_idx}: {e_fmt}")
+        return {
+            "prompt_id": prompt_idx,
+            "prompt": prompt_text,
+            "generation": None,
+            "status": "failed",
+            "error": f"prompt formatting: {e_fmt}",
+            "events": [],
+            "duration_sec": 0,
+            "tokens_generated_prompt": 0,
+        }
+    
     validators = _setup_validators(thread_cfg, main_logger)
     api_client = _get_api_client(thread_cfg, main_logger)
     if not api_client:

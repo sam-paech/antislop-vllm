@@ -612,11 +612,7 @@ class ApiAntiSlopSampler:
                 gen_so_far_tokens = state.generated_token_strings[:idx]
                 gen_so_far_text   = _tokens_to_text(gen_so_far_tokens)
 
-                context_chat = (
-                    self.chat_formatter.build_prompt(state.prompt_string, gen_so_far_text)
-                    if self.chat_formatter is not None
-                    else state.prompt_string + gen_so_far_text
-                )
+                context_chat = state.prompt_string + gen_so_far_text
 
                 self.ftpo_samples[context_chat] = {
                     "prompt_raw":       state.prompt_string,
@@ -748,12 +744,7 @@ class ApiAntiSlopSampler:
             natural_end    = False
 
             remaining = max_new_tokens - state.get_generated_length()
-            api_prompt = (
-                state.get_full_text() if self.chat_formatter is None
-                else self.chat_formatter.build_prompt(
-                        state.prompt_string,
-                        state.get_generated_text())
-            )
+            api_prompt = state.prompt_string + state.get_generated_text()
 
             stream = self.api_client.generate_stream(
                 prompt_text     = api_prompt,
@@ -880,8 +871,10 @@ class ApiAntiSlopSampler:
             self._chunk_timings: list[tuple[int, int, float, float]] = []  # chunk, ctx_len, api_s, val_s
 
         chunk_nr = 0
-        state = GenerationState(prompt)
+        state = GenerationState(prompt) # already templated upstream
         last_yield_idx = 0                         # first token not yet sent
+
+        
 
         while True:
             # hard token limit
@@ -893,12 +886,7 @@ class ApiAntiSlopSampler:
                 break
 
             # build prompt for backend
-            if self.chat_formatter is not None:
-                full_prompt = self.chat_formatter.build_prompt(
-                    state.prompt_string, state.get_generated_text()
-                )
-            else:
-                full_prompt = state.get_full_text()
+            full_prompt = prompt + state.get_generated_text()
 
             # ── API call timing ─────────────────────────────────────────────
             t0 = time.perf_counter()

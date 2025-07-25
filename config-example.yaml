@@ -8,6 +8,8 @@ api_key: "xxx"
 
 model_name: "unsloth/gemma-3-1b-it"
 
+# The model id or path containing the tokeniser used for applying the chat template:
+chat_template_model_id: "unsloth/gemma-3-1b-it"
 
 # Slop Configuration
 
