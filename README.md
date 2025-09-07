@@ -123,7 +123,7 @@ python main.py \
     --chat-template-model-id "Qwen/Qwen3-4B" \
     --logging-level "INFO" \
     --slop-phrases-file "banlists/slop_phrases.json" \
-    --top-n-slop_phrases 500 \
+    --top-n-slop-phrases 500 \
     --regex-blocklist-file "banlists/regex_not_x_but_y.json" \
     --ngram-banned-file "banlists/banned_ngrams.json" \
     --max-new-tokens 500 \

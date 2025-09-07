@@ -31,6 +31,7 @@ _BUILTIN_DEFAULT: Dict[str, Any] = {
     },
     "backtracking": {
         "max_retries_per_position": 100,
+        "force_backtrack": False,
     },
     "ngram_validator": {
         # no banned list/file by default
