@@ -40,7 +40,7 @@ system_prompt: ""        # optional; left empty → no system prompt
 generation_params:
   threads: 40
   request_mode: chunk      # chunk | stream (stream might be buggy)
-  chunk_size: 50  # if using chunk request_mode
+  chunk_size: 20  # if using chunk request_mode
   top_logprobs_count: 20
   max_new_tokens: 600
   temperature: 1.0
@@ -52,9 +52,17 @@ generation_params:
   #    This encourages selection of the tail of the top n candidates, for more diverse outputs.
   #    You should probably only use this if using min_p to constrain the distribution.
   #    otherwise you will likely get incoherent completions.
-  invert_probs: true
+  invert_probs: false
   timeout: 120        # seconds
   stop_sequences: []
+  # If true, the banlist only takes effects on whole words/phrases that
+  # are bounded by non-word characters.
+  # Examples:
+  # Our banlist is ["bill"]
+  # If set to true, a ban triggers on "bill" but not on "billion"
+  # If set to false, a ban triggers anytime "bill" occurs as a substring, 
+  # without caring about word boundaries.
+  match_requires_word_boundaries: true
 
 # Refusal detection (batch mode only)
 # This avoids adding refused generations to the generated dpo dataset

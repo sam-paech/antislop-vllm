@@ -22,6 +22,14 @@ class SlopPhraseValidator(BaseValidator):
         self.slop_phrases_keys: Set[str] = set(slop_phrases_dict.keys())
         self.max_phrase_len = max((len(p) for p in self.slop_phrases_keys), default=0)
         self.min_phrase_len = min((len(p) for p in self.slop_phrases_keys), default=0)
+
+        # Configurable boundary behavior (default True)
+        self.match_requires_word_boundaries: bool = True
+        if app_config is not None:
+            try:
+                self.match_requires_word_boundaries = bool(app_config.get("match_requires_word_boundaries", True))
+            except Exception:
+                self.match_requires_word_boundaries = True
         
         # Determine scan_window_size_config based on app_config if provided
         # This is used to estimate a good window size for scanning.
@@ -38,7 +46,8 @@ class SlopPhraseValidator(BaseValidator):
             "SlopPhraseValidator ready "
             f"(count={len(self.slop_phrases_keys)}, "
             f"min_len={self.min_phrase_len}, max_len={self.max_phrase_len}, "
-            f"scan_window_base_size={self.scan_window_base_size})"
+            f"scan_window_base_size={self.scan_window_base_size}",
+            f"require_word_boundaries={self.match_requires_word_boundaries})"
         )
 
     def check(self, state: GenerationState) -> Optional[ViolationInfo]:
@@ -61,7 +70,8 @@ class SlopPhraseValidator(BaseValidator):
             slop_phrases_keys=self.slop_phrases_keys,
             max_phrase_len=self.max_phrase_len,
             min_phrase_len=self.min_phrase_len,
-            check_n_chars_back=len(text_to_scan) 
+            check_n_chars_back=len(text_to_scan),
+            require_word_boundaries=self.match_requires_word_boundaries,
         )
 
         if not phrase:

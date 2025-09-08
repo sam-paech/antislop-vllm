@@ -72,6 +72,7 @@ def detect_disallowed_sequence(
     max_phrase_len: int,
     min_phrase_len: int,
     check_n_chars_back: int = 1,
+    require_word_boundaries: bool = True,
 ) -> Tuple[Optional[str], Optional[int]]:
     """
     Scan the last *check_n_chars_back* characters of *text* for any phrase
@@ -120,6 +121,10 @@ def detect_disallowed_sequence(
             global_pos = win_start + start
             right_pos  = global_pos + length
 
+            if not require_word_boundaries:
+                # No boundary checks — accept any substring
+                return cand, global_pos
+
             need_left  = _is_word_char(cand[0])
             need_right = _is_word_char(cand[-1])
 
@@ -136,5 +141,6 @@ def detect_disallowed_sequence(
 
             if left_ok and right_ok:
                 return cand, global_pos        # ← EARLY EXIT
+
 
     return None, None
