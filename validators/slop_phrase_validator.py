@@ -43,12 +43,13 @@ class SlopPhraseValidator(BaseValidator):
             self.scan_window_base_size = max(self.scan_window_base_size, estimated_chars_per_chunk)
 
         logger.info(
-            "SlopPhraseValidator ready "
+            f"SlopPhraseValidator ready "
             f"(count={len(self.slop_phrases_keys)}, "
             f"min_len={self.min_phrase_len}, max_len={self.max_phrase_len}, "
-            f"scan_window_base_size={self.scan_window_base_size}",
+            f"scan_window_base_size={self.scan_window_base_size}, "
             f"require_word_boundaries={self.match_requires_word_boundaries})"
         )
+
 
     def check(self, state: GenerationState) -> Optional[ViolationInfo]:
         if not self.slop_phrases_keys or state.get_generated_length() == 0 or self.min_phrase_len == 0:
