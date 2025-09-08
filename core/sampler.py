@@ -57,7 +57,7 @@ _BANNED_PREFIX_LOCK = Lock()
 # Set a custom path via environment var, or it defaults here.
 _NGRAM_BT_FAIL_LOG = os.getenv(
     "ANTISLOP_NGRAM_BT_FAIL_LOG",
-    "/workspace/auto-antislop/ngram_bt_failures.jsonl"
+    "ngram_bt_failures.jsonl"
 )
 _BT_FAIL_LOG_LOCK = Lock()
 
