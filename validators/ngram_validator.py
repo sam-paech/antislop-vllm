@@ -5,7 +5,6 @@ from typing import List, Optional, Set, Tuple, Union, Dict, Any
 from collections import Counter # Not strictly needed for validator, but good for n-gram concepts
 
 import nltk
-import os, json, time
 
 from .base_validator import BaseValidator
 from state.generation_state import GenerationState
@@ -220,24 +219,7 @@ class NGramValidator(BaseValidator):
         if tok_idx is None:
             # This can happen if the character position is somehow outside the tokenized spans
             # or if the text has changed in a way that invalidates the mapping.
-            logger.error(
-                "NGramValidator: Could not map char_pos %d to token_idx for n-gram %s.",
-                violation_char_pos, ' '.join(matched_ngram_tuple)
-            )
-            try:
-                path = os.getenv("ANTISLOP_NGRAM_CHARIDX_LOG")
-                if path:
-                    rec = {
-                        "ts": time.time(),
-                        "char_pos": int(violation_char_pos),
-                        "ngram_tuple": list(matched_ngram_tuple),
-                        "ngram_string": ' '.join(matched_ngram_tuple),
-                        "snippet": generated_text[max(0, violation_char_pos-40): violation_char_pos+40].replace("\n"," "),
-                    }
-                    with open(path, "a", encoding="utf-8") as fh:
-                        fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            except Exception:
-                pass
+            logger.error(f"NGramValidator: Could not map char_pos {violation_char_pos} to token_idx for n-gram {' '.join(matched_ngram_tuple)}.")
             return None
 
         # Check if this specific violation (at this token index, for this n-gram) has been ignored

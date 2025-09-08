@@ -25,7 +25,6 @@ import logging
 import math
 import time
 import random
-import json
 from typing import Dict, Generator, List, Optional, Tuple, Callable, Any
 
 import tiktoken # Added tiktoken
@@ -52,30 +51,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 _BANNED_PREFIX_CACHE: dict[str, frozenset[str]] = {}
 _BANNED_PREFIX_LOCK = Lock()
-
-# ── n‑gram backtrack failure audit (JSONL) ─────────────────────────────
-# Set a custom path via environment var, or it defaults here.
-_NGRAM_BT_FAIL_LOG = os.getenv(
-    "ANTISLOP_NGRAM_BT_FAIL_LOG",
-    "ngram_bt_failures.jsonl"
-)
-_BT_FAIL_LOG_LOCK = Lock()
-
-def _log_ngram_bt_failure(record: dict) -> None:
-    try:
-        line = json.dumps(record, ensure_ascii=False)
-    except Exception:
-        # Fallback – never crash the sampler on logging
-        try:
-            line = json.dumps({"_serialization_error": True}, ensure_ascii=False)
-        except Exception:
-            return
-    try:
-        with _BT_FAIL_LOG_LOCK:
-            with open(_NGRAM_BT_FAIL_LOG, "a", encoding="utf-8") as fh:
-                fh.write(line + "\n")
-    except Exception as e:
-        logger.error("Failed to write n‑gram backtrack audit: %s", e)
 
 
 def _build_banned_prefix_set(chat_tpl, validators) -> frozenset[str]:
@@ -444,70 +419,10 @@ class ApiAntiSlopSampler:
         def _abort() -> bool:
             self._suppress_violation(vio)   # ← remember: vio is already in scope
             return False                       # [(token, logp)]
-        
-        # Track which alts we’ve already tried at this position across detections
-        tried_here = self._tried_alternatives.setdefault(idx, set())
-
-        # Collect rung‑by‑rung diagnostics for this *attempt*
-        rung_debug = []   # each: {"rung": int, "temp": ..., "min_p": ..., "top_p": ..., "top_k": ..., "pairs": int, "valid_pairs": int}
-
-        def _audit_and_abort(reason: str) -> bool:
-            """
-            Emit a JSONL record only for n‑gram violations when we cannot pick any candidate
-            in this detection attempt. Then apply your current suppression behavior.
-            """
-            if vio.validator_type == "ngram":
-                # Snapshot alternatives with reasons
-                alts_info = []
-                if lp_list:
-                    for tok, logp in lp_list:
-                        if tok == banned_token:
-                            continue
-                        # classify why this alt is not immediately usable
-                        tried = tok in tried_here
-                        ok, why = self._check_hypothetical_state(state, idx, tok)
-                        alts_info.append({
-                            "tok_raw": tok,
-                            "tok_decoded": _decode_token(tok),
-                            "logprob": float(logp),
-                            "tried": bool(tried),
-                            "valid_now": bool(ok),
-                            "blocked_by": None if ok else (why[0] if why else None),
-                            "blocked_detail": None if ok else (why[1] if why else None),
-                        })
-
-                rec = {
-                    "ts": time.time(),
-                    "reason": reason,                     # "no_logprobs" | "no_valid_candidates"
-                    "idx": idx,
-                    "banned_token_raw": banned_token,
-                    "banned_token_decoded": _decode_token(banned_token),
-                    "top_logprobs_count": 0 if not lp_list else len(lp_list),
-                    "tried_here": len(tried_here),
-                    "ladder": rung_debug,
-                    "gen_config": {
-                        "temperature": self.temperature,
-                        "min_p": self.min_p,
-                        "top_p": self.top_p,
-                        "top_k": self.top_k,
-                    },
-                    # from validator details (if available)
-                    "ngram_tuple": list(vio.details.get("ngram_tuple", [])) if isinstance(vio.details, dict) else [],
-                    "ngram_string": vio.details.get("ngram_string") if isinstance(vio.details, dict) else None,
-                    "context": vio.details.get("context") if isinstance(vio.details, dict) else None,
-                }
-                # cap to keep lines reasonable
-                rec["alts"] = alts_info[:80]
-                _log_ngram_bt_failure(rec)
-
-            # keep your current suppression semantics
-            self._suppress_violation(vio)
-            return False
 
         if not lp_list:
             logger.error("Back-track failed — no logprobs available.")
-            return _audit_and_abort("no_logprobs")
-
+            return _abort()
 
         tried_here   = self._tried_alternatives.setdefault(idx, set())
         invert_probs = bool(getattr(self, "gen_config", {}).get("invert_probs", True))
@@ -589,10 +504,7 @@ class ApiAntiSlopSampler:
         valid_pairs = []
         for relax_idx, (temp, min_p, top_p, top_k) in enumerate(attempts):
             pairs = _build_pairs(temp, min_p, top_p, top_k)
-            rung = {"rung": relax_idx, "temp": temp, "min_p": min_p, "top_p": top_p, "top_k": top_k, "pairs": len(pairs)}
             if not pairs:
-                rung["valid_pairs"] = 0
-                rung_debug.append(rung)
                 continue
 
             # Invert only while min_p still active (relax_idx 0 or 1)
@@ -601,31 +513,24 @@ class ApiAntiSlopSampler:
                 p_max, p_min = max(p_vals), min(p_vals)
                 pairs = [(tok, (p_max - pt) + p_min) for tok, pt in pairs]
                 Z_inv = sum(pt for _, pt in pairs)
-                pairs = [(tok, (pt / Z_inv) if Z_inv else (1.0 / len(pairs))) for tok, pt in pairs]
+                if Z_inv == 0.0:
+                    # fall back to a uniform distribution to avoid div by 0
+                    uniform = 1.0 / len(pairs) if pairs else 0.0
+                    pairs = [(tok, uniform) for tok, _ in pairs]
+                else:
+                    pairs = [(tok, pt / Z_inv) for tok, pt in pairs]
 
-            cur_valid = []
-            for tok, pt in pairs:
-                if pt <= 0:
-                    continue
-                if tok in tried_here:
-                    continue
-                if not _is_valid(tok):
-                    continue
-                cur_valid.append((tok, pt))
-
-            rung["valid_pairs"] = len(cur_valid)
-            rung_debug.append(rung)
-
-            if cur_valid:
-                valid_pairs = cur_valid
+            valid_pairs = [(tok, pt) for tok, pt in pairs
+               if pt > 0 and tok not in tried_here and _is_valid(tok)]
+            if valid_pairs:
                 break
 
-
         if not valid_pairs:
-            with open('fails.txt', 'a') as f:
+            import json
+            with open('/workspace/auto-antislop/fails.txt', 'a') as f:
                 f.write(banned_token + ', ' + str(self.min_p) +', ' + str(self.top_logprobs_count) +  '\n' + json.dumps(lp_list) +  '\n\n')
             logger.error("Back-track: no valid next-token candidates found.")
-            return _audit_and_abort("no_valid_candidates")
+            return _abort()
 
         # sample replacement
         tokens, probs = zip(*valid_pairs)
