@@ -41,14 +41,18 @@ _BUILTIN_DEFAULT: Dict[str, Any] = {
 }
 
 def _deep_merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
-    """b ← a  (a wins only where b lacks the key).  Non-dict leaves are copied."""
-    out: Dict[str, Any] = copy.deepcopy(b)
-    for k, v in a.items():
+    """
+    Return a copy of *a* updated with keys from *b* (i.e., *b* overrides *a*).
+    Non-dict leaves from *b* replace *a*; nested dicts are merged recursively.
+    """
+    out: Dict[str, Any] = copy.deepcopy(a)
+    for k, v in (b or {}).items():
         if k in out and isinstance(out[k], dict) and isinstance(v, dict):
-            out[k] = _deep_merge(v, out[k])
+            out[k] = _deep_merge(out[k], v)
         else:
             out[k] = copy.deepcopy(v)
     return out
+
 
 def _str2bool(s: str) -> bool:
     if isinstance(s, bool):

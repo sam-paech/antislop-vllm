@@ -522,7 +522,10 @@ class ApiAntiSlopSampler:
                 break
 
         if not valid_pairs:
-            #logger.error("Back-track: no valid next-token candidates found.")
+            import json
+            with open('/workspace/auto-antislop/fails.txt', 'a') as f:
+                f.write(banned_token + ', ' + str(self.min_p) +', ' + str(self.top_logprobs_count) +  '\n' + json.dumps(lp_list) +  '\n\n')
+            logger.error("Back-track: no valid next-token candidates found.")
             return _abort()
 
         # sample replacement
