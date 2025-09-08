@@ -188,9 +188,16 @@ class ApiClient(BaseApiClient):
                     logger.warning("Malformed SSE line: %s", raw[:160])
                     continue
 
+                # Pass-through OpenAI-style streamed error packets
+                if isinstance(obj, dict) and obj.get("error"):
+                    err = obj["error"]
+                    msg = (err.get("message") if isinstance(err, dict) else str(err)) or "Upstream stream error"
+                    raise requests.HTTPError(msg, response=resp)
+
                 if not obj.get("choices"):
                     continue
                 choice = obj["choices"][0]
+
 
                 # -- incremental text fragment ------------------------------
                 generated_text = choice.get("text", "")
@@ -302,9 +309,17 @@ class ApiClient(BaseApiClient):
         data = resp.json()
         logger.debug(f"Raw response: {json.dumps(data)[:2000]}")
 
+        # Pass-through OpenAI-style error embedded in a 200 OK
+        if "error" in data and data["error"]:
+            err = data["error"]
+            msg = (err.get("message") if isinstance(err, dict) else str(err)) or "Upstream error"
+            # Attach original response so callers can propagate status/body
+            raise requests.HTTPError(msg, response=resp)
+
+        # Treat “no choices” as an upstream failure
         if not data.get("choices"):
-            logger.warning("API response contained no choices.")
-            return ApiChunkResult(generated_text="", finish_reason="no_choice")
+            raise requests.HTTPError("Upstream returned no choices", response=resp)
+
 
         choice = data["choices"][0]
 

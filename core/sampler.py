@@ -215,6 +215,10 @@ class ApiAntiSlopSampler:
         self.chat_formatter = chat_template_formatter
         self.force_backtrack = bool(config.get("backtracking", {}).get("force_backtrack", False))
 
+        # API retry policy (sampler-level)
+        self.api_retry_attempts = int(gen.get("api_retry_attempts", 5))
+        self.api_retry_delay_sec = float(gen.get("api_retry_delay_sec", 1.0))
+
         back = config.get("backtracking", {})
         self.max_retries_per_position = back.get("max_retries_per_position", 100)
 
@@ -892,45 +896,63 @@ class ApiAntiSlopSampler:
             full_prompt = prompt + state.get_generated_text()
 
             # ── API call timing ─────────────────────────────────────────────
-            t0 = time.perf_counter()
-            try:
-                chunk = self.api_client.generate_chunk(
-                    prompt_text     = full_prompt,
-                    max_tokens      = self.chunk_size,
-                    top_logprobs    = self.top_logprobs_count,
-                    temperature     = temperature,
-                    top_p           = self.top_p,
-                    top_k           = self.top_k,
-                    min_p           = min_p,
-                    timeout         = self.timeout,
-                    stop_sequences  = self.stop_sequences,
-                )
-            # ── friendly handling of “context length” overflow ───────────
-            except requests.exceptions.HTTPError as e:
-                resp_json = {}
-                if e.response is not None:
-                    try:
-                        resp_json = e.response.json()
-                    except Exception:
-                        pass
-
-                if (
-                    e.response is not None
-                    and e.response.status_code == 400
-                    and "maximum context length" in resp_json.get("message", "").lower()
-                ):
-                    logger.warning(
-                        "Generation aborted for this prompt – the model’s "
-                        "context window was exceeded: %s",
-                        resp_json.get("message", "").rstrip()
+            attempt = 0
+            while True:
+                t0 = time.perf_counter()
+                try:
+                    chunk = self.api_client.generate_chunk(
+                        prompt_text     = full_prompt,
+                        max_tokens      = self.chunk_size,
+                        top_logprobs    = self.top_logprobs_count,
+                        temperature     = temperature,
+                        top_p           = self.top_p,
+                        top_k           = self.top_k,
+                        min_p           = min_p,
+                        timeout         = self.timeout,
+                        stop_sequences  = self.stop_sequences,
                     )
-                else:
-                    logger.error("API call failed: %s", e, exc_info=True)
-                break   # keep the existing control-flow (skip further chunks)
+                    api_sec = time.perf_counter() - t0
+                    break  # success
+                except requests.exceptions.HTTPError as e:
+                    resp_json = {}
+                    if e.response is not None:
+                        try:
+                            resp_json = e.response.json()
+                        except Exception:
+                            pass
+                    # Do not retry context-length overflows; just stop this prompt.
+                    if (
+                        e.response is not None
+                        and e.response.status_code == 400
+                        and "maximum context length" in str(resp_json.get("message", "")).lower()
+                    ):
+                        logger.warning(
+                            "Generation aborted for this prompt – the model’s context window was exceeded: %s",
+                            str(resp_json.get("message", "")).rstrip()
+                        )
+                        return  # exit the generator early
+                    attempt += 1
+                    if attempt <= self.api_retry_attempts:
+                        logger.warning(
+                            "API HTTPError (attempt %d/%d): %s — retrying in %.1fs",
+                            attempt, self.api_retry_attempts, e, self.api_retry_delay_sec
+                        )
+                        time.sleep(self.api_retry_delay_sec)
+                        continue
+                    logger.error("API HTTPError after retries: %s", e)
+                    raise
+                except Exception as e:
+                    attempt += 1
+                    if attempt <= self.api_retry_attempts:
+                        logger.warning(
+                            "API call failed (attempt %d/%d): %s — retrying in %.1fs",
+                            attempt, self.api_retry_attempts, e, self.api_retry_delay_sec
+                        )
+                        time.sleep(self.api_retry_delay_sec)
+                        continue
+                    logger.error("API call failed after retries: %s", e)
+                    raise
 
-            except Exception as e:
-                logger.error("API call failed: %s", e, exc_info=True)
-                break
             api_sec = time.perf_counter() - t0
 
             if not chunk.token_strings:            # end-of-stream

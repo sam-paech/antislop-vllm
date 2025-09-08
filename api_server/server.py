@@ -3,6 +3,8 @@ import uuid
 import json
 import logging
 from typing import List, Dict, Any, Optional
+import requests
+
 
 from fastapi import FastAPI, Request, Response, status
 from fastapi.concurrency import run_in_threadpool
@@ -95,9 +97,40 @@ def _run_generation_for_request(request_data: Dict[str, Any]) -> Dict[str, Any]:
             min_p=min_p_req,
         ))
         full_response = "".join(full_response_parts)
+    except requests.HTTPError as e:
+        # Upstream provided an HTTP response — propagate its status/body
+        resp = getattr(e, "response", None)
+        status_code = int(getattr(resp, "status_code", 502) or 502)
+        body_text = None
+        content_type = "application/json"
+        if resp is not None:
+            try:
+                body_text = json.dumps(resp.json())
+            except Exception:
+                try:
+                    body_text = resp.text
+                    # crude content-type inference
+                    if not body_text.lstrip().startswith(("{", "[")):
+                        content_type = "text/plain; charset=utf-8"
+                except Exception:
+                    body_text = json.dumps({"error": str(e)})
+        else:
+            body_text = json.dumps({"error": str(e)})
+        return {
+            "error": "upstream_error",
+            "http_status": status_code,
+            "error_body": body_text,
+            "content_type": content_type,
+        }
     except Exception as e:
         logger.error(f"Error during generation for a request: {e}", exc_info=True)
-        return {"error": f"Generation failed: {e}"}
+        return {
+            "error": f"Generation failed: {e}",
+            "http_status": 500,
+            "error_body": json.dumps({"error": str(e)}),
+            "content_type": "application/json",
+        }
+
 
     # --- 5. Token Counting for Usage ---
     prompt_tokens = 0
@@ -162,10 +195,19 @@ async def create_chat_completion(request: Request):
     result = await run_in_threadpool(_run_generation_for_request, request_data)
 
     if "error" in result:
+        # If upstream status/body were provided, pass them through verbatim
+        if "http_status" in result and "error_body" in result:
+            return Response(
+                content=result["error_body"],
+                status_code=int(result.get("http_status", 500)),
+                media_type=result.get("content_type", "application/json"),
+            )
+        # Fallback: generic 500 with our error envelope
         return Response(
             content=json.dumps(result),
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            media_type="application/json"
+            media_type="application/json",
         )
+
 
     return Response(content=json.dumps(result), media_type="application/json")
