@@ -48,11 +48,6 @@ generation_params:
   top_k: 50
   min_p: 0.03
   
-  # Inverts the probability distribution after other sampling modifications have been applied
-  #    This encourages selection of the tail of the top n candidates, for more diverse outputs.
-  #    You should probably only use this if using min_p to constrain the distribution.
-  #    otherwise you will likely get incoherent completions.
-  invert_probs: false
   timeout: 120        # seconds
   stop_sequences: []
   # If true, the banlist only takes effects on whole words/phrases that

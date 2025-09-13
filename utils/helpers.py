@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__) # Logger for this module
 # --------------------------------------------------------------------- #
 _BUILTIN_DEFAULT: Dict[str, Any] = {
     "logging_level": "INFO",
+    "ban_strength": 1.0,  # 0..1 soft-ban strength (1 = hard ban)
     "generation_params": {
         "chunk_size":        20,
         "top_logprobs_count": 20,
@@ -34,11 +35,11 @@ _BUILTIN_DEFAULT: Dict[str, Any] = {
         "force_backtrack": False,
     },
     "ngram_validator": {
-        # no banned list/file by default
         "remove_stopwords": True,
         "language":         "english",
     },
 }
+
 
 def _deep_merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -134,6 +135,10 @@ def add_common_generation_cli_args(parser: argparse.ArgumentParser, base_cfg: Di
         help="Path to a previous-iteration creative-writing JSONL. "
              "Every record whose generation was a refusal will be skipped."
     )
+    common_group.add_argument("--ban-strength",
+                            type=float,
+                            help="Soft-ban strength in [0,1]. 0=no ban, 1=hard ban.")
+
 
     gen_param_group = parser.add_argument_group('Generation Parameters (override config.yaml)')
     gen_param_group.add_argument("--chunk-size", type=int, default=g_default.get("chunk_size"), help="Chunk size for API requests.")
@@ -152,14 +157,6 @@ def add_common_generation_cli_args(parser: argparse.ArgumentParser, base_cfg: Di
                                  default=b_default.get("max_retries_per_position"),
                                  help="Max retries for backtracking at a single token position.")
     
-    gen_param_group.add_argument(
-        "--invert-probs",
-        type=_str2bool,
-        default=g_default.get("invert_probs"),
-        metavar="true/false",
-        help="Invert probability mass before sampling (overrides config.yaml)."
-    )
-
     ngram_group = parser.add_argument_group('N-Gram Validator Options (override config.yaml)')
     ngram_group.add_argument("--ngram-banned-list", type=str, help="Comma-separated list of n-grams to ban (e.g., \"this is one,another one\"). Each n-gram string will be tokenized. Overrides file and config list.")
     ngram_group.add_argument("--ngram-banned-file", type=str, default=ngram_default.get("banned_file"), help="Path to JSON file with banned n-grams (list of strings or list of lists of strings).")
@@ -179,7 +176,7 @@ def merge_configs(base_cfg: Dict[str, Any], cli_args: argparse.Namespace) -> Dic
         "chat_template_model_id", "request_mode",
         "force_backtrack", "prompt_template",
         "system_prompt", "enable_refusal_detection",
-        "refusals_file", 
+        "refusals_file", "ban_strength",
     ]
 
     for key in scalar_keys:
@@ -200,7 +197,6 @@ def merge_configs(base_cfg: Dict[str, Any], cli_args: argparse.Namespace) -> Dic
     gen_param_keys = [
         "chunk_size", "top_logprobs_count", "max_new_tokens",
         "temperature", "top_p", "top_k", "min_p", "timeout",
-        "invert_probs", 
     ]
     for key in gen_param_keys:
         if hasattr(cli_args, key) and getattr(cli_args, key) is not None:

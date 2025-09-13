@@ -215,6 +215,14 @@ class ApiAntiSlopSampler:
         self.chat_formatter = chat_template_formatter
         self.force_backtrack = bool(config.get("backtracking", {}).get("force_backtrack", False))
 
+        # Soft-ban strength (0..1). Applies to phrase/ngram, not regex.
+        try:
+            self.ban_strength = float(config.get("ban_strength", 1.0))
+        except Exception:
+            self.ban_strength = 1.0
+        self.ban_strength = max(0.0, min(1.0, self.ban_strength))
+
+
         # API retry policy (sampler-level)
         self.api_retry_attempts = int(gen.get("api_retry_attempts", 5))
         self.api_retry_delay_sec = float(gen.get("api_retry_delay_sec", 1.0))
@@ -424,21 +432,37 @@ class ApiAntiSlopSampler:
             logger.error("Back-track failed — no logprobs available.")
             return _abort()
 
-        tried_here   = self._tried_alternatives.setdefault(idx, set())
-        invert_probs = bool(getattr(self, "gen_config", {}).get("invert_probs", True))
+        # NEW: honour soft-ban strength; 1.0 = hard ban, 0.0 = no penalty
+        try:
+            ban_s = float(getattr(self, "ban_strength", 1.0))
+        except Exception:
+            ban_s = 1.0
+        ban_s = max(0.0, min(1.0, ban_s))
+        include_banned_scaled_global = (vio.validator_type in {"slop_phrase", "ngram"} and ban_s < 1.0)
 
+        tried_here   = self._tried_alternatives.setdefault(idx, set())
         logger.warning(
             f"Back-tracking @tok={idx} orig='{banned_token}' ban='{vio.details}'."
         )
 
         # ── utility: validate a single token once per call ───────────────
-        validation_cache = {}              # tok_id -> bool
-        def _is_valid(tok_id: str) -> bool:
-            if tok_id in validation_cache:
-                return validation_cache[tok_id]
-            ok, _ = self._check_hypothetical_state(state, idx, tok_id)
-            validation_cache[tok_id] = ok
+        validation_cache = {}              # tok_str -> bool
+        def _is_valid(tok_str: str) -> bool:
+            if tok_str in validation_cache:
+                return validation_cache[tok_str]
+            ok, _ = self._check_hypothetical_state(state, idx, tok_str)
+            validation_cache[tok_str] = ok
             return ok
+
+        # NEW: normalise “is banned” across raw/decoded to avoid mismatches.
+        banned_decoded_lc = _decode_token(banned_token).lower()
+        def _is_same_banned(tok_str: str) -> bool:
+            if tok_str == banned_token:
+                return True
+            try:
+                return _decode_token(tok_str).lower() == banned_decoded_lc
+            except Exception:
+                return False
 
         # ── build base (token, prob) list after temperature softmax ──────
         logits         = [lp for _, lp in lp_list]
@@ -447,7 +471,7 @@ class ApiAntiSlopSampler:
         Z              = sum(tempered)
         base_pairs     = [(tok, pt / Z if Z > 0 else 1 / len(tempered))
                         for (tok, _), pt in zip(lp_list, tempered)
-                        if tok != banned_token]                         # banned removed
+                        if not _is_same_banned(tok)]                         # NEW: hard‑exclude by raw OR decoded
 
         if not base_pairs:
             logger.error("Back-track: after removing banned token no candidates left.")
@@ -455,6 +479,8 @@ class ApiAntiSlopSampler:
 
         # ─────────────────────────────────────────────────────────────────
         #  1. NEXT-TOKEN SELECTION  (honours --force-backtrack)
+        #      NEW: for phrase/ngram with ban_strength<1 keep a downscaled
+        #      banned token in the pool; if it wins we allow+supress+recheck.
         # ─────────────────────────────────────────────────────────────────
 
         def _build_pairs(temp, min_p, top_p, top_k):
@@ -462,10 +488,20 @@ class ApiAntiSlopSampler:
             logits  = [lp for _, lp in lp_list]
             raw_p   = [math.exp(l) for l in logits]
             probs_t = [p ** (1.0 / max(temp, 1e-6)) for p in raw_p]
-            Z       = sum(probs_t)
-            pairs   = [(tok, pt / Z if Z else 1 / len(probs_t))
-                    for (tok, _), pt in zip(lp_list, probs_t)
-                    if tok != banned_token]
+
+            tmp = []
+            for (tok, _), pt in zip(lp_list, probs_t):
+                if _is_same_banned(tok):
+                    if include_banned_scaled_global:
+                        pt *= (1.0 - ban_s)   # NEW: soft-ban scaling
+                    else:
+                        continue              # hard exclude
+                tmp.append((tok, pt))
+
+            Z2 = sum(pt for _, pt in tmp)
+            if Z2 <= 0:
+                return []
+            pairs = [(tok, pt / Z2) for tok, pt in tmp]
 
             # min-p filter
             if min_p is not None and pairs:
@@ -507,21 +543,14 @@ class ApiAntiSlopSampler:
             if not pairs:
                 continue
 
-            # Invert only while min_p still active (relax_idx 0 or 1)
-            if invert_probs and relax_idx < 2:
-                p_vals = [pt for _, pt in pairs]
-                p_max, p_min = max(p_vals), min(p_vals)
-                pairs = [(tok, (p_max - pt) + p_min) for tok, pt in pairs]
-                Z_inv = sum(pt for _, pt in pairs)
-                if Z_inv == 0.0:
-                    # fall back to a uniform distribution to avoid div by 0
-                    uniform = 1.0 / len(pairs) if pairs else 0.0
-                    pairs = [(tok, uniform) for tok, _ in pairs]
+            # NEW: allow the banned token only when soft-ban is active
+            valid_pairs = []
+            for tok, pt in pairs:
+                if include_banned_scaled_global and _is_same_banned(tok):
+                    valid_pairs.append((tok, pt))
                 else:
-                    pairs = [(tok, pt / Z_inv) for tok, pt in pairs]
-
-            valid_pairs = [(tok, pt) for tok, pt in pairs
-               if pt > 0 and tok not in tried_here and _is_valid(tok)]
+                    if pt > 0 and tok not in tried_here and _is_valid(tok):
+                        valid_pairs.append((tok, pt))
             if valid_pairs:
                 break
 
@@ -532,10 +561,18 @@ class ApiAntiSlopSampler:
             logger.error("Back-track: no valid next-token candidates found.")
             return _abort()
 
-        # sample replacement
+        # sample replacement (or possibly the banned token if soft-ban is active)
         tokens, probs = zip(*valid_pairs)
         choice = random.choices(tokens, weights=probs, k=1)[0]
 
+        # NEW: if soft-ban didn't stick, allow & suppress then re-run validators
+        if include_banned_scaled_global and _is_same_banned(choice):
+            self._suppress_violation(vio)
+            next_vio = self._run_validators(state)
+            if not next_vio:
+                return True
+            # continue fixing via the outer driver; we handled this position
+            return True
 
         # ─────────────────────────────────────────────────────────────────
         # 2. TAIL-CANDIDATE SELECTION
@@ -551,7 +588,7 @@ class ApiAntiSlopSampler:
         else:
             tail_min_p = 0.01
 
-        tail_ids: list[str] = []
+        tail_toks: list[str] = []
         if max_tail > 0:
             # re-apply tail-specific filters on **base_pairs** (no inversion!)
             tail_pairs = base_pairs.copy()
@@ -583,7 +620,7 @@ class ApiAntiSlopSampler:
                 # skip tokens that don't contain any alphanumeric chars
                 if not any(c.isalnum() for c in tok):
                     continue
-                if tok == banned_token or tok in tried_here:
+                if _is_same_banned(tok) or tok in tried_here:   # NEW: consistent skip
                     continue
                 if not _is_valid(tok):
                     continue
@@ -591,11 +628,11 @@ class ApiAntiSlopSampler:
 
                 
                 #print('adding', tok)
-                tail_ids.append(tok)
-                if len(tail_ids) >= max_tail:
+                tail_toks.append(tok)
+                if len(tail_toks) >= max_tail:
                     break
 
-        multi_chosen_decoded = [_decode_token(t) for t in tail_ids]
+        multi_chosen_decoded = [_decode_token(t) for t in tail_toks]
 
         # ── commit replacement ───────────────────────────────────────────
         tried_here.add(choice)
@@ -610,11 +647,11 @@ class ApiAntiSlopSampler:
         logger.warning(
             f"    ✓ replacement='{choice}' "
             f"(T={self.temperature}, min_p={self.min_p}, "
-            f"top_p={self.top_p}, top_k={self.top_k}, invert={invert_probs})"
+            f"top_p={self.top_p}, top_k={self.top_k})"
         )
 
         # ── ftpo sample capture (legacy + new multi-fields) ──────────────
-        if tail_ids:
+        if tail_toks:
             try:
                 gen_so_far_tokens = state.generated_token_strings[:idx]
                 gen_so_far_text   = _tokens_to_text(gen_so_far_tokens)
@@ -634,7 +671,7 @@ class ApiAntiSlopSampler:
 
                     # NEW multi-token keys
                     "multi_chosen_decoded":  multi_chosen_decoded,
-                    "multi_chosen_raw":      tail_ids,
+                    "multi_chosen_raw":      tail_toks,
                     "multi_rejected_decoded": [_decode_token(banned_token)],
                     "multi_rejected_raw":     [banned_token],
 
@@ -662,6 +699,7 @@ class ApiAntiSlopSampler:
                 logger.error(f"ftpo-pair capture failed: {e_log}", exc_info=True)
 
         return True
+
 
 
 
