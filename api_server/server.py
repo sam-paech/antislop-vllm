@@ -4,7 +4,7 @@ import json
 import logging
 from typing import List, Dict, Any, Optional
 import requests
-
+import copy
 
 from fastapi import FastAPI, Request, Response, status
 from fastapi.concurrency import run_in_threadpool
@@ -46,7 +46,12 @@ def _run_generation_for_request(request_data: Dict[str, Any]) -> Dict[str, Any]:
     """
     # Retrieve shared resources
     config = SHARED_RESOURCES["config"]
-    validators = SHARED_RESOURCES["validators"]
+    # Clone shared validators so suppression (_ignored) is per‑request only.
+    validators_template = SHARED_RESOURCES["validators"]
+    validators = [copy.copy(v) for v in validators_template]
+    for v in validators:
+        # fresh suppression cache for this generation
+        v._ignored = set()
     api_client = SHARED_RESOURCES["api_client"]
     chat_formatter = SHARED_RESOURCES["chat_formatter"]
     logger = SHARED_RESOURCES["logger"]
