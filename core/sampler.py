@@ -136,7 +136,12 @@ def _build_banned_prefix_set(chat_tpl, validators) -> frozenset[str]:
     )
     return frozenset(out)
 
-
+def _scale_ban_strength(x: float) -> float:
+    # Deciles map to decades: 0.1→0.9, 0.2→0.99, …, 0.9→0.999999999
+    x = max(0.0, min(1.0, float(x)))
+    if x >= 1.0:
+        return 1.0
+    return 1.0 - 10.0 ** (-10.0 * x)
 
 
 class ApiAntiSlopSampler:
@@ -432,13 +437,14 @@ class ApiAntiSlopSampler:
             logger.error("Back-track failed — no logprobs available.")
             return _abort()
 
-        # NEW: honour soft-ban strength; 1.0 = hard ban, 0.0 = no penalty
+        # soft-ban strength; 1.0 = hard ban, 0.0 = no penalty
         try:
             ban_s = float(getattr(self, "ban_strength", 1.0))
         except Exception:
             ban_s = 1.0
-        ban_s = max(0.0, min(1.0, ban_s))
+        ban_s = _scale_ban_strength(max(0.0, min(1.0, ban_s)))
         include_banned_scaled_global = (vio.validator_type in {"slop_phrase", "ngram"} and ban_s < 1.0)
+
 
         tried_here   = self._tried_alternatives.setdefault(idx, set())
         logger.warning(
@@ -454,7 +460,7 @@ class ApiAntiSlopSampler:
             validation_cache[tok_str] = ok
             return ok
 
-        # NEW: normalise “is banned” across raw/decoded to avoid mismatches.
+        # normalise “is banned” across raw/decoded to avoid mismatches.
         banned_decoded_lc = _decode_token(banned_token).lower()
         def _is_same_banned(tok_str: str) -> bool:
             if tok_str == banned_token:
@@ -880,11 +886,37 @@ class ApiAntiSlopSampler:
                 if run_regex:
                     regex_since = 0
 
-            # ~~~~~~~~~ end of inner for-loop ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            
+            # Final sweep so end-of-stream tail still gets regex-checked
+            if not restart_stream and (natural_end or regex_since > 0):
+                vio = self._run_validators(state)
+                if vio:
+                    self.api_client.cancel_current_stream()
+                    fixed = self._perform_backtrack(state, vio)
+                    event = {
+                        "type":  vio.validator_type,
+                        "index": vio.violation_index,
+                        "details": vio.details,
+                        "original_token_string": vio.original_token_string,
+                        "fixed": fixed,
+                    }
+                    self.events.append(event)
+                    if self.on_ban_event_callback:
+                        try:
+                            self.on_ban_event_callback(event)
+                        except Exception as e_cb:
+                            logger.error("Error in on_ban_event_callback: %s", e_cb, exc_info=True)
+                    if not fixed:
+                        self._suppress_violation(vio)
+                    restart_stream = True
+                    natural_end = False
+                    regex_since = 0
+
             if restart_stream:
-                continue                    # repaired → open a new HTTP stream
+                continue
             if natural_end:
-                break                       # server said “done”
+                break
+
             # else: ended by length, outer while will loop if we still want more
 
         # ---------------- flush tail --------------------------------------
