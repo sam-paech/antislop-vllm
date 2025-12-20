@@ -742,6 +742,8 @@ class ApiAntiSlopSampler:
         max_new_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
         min_p: Optional[float] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
     ) -> Generator[str, None, None]:
         """
         Generates text, handling validation and back-tracking.
@@ -751,14 +753,15 @@ class ApiAntiSlopSampler:
             max_new_tokens: Optional override for the maximum number of new tokens.
             temperature: Optional override for the sampling temperature.
             min_p: Optional override for the min_p sampling parameter.
+            top_p: Optional override for nucleus sampling (top-p).
+            top_k: Optional override for top-k filtering.
         """
         # Determine effective generation parameters, overriding defaults if provided.
         effective_max_new_tokens = self.max_new_tokens if max_new_tokens is None else max_new_tokens
         effective_temperature = self.temperature if temperature is None else temperature
         effective_min_p = self.min_p if min_p is None else min_p
-
-        # The rest of the parameters (top_p, top_k, etc.) still come from the instance config.
-        # This logic is now inside the generation methods.
+        effective_top_p = self.top_p if top_p is None else top_p
+        effective_top_k = self.top_k if top_k is None else top_k
 
         if self.request_mode == "stream":
             yield from self._generate_streamwise(
@@ -766,6 +769,8 @@ class ApiAntiSlopSampler:
                 max_new_tokens=effective_max_new_tokens,
                 temperature=effective_temperature,
                 min_p=effective_min_p,
+                top_p=effective_top_p,
+                top_k=effective_top_k,
             )
         else:
             yield from self._generate_chunkwise(
@@ -773,6 +778,8 @@ class ApiAntiSlopSampler:
                 max_new_tokens=effective_max_new_tokens,
                 temperature=effective_temperature,
                 min_p=effective_min_p,
+                top_p=effective_top_p,
+                top_k=effective_top_k,
             )
 
     # ------------------------------------------------------------------ #
@@ -784,6 +791,8 @@ class ApiAntiSlopSampler:
         max_new_tokens: int,
         temperature: float,
         min_p: Optional[float],
+        top_p: Optional[float],
+        top_k: Optional[int],
     ):
         state = GenerationState(prompt)
         last_yield  = 0
@@ -802,8 +811,8 @@ class ApiAntiSlopSampler:
                 max_tokens      = remaining,
                 top_logprobs    = self.top_logprobs_count,
                 temperature     = temperature,
-                top_p           = self.top_p,
-                top_k           = self.top_k,
+                top_p           = top_p,
+                top_k           = top_k,
                 min_p           = min_p,
                 timeout         = self.timeout,
                 stop_sequences  = self.stop_sequences,
@@ -934,6 +943,8 @@ class ApiAntiSlopSampler:
         max_new_tokens: int,
         temperature: float,
         min_p: Optional[float],
+        top_p: Optional[float],
+        top_k: Optional[int],
     ) -> Generator[str, None, None]:
         """
         Stream text while validating the *entire* prompt + generation after
@@ -951,7 +962,7 @@ class ApiAntiSlopSampler:
         state = GenerationState(prompt) # already templated upstream
         last_yield_idx = 0                         # first token not yet sent
 
-        
+
 
         while True:
             # hard token limit
@@ -975,8 +986,8 @@ class ApiAntiSlopSampler:
                         max_tokens      = self.chunk_size,
                         top_logprobs    = self.top_logprobs_count,
                         temperature     = temperature,
-                        top_p           = self.top_p,
-                        top_k           = self.top_k,
+                        top_p           = top_p,
+                        top_k           = top_k,
                         min_p           = min_p,
                         timeout         = self.timeout,
                         stop_sequences  = self.stop_sequences,

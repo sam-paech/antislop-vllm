@@ -92,6 +92,13 @@ def _run_generation_for_request(request_data: Dict[str, Any]) -> Dict[str, Any]:
     max_tokens_req = request_data.get("max_tokens")
     temperature_req = request_data.get("temperature")
     min_p_req = request_data.get("min_p")
+    top_p_req = request_data.get("top_p")
+    top_k_req = request_data.get("top_k")
+
+    # Override ban_strength if provided in request
+    ban_strength_req = request_data.get("ban_strength")
+    if ban_strength_req is not None:
+        sampler.ban_strength = max(0.0, min(1.0, float(ban_strength_req)))
 
     # --- 4. Generate Response ---
     try:
@@ -100,6 +107,8 @@ def _run_generation_for_request(request_data: Dict[str, Any]) -> Dict[str, Any]:
             max_new_tokens=max_tokens_req,
             temperature=temperature_req,
             min_p=min_p_req,
+            top_p=top_p_req,
+            top_k=top_k_req,
         ))
         full_response = "".join(full_response_parts)
     except requests.HTTPError as e:

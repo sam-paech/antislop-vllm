@@ -29,6 +29,7 @@ AntiSlop-vLLM can be used for single prompt completions or for generating entire
 *   **Single & Batch Modes:**
     *   Generate a single, "unslotted" completion for a given prompt.
     *   Process a batch of prompts (from a JSON file or Hugging Face dataset) to create a cleaned dataset.
+*   **OpenAI-Compatible API Server:** Run as a drop-in replacement server that applies anti-slop filtering to any backend.
 *   **Iterative Anti-Slop Pipeline (`auto_unslop.py`):**
     *   Automates generating text, analyzing it for over-represented n-grams and phrases (leveraging techniques similar to those in [slop_forensics](https://github.com/sam-paech/slop_forensics)).
     *   Updates ban lists iteratively to progressively improve output quality over multiple runs.
@@ -168,6 +169,44 @@ python main.py \
 *   `--threads`: Number of parallel generation workers.
 *   `--max-prompts`: Limits the number of new prompts processed per run.
 *   `--ftpo-pairs-jsonl`: If specified, saves (chosen, rejected) token pairs for FTPO training (final token preference optimisation).
+
+### Example 3: OpenAI-Compatible API Server
+
+Run AntiSlop as an OpenAI-compatible server. This lets you use any OpenAI client library while automatically applying anti-slop filtering.
+
+**1. Start your backend vLLM server:**
+```bash
+vllm serve unsloth/gemma-3-4b-it --port 8000 --api-key xxx
+```
+
+**2. Start the AntiSlop proxy server:**
+```bash
+python main.py --openai-api --openai-api-port 8080 \
+    --api-base-url "http://localhost:8000/v1" \
+    --api-key "xxx" \
+    --model-name "unsloth/gemma-3-4b-it" \
+    --chat-template-model-id "unsloth/gemma-3-4b-it" \
+    --slop-phrases-file "banlists/slop_phrases.json" \
+    --top-n-slop-phrases 500
+```
+
+**3. Use with any OpenAI client:**
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8080/v1", api_key="unused")
+response = client.chat.completions.create(
+    model="unsloth/gemma-3-4b-it",
+    messages=[{"role": "user", "content": "Write a story about a princess."}],
+    max_tokens=500,
+    temperature=0.9
+)
+print(response.choices[0].message.content)
+```
+
+**Supported request parameters:** `max_tokens`, `temperature`, `min_p`, `top_p`, `top_k`, `ban_strength`.
+
+See `example_api_server.ipynb` for a complete example.
 
 ### Iterative Anti-Slop (`auto_unslop.py`)
 
