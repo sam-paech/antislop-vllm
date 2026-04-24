@@ -51,6 +51,15 @@ history_lock    = Lock()
 
 chat_formatter = None
 
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "y"}
+    return bool(value)
+
 # ──────────────────────────────────────────────────────────────────────
 #  Helper: apply prompt‑level templating / chat template (priority)
 # ──────────────────────────────────────────────────────────────────────
@@ -944,7 +953,8 @@ def main_cli():
         try:
             chat_formatter = ChatTemplateFormatter(
                 cfg["chat_template_model_id"],
-                system_prompt=cfg.get("system_prompt", "")
+                system_prompt=cfg.get("system_prompt", ""),
+                enable_thinking=_coerce_bool(cfg.get("chat_template_enable_thinking"), False),
             )
         except Exception as e:
             app_logger.error(f"Failed to load chat template: {e}")

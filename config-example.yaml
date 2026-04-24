@@ -10,6 +10,8 @@ model_name: "unsloth/gemma-3-1b-it"
 
 # The model id or path containing the tokeniser used for applying the chat template:
 chat_template_model_id: "unsloth/gemma-3-1b-it"
+# For chat templates that support reasoning/thinking mode, keep it disabled by default.
+chat_template_enable_thinking: false
 
 # Slop Configuration
 

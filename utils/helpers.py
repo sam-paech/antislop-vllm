@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__) # Logger for this module
 _BUILTIN_DEFAULT: Dict[str, Any] = {
     "logging_level": "INFO",
     "ban_strength": 1.0,  # 0..1 soft-ban strength (1 = hard ban)
+    "chat_template_enable_thinking": False,
     "generation_params": {
         "chunk_size":        20,
         "top_logprobs_count": 20,
@@ -107,6 +108,13 @@ def add_common_generation_cli_args(parser: argparse.ArgumentParser, base_cfg: Di
              "calling the /v1/completions endpoint."
     )
     common_group.add_argument(
+        "--chat-template-enable-thinking",
+        type=_str2bool,
+        metavar="true/false",
+        default=None,
+        help="Pass enable_thinking to chat templates that support reasoning mode."
+    )
+    common_group.add_argument(
         "--request-mode",
         choices=["chunk", "stream"],
         help="How we contact the backend: classic chunk polling or true streaming."
@@ -174,6 +182,7 @@ def merge_configs(base_cfg: Dict[str, Any], cli_args: argparse.Namespace) -> Dic
         "slop_phrases_file", "top_n_slop_phrases",
         "regex_blocklist_file", "logging_level",
         "chat_template_model_id", "request_mode",
+        "chat_template_enable_thinking",
         "force_backtrack", "prompt_template",
         "system_prompt", "enable_refusal_detection",
         "refusals_file", "ban_strength",

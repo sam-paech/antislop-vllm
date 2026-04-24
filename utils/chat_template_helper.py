@@ -7,7 +7,7 @@ If *system_prompt* is supplied it is injected as a system role message
 exactly once, before the user message.
 """
 import threading
-from typing import Tuple
+from typing import Any, Tuple
 from transformers import AutoTokenizer
 
 
@@ -17,9 +17,11 @@ class ChatTemplateFormatter:
 
     def __init__(self,
                  model_id: str,
-                 system_prompt: str = "") -> None:
+                 system_prompt: str = "",
+                 enable_thinking: bool = False) -> None:
         self.model_id      = model_id
         self.system_prompt = system_prompt or ""
+        self.enable_thinking = enable_thinking
 
         with self._lock:
             tok = self._cache.get(model_id)
@@ -35,6 +37,16 @@ class ChatTemplateFormatter:
     # ------------------------------------------------------------- #
     # internal helpers                                              #
     # ------------------------------------------------------------- #
+    def _apply_chat_template(self, messages, **kwargs: Any) -> str:
+        kwargs.setdefault("enable_thinking", self.enable_thinking)
+        try:
+            return self.tokenizer.apply_chat_template(messages, **kwargs)
+        except TypeError as exc:
+            if "enable_thinking" not in str(exc):
+                raise
+            kwargs.pop("enable_thinking", None)
+            return self.tokenizer.apply_chat_template(messages, **kwargs)
+
     def _extract_segments(self) -> Tuple[str, str, str]:
         ph_user = "__PLACEHOLDER_USER__"
         ph_asst = "__PLACEHOLDER_ASST__"
@@ -48,9 +60,9 @@ class ChatTemplateFormatter:
             {"role": "assistant", "content": ph_asst},
         ])
 
-        tpl = self.tokenizer.apply_chat_template(messages,
-                                                 tokenize=False,
-                                                 add_generation_prompt=False)
+        tpl = self._apply_chat_template(messages,
+                                        tokenize=False,
+                                        add_generation_prompt=False)
 
         i_user = tpl.find(ph_user)
         i_asst = tpl.find(ph_asst)
@@ -85,7 +97,7 @@ class ChatTemplateFormatter:
             messages.insert(0, {"role": "system", "content": self.system_prompt})
         
         with self._lock:
-            templated_prompt = self.tokenizer.apply_chat_template(messages,
+            templated_prompt = self._apply_chat_template(messages,
                                                 tokenize=False,
                                                 add_generation_prompt=True)
             return templated_prompt
@@ -99,7 +111,7 @@ class ChatTemplateFormatter:
             messages_copy.insert(0, {"role": "system", "content": self.system_prompt})
         
         with self._lock:
-            templated_prompt = self.tokenizer.apply_chat_template(messages_copy,
+            templated_prompt = self._apply_chat_template(messages_copy,
                                                 tokenize=False,
                                                 add_generation_prompt=True)
             return templated_prompt
