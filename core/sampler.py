@@ -38,7 +38,7 @@ from state.generation_state import (
 )
 from validators.base_validator import BaseValidator
 from validators.slop_phrase_validator import SlopPhraseValidator
-from utils.sampler_helpers import select_tail_tokens
+from utils.sampler_helpers import apply_sampling_filters, select_tail_tokens
 import csv, time, datetime, os
 import requests
 from threading import Lock
@@ -474,14 +474,9 @@ class ApiAntiSlopSampler:
         logits         = [lp for _, lp in lp_list]
         raw_p          = [math.exp(l) for l in logits]
         tempered       = [p ** (1 / self.temperature) for p in raw_p]
-        Z              = sum(tempered)
-        base_pairs     = [(tok, pt / Z if Z > 0 else 1 / len(tempered))
-                        for (tok, _), pt in zip(lp_list, tempered)
-                        if not _is_same_banned(tok)]                         # NEW: hard‑exclude by raw OR decoded
-
-        if not base_pairs:
-            logger.error("Back-track: after removing banned token no candidates left.")
-            return _abort()
+        base_weighted_pairs = [
+            (tok, pt) for (tok, _), pt in zip(lp_list, tempered)
+        ]
 
         # ─────────────────────────────────────────────────────────────────
         #  1. NEXT-TOKEN SELECTION  (honours --force-backtrack)
@@ -495,41 +490,27 @@ class ApiAntiSlopSampler:
             raw_p   = [math.exp(l) for l in logits]
             probs_t = [p ** (1.0 / max(temp, 1e-6)) for p in raw_p]
 
-            tmp = []
-            for (tok, _), pt in zip(lp_list, probs_t):
+            # Establish the original sampler support before applying the
+            # post-hoc ban.  Otherwise rejecting a dominant top token lowers
+            # min-p's reference probability and admits tokens that normal
+            # decoding could never have selected.
+            pairs = apply_sampling_filters(
+                [(tok, pt) for (tok, _), pt in zip(lp_list, probs_t)],
+                min_p=min_p,
+                top_p=top_p,
+                top_k=top_k,
+            )
+
+            constrained_pairs = []
+            for tok, pt in pairs:
                 if _is_same_banned(tok):
                     if include_banned_scaled_global:
                         pt *= (1.0 - ban_s)   # NEW: soft-ban scaling
                     else:
                         continue              # hard exclude
-                tmp.append((tok, pt))
+                constrained_pairs.append((tok, pt))
 
-            Z2 = sum(pt for _, pt in tmp)
-            if Z2 <= 0:
-                return []
-            pairs = [(tok, pt / Z2) for tok, pt in tmp]
-
-            # min-p filter
-            if min_p is not None and pairs:
-                floor = min_p * max(pt for _, pt in pairs)
-                pairs = [(tok, pt) for tok, pt in pairs if pt >= floor]
-
-            # top-p nucleus
-            if top_p is not None and pairs:
-                pairs.sort(key=lambda tp: tp[1], reverse=True)
-                nucleus, cum = [], 0.0
-                for tok, pt in pairs:
-                    nucleus.append((tok, pt))
-                    cum += pt
-                    if cum >= top_p:
-                        break
-                pairs = nucleus
-
-            # top-k
-            if top_k is not None and len(pairs) > top_k:
-                pairs = sorted(pairs, key=lambda tp: tp[1], reverse=True)[:top_k]
-
-            return pairs
+            return constrained_pairs
 
         # ── attempt ladder: default ⇒ relax T ⇒ drop min_p ⇒ drop top_p ⇒ drop top_k
         attempts = [
@@ -596,15 +577,14 @@ class ApiAntiSlopSampler:
 
         tail_toks: list[str] = []
         if max_tail > 0:
-            # re-apply tail-specific filters on **base_pairs** (no inversion!)
-            tail_pairs = base_pairs.copy()
-
-            if tail_min_p is not None:
-                floor = tail_min_p * max(pt for _, pt in tail_pairs)
-                tail_pairs = [(tok, pt) for tok, pt in tail_pairs if pt >= floor]
-
-            if tail_top_k is not None and len(tail_pairs) > tail_top_k:
-                tail_pairs = sorted(tail_pairs, key=lambda tp: tp[1], reverse=True)[: tail_top_k]
+            # Apply tail sampling filters before excluding the rejected token,
+            # for the same reason as replacement selection above.
+            tail_pairs = apply_sampling_filters(
+                base_weighted_pairs,
+                min_p=tail_min_p,
+                top_p=None,
+                top_k=tail_top_k,
+            )
 
             # sort ascending prob ⇒ lowest-prob tokens first
             tail_pairs.sort(key=lambda tp: tp[1])
