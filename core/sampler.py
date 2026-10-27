@@ -765,6 +765,9 @@ class ApiAntiSlopSampler:
     # ------------------------------------------------------------------ #
     #  Streaming generation with proper restart on back-track            #
     # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------ #
+    #  Streaming generation with proper restart on back-track            #
+    # ------------------------------------------------------------------ #
     def _generate_streamwise(
         self,
         prompt: str,
@@ -800,8 +803,11 @@ class ApiAntiSlopSampler:
 
             for chunk in stream:
                 if not chunk.token_strings:
-                    if chunk.finish_reason and chunk.finish_reason != "length":
-                        natural_end = True
+                    # Check for finish_reason even on empty token chunks
+                    # This handles the case where the API sends finish_reason separately
+                    if chunk.finish_reason:
+                        if chunk.finish_reason != "length":
+                            natural_end = True
                         break
                     continue
 
@@ -812,7 +818,7 @@ class ApiAntiSlopSampler:
 
                 if delta and self.on_chunk_yielded_callback:
                     try:
-                        # empty text → caller knows this count is “accepted, not yet flushed”
+                        # empty text → caller knows this count is "accepted, not yet flushed"
                         self.on_chunk_yielded_callback("", delta)
                     except Exception as e_cb:
                         logger.error("Throughput callback failed: %s", e_cb, exc_info=True)
@@ -868,9 +874,16 @@ class ApiAntiSlopSampler:
                     last_yield = safe_upto
 
                 # ---------- natural termination inside stream --------------
-                if chunk.finish_reason and chunk.finish_reason != "length":
-                    natural_end = True
-                    break
+                # Note: We check finish_reason AFTER appending the chunk and yielding safe prefix.
+                # This ensures all tokens are processed before deciding to stop.
+                if chunk.finish_reason:
+                    if chunk.finish_reason == "length":
+                        # Hit max_tokens limit - continue generating if we haven't reached user's max
+                        pass  # Continue in outer while loop
+                    else:
+                        # Model signaled completion (e.g., "stop" from stop sequence)
+                        natural_end = True
+                        break
 
                 if run_regex:
                     regex_since = 0
