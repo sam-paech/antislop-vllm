@@ -150,78 +150,105 @@ class ApiClient(BaseApiClient):
         logger.debug(f"Payload: {json.dumps(payload)[:500]}")
 
         # ---------- open HTTP stream ---------------------------------------
-        with self._session.post(
-            self.completion_endpoint,
-            headers=headers,
-            json=payload,
-            stream=True,
-            timeout=timeout,
-        ) as resp:
-            resp.raise_for_status()
+        last_finish_reason = None
+        try:
+            with self._session.post(
+                self.completion_endpoint,
+                headers=headers,
+                json=payload,
+                stream=True,
+                timeout=timeout,
+            ) as resp:
+                resp.raise_for_status()
 
-            for raw in resp.iter_lines(decode_unicode=True):
+                for raw in resp.iter_lines(decode_unicode=True):
 
-                # ---- sampler asked to abort? ------------------------------
-                if self._cancel_stream:
-                    resp.close()
-                    self._cancel_stream = False
-                    break
+                    # ---- sampler asked to abort? ------------------------------
+                    if self._cancel_stream:
+                        resp.close()
+                        self._cancel_stream = False
+                        break
 
-                if not raw or raw == "\n":
-                    continue
+                    if not raw or raw == "\n":
+                        continue
 
-                if raw.startswith("data: "):
-                    raw = raw[6:]
+                    if raw.startswith("data: "):
+                        raw = raw[6:]
 
-                if raw.strip() == "[DONE]":
-                    # signal natural end-of-stream
+                    if raw.strip() == "[DONE]":
+                        # signal natural end-of-stream
+                        yield ApiChunkResult(
+                            generated_text="",
+                            finish_reason="stream_end",
+                        )
+                        break
+
+                    # ---------- parse SSE JSON ---------------------------------
+                    try:
+                        obj = json.loads(raw)
+                    except json.JSONDecodeError:
+                        logger.warning("Malformed SSE line: %s", raw[:160])
+                        continue
+
+                    # Pass-through OpenAI-style streamed error packets
+                    if isinstance(obj, dict) and obj.get("error"):
+                        err = obj["error"]
+                        msg = (err.get("message") if isinstance(err, dict) else str(err)) or "Upstream stream error"
+                        raise requests.HTTPError(msg, response=resp)
+
+                    if not obj.get("choices"):
+                        continue
+                    choice = obj["choices"][0]
+
+                    # Track finish_reason from the last chunk
+                    last_finish_reason = choice.get("finish_reason")
+
+                    # -- incremental text fragment ------------------------------
+                    generated_text = choice.get("text", "")
+                    # (some providers use .delta.content / .message.content – those
+                    # branches are left in generate_chunk; for vLLM we only need .text)
+
+                    # -- extract logprobs --------------------------------------
+                    token_strings: List[str] = []
+                    rel_logprobs: Dict[int, List[Tuple[str, float]]] = {}
+
+                    lp_obj = choice.get("logprobs")
+                    if lp_obj and isinstance(lp_obj, dict):
+                        token_strings = lp_obj.get("tokens", [])
+                        # vLLM: top_logprobs is list[dict] aligned with tokens
+                        for idx, alt_dict in enumerate(lp_obj.get("top_logprobs", [])):
+                            if isinstance(alt_dict, dict):
+                                rel_logprobs[idx] = list(alt_dict.items())
+
                     yield ApiChunkResult(
-                        generated_text="",
-                        finish_reason="stream_end",
+                        generated_text=generated_text,
+                        token_strings=token_strings,
+                        logprobs=rel_logprobs,
+                        finish_reason=last_finish_reason,
                     )
-                    break
 
-                # ---------- parse SSE JSON ---------------------------------
-                try:
-                    obj = json.loads(raw)
-                except json.JSONDecodeError:
-                    logger.warning("Malformed SSE line: %s", raw[:160])
-                    continue
-
-                # Pass-through OpenAI-style streamed error packets
-                if isinstance(obj, dict) and obj.get("error"):
-                    err = obj["error"]
-                    msg = (err.get("message") if isinstance(err, dict) else str(err)) or "Upstream stream error"
-                    raise requests.HTTPError(msg, response=resp)
-
-                if not obj.get("choices"):
-                    continue
-                choice = obj["choices"][0]
-
-
-                # -- incremental text fragment ------------------------------
-                generated_text = choice.get("text", "")
-                # (some providers use .delta.content / .message.content – those
-                # branches are left in generate_chunk; for vLLM we only need .text)
-
-                # -- extract logprobs --------------------------------------
-                token_strings: List[str] = []
-                rel_logprobs: Dict[int, List[Tuple[str, float]]] = {}
-
-                lp_obj = choice.get("logprobs")
-                if lp_obj and isinstance(lp_obj, dict):
-                    token_strings = lp_obj.get("tokens", [])
-                    # vLLM: top_logprobs is list[dict] aligned with tokens
-                    for idx, alt_dict in enumerate(lp_obj.get("top_logprobs", [])):
-                        if isinstance(alt_dict, dict):
-                            rel_logprobs[idx] = list(alt_dict.items())
-
+        except requests.exceptions.Timeout:
+            logger.warning("Stream timed out. Yielding final chunk with finish_reason='timeout'.")
+            # Yield a final chunk to signal the end, even if incomplete
+            yield ApiChunkResult(
+                generated_text="",
+                token_strings=[],
+                logprobs={},
+                finish_reason="timeout",
+            )
+            raise
+        except Exception as e:
+            logger.warning(f"Stream ended unexpectedly: {e}")
+            # If we have a finish_reason from earlier, the stream likely completed
+            # Otherwise, signal an abnormal end
+            if not last_finish_reason:
                 yield ApiChunkResult(
-                    generated_text=generated_text,
-                    token_strings=token_strings,
-                    logprobs=rel_logprobs,
-                    finish_reason=choice.get("finish_reason"),
+                    generated_text="",
+                    token_strings=[],
+                    logprobs={},
+                    finish_reason="error",
                 )
+            raise
 
 
 
