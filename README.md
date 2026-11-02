@@ -115,7 +115,9 @@ Modify `config.yaml` for persistent settings. Key options include:
 *   `api_base_url`, `api_key`, `model_name`
 *   `slop_phrases_file`, `top_n_slop_phrases`
 *   `regex_blocklist_file`
-*   `ngram_validator` (including `banned_file`, `remove_stopwords`, `language`)
+*   `ngram_validator` (including `enabled`, `banned_file`, `banned_list`, `remove_stopwords`, `language`).
+    Set `ngram_validator.enabled: false` to turn n-gram banning off entirely without
+    having to clear the ban list; the default is `true`.
 *   `generation_params` (like `max_new_tokens`, `temperature`, `top_p`, `top_k`, `min_p`, `chunk_size`, `request_mode`)
 *   `generation_params.end_of_turn_markers`, `generation_params.max_consecutive_stops` (early end-of-turn recovery, see below)
 *   `generation_params.max_concurrent_requests` (API server concurrency, see below)

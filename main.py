@@ -135,6 +135,20 @@ def _setup_validators(cfg: Dict[str, Any], main_logger: logging.Logger) -> List[
         from validators.ngram_validator import NGramValidator # Assuming this import is fine
         
         ngram_validator_config = cfg.get("ngram_validator", {}) # This reflects CLI overrides
+
+        # Master switch: `ngram_validator.enabled: false` turns n-gram validation
+        # off completely, even when banned_file / banned_list are still configured.
+        # Blanking the section is what makes the priority chain below fall through to
+        # "no n-grams loaded", so nothing is read and no validator is constructed.
+        # Emptying the ban list is not a usable "off": the file is re-read on every
+        # run, so the validator silently comes back.
+        if not _coerce_bool(ngram_validator_config.get("enabled"), default=True):
+            main_logger.info(
+                "NGramValidator disabled via ngram_validator.enabled=false; "
+                "no n-grams will be loaded."
+            )
+            ngram_validator_config = {}
+
         banned_ngrams_for_validator: List[Union[str, List[str]]] = []
         source_of_ngrams = "nothing" # For logging where n-grams came from
 

@@ -179,7 +179,7 @@ Excluded from `run_all.SUITES`; fix these, do not delete them.
 | `core/sampler.py` | `ApiAntiSlopSampler`: generation, validation, back-tracking |
 | `core/models.py` | API result and violation dataclasses |
 | `state/generation_state.py` | The text being generated; `hypothetical()` builds candidate states |
-| `validators/` | `SlopPhraseValidator`, `RegexValidator`, `NGramValidator` |
+| `validators/` | `SlopPhraseValidator`, `RegexValidator`, `NGramValidator` (the last is switchable with `ngram_validator.enabled: false`) |
 | `utils/` | Config, string, chat-template, refusal, slop helpers |
 | `api_client/` | `ApiClient` for OpenAI-compatible endpoints; SSE parsing |
 | `api_server/` | FastAPI wrapper |

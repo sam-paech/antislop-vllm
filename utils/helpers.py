@@ -36,6 +36,9 @@ _BUILTIN_DEFAULT: Dict[str, Any] = {
         "force_backtrack": False,
     },
     "ngram_validator": {
+        # Master switch.  ``false`` skips n-gram validation entirely, even when a
+        # ``banned_file`` / ``banned_list`` is configured.
+        "enabled":          True,
         "remove_stopwords": True,
         "language":         "english",
     },

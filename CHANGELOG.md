@@ -9,6 +9,34 @@ so every entry is ordered and unambiguous without a manual version bump.
 
 ---
 
+## [2026.11.02.1548] — add `ngram_validator.enabled` to switch n-gram banning off
+
+### Added — `ngram_validator.enabled` config switch
+
+N-gram banning had no off switch. The only way to stop it was to empty
+`banned_file` / `banned_list`, which is not a stable "off": the ban file is re-read
+on every run, so the validator silently came back as soon as the section was
+configured again.
+
+* `ngram_validator.enabled: false` in `config.yaml` now skips the validator
+  completely. The ban file is not read and no `NGramValidator` is constructed, even
+  when `banned_file` / `banned_list` are present.
+* Default is `true`, so existing configs without the key behave exactly as before.
+* The value is coerced with the existing `_coerce_bool` helper, so a quoted YAML
+  `"false"` is treated as false rather than as a non-empty string.
+* Implemented in `main._setup_validators`, which the single-prompt, batch and API
+  server paths all share.
+* Documented in `config-example.yaml` and `README.md`.
+
+### Added — `tests/test_ngram_toggle.py`
+
+Covers `enabled: false` (dict and quoted-string form), `enabled: false` overriding a
+configured `banned_list`, the default-on path, and the missing-key default. Registered
+in `run_all.SUITES`. `tests/_stubs.py` gained a `tqdm` stub so `main.py` can be
+imported by a suite.
+
+---
+
 ## [2026.11.02.1530] — tests: fix the excluded sampler-filter suite, add a run lock
 
 ### Fixed — `tests/test_sampler_filters.py` was broken and excluded from the suite

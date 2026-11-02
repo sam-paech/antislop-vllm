@@ -46,6 +46,7 @@ SUITES = (
     "test_early_eos",
     "test_partial_word_bans",
     "test_config_and_sse",
+    "test_ngram_toggle",
     "test_sampler_filters",
 )
 

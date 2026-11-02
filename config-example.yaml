@@ -157,6 +157,11 @@ backtracking:
 
 # N-Gram Validator Configuration (Optional)
 ngram_validator:
+  # Master switch.  Set to false to skip n-gram validation entirely, even though
+  # a banned_file / banned_list is configured below.  Default: true.
+  # (Emptying the ban list is not the same thing: the file is re-read on every run.)
+  enabled: true
+
   # Option 1: Specify a file containing a JSON list of banned n-grams
   # Each item in the JSON list can be a string (e.g., "this is an n gram")
   # or a list of strings (e.g., ["this", "is", "an", "n", "gram"])

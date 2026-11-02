@@ -41,6 +41,13 @@ def install() -> None:
         transformers.AutoTokenizer = _AutoTokenizer
         sys.modules["transformers"] = transformers
 
+    # ``main.py`` imports ``tqdm`` at module scope for the batch progress bar.
+    # Only the callable is needed; the suites never run batch mode.
+    if "tqdm" not in sys.modules:
+        tqdm_mod = types.ModuleType("tqdm")
+        tqdm_mod.tqdm = lambda iterable=None, *a, **k: iterable
+        sys.modules["tqdm"] = tqdm_mod
+
     # ``validators/__init__.py`` imports the n-gram validator eagerly, which
     # imports nltk.  These tests do not use it, so a bare stub is enough.
     if "nltk" not in sys.modules:
