@@ -59,6 +59,12 @@ _BANNED_PREFIX_LOCK = Lock()
 # still gets re-probed on the next request instead of failing permanently.
 _STREAM_PROBE_CACHE: dict[str, bool] = {}
 
+# One-shot warnings.  A sampler is constructed per request in server mode, so any
+# warning raised from __init__ is otherwise emitted once per request and drowns
+# out the events that matter.
+_TAIL_PREFIX_WARNED = False
+_TIKTOKEN_WARNED: set[str] = set()
+
 
 def _build_banned_prefix_set(chat_tpl, validators) -> frozenset[str]:
     """
@@ -193,6 +199,7 @@ class ApiAntiSlopSampler:
         # Tiktoken encoding for internal token counting
         # Use the provided model name or default to cl100k_base
         _tiktoken_encoding_name = tiktoken_model_name_for_counting or "cl100k_base"
+        _tiktoken_model_name = str(tiktoken_model_name_for_counting)
         try:
             # If tiktoken_model_name_for_counting is None, it will use "cl100k_base"
             # If it's a model name, it will try that.
@@ -202,10 +209,13 @@ class ApiAntiSlopSampler:
                  self.tiktoken_encoding = tiktoken.get_encoding("cl100k_base")
             logger.info(f"ApiAntiSlopSampler using tiktoken encoding for '{_tiktoken_encoding_name}' for yielded chunk token counts.")
         except KeyError:
-            logger.warning(
-                f"Tiktoken model '{tiktoken_model_name_for_counting}' not found. "
-                f"Falling back to 'cl100k_base' for yielded chunk token counts."
-            )
+            if _tiktoken_model_name not in _TIKTOKEN_WARNED:
+                _TIKTOKEN_WARNED.add(_tiktoken_model_name)
+                logger.warning(
+                    f"Tiktoken model '{tiktoken_model_name_for_counting}' not found. "
+                    f"Falling back to 'cl100k_base' for yielded chunk token counts "
+                    f"(this warning is logged once per model name)."
+                )
             self.tiktoken_encoding = tiktoken.get_encoding("cl100k_base")
         except Exception as e:
             logger.error(f"Error getting tiktoken encoding for '{_tiktoken_encoding_name}': {e}. "
@@ -353,9 +363,15 @@ class ApiAntiSlopSampler:
 
         if self.filter_tail_banned_prefix_tokens:
             if chat_template_formatter is None or not hasattr(chat_template_formatter, "model_id"):
-                logger.warning(
-                    "tail-prefix filter requested but no chat-template tokenizer available – skipping filter."
-                )
+                # A sampler is built per request in server mode, so this used to be
+                # logged once per request.  Warn once per process instead.
+                global _TAIL_PREFIX_WARNED
+                if not _TAIL_PREFIX_WARNED:
+                    _TAIL_PREFIX_WARNED = True
+                    logger.warning(
+                        "tail-prefix filter requested but no chat-template tokenizer "
+                        "available – skipping filter (this warning is logged once)."
+                    )
                 self.filter_tail_banned_prefix_tokens = False
             else:
                 cache_key = chat_template_formatter.model_id
@@ -382,14 +398,22 @@ class ApiAntiSlopSampler:
             f"tail_keep_tokens={self.tail_keep_tokens}"
         )
 
+        # NOTE: `request_mode` must be resolved *before* the round-trip warning
+        # below, otherwise a stream-mode run is warned about chunk-mode prefill
+        # amplification that does not apply to it.  The warning used to be emitted
+        # unconditionally, so every stream-mode request logged it.
+        self.request_mode = str(gen.get("request_mode", "chunk") or "chunk").strip().lower()
+        self.regex_interval = int(config.get("regex_validation_interval", 20))
+
         # --- Upstream round-trip cost -------------------------------------
         # _generate_chunkwise() re-sends the whole prompt every chunk, so a
         # single request costs ~(max_new_tokens / chunk_size) sequential
         # prefill round-trips instead of one. That multiplies the backend
         # prefill load by a large factor and caps real throughput well below
         # the configured concurrency. Warn loudly rather than let it surprise
-        # anyone sizing a deployment.
-        if self.chunk_size and self.max_new_tokens:
+        # anyone sizing a deployment.  Stream mode is immune: it makes one
+        # upstream request and does not re-send the prompt.
+        if self.request_mode == "chunk" and self.chunk_size and self.max_new_tokens:
             round_trips = max(1, math.ceil(self.max_new_tokens / self.chunk_size))
             if round_trips >= 10:
                 logger.warning(
@@ -400,9 +424,6 @@ class ApiAntiSlopSampler:
                     f"well below max_concurrent_requests. Consider a larger chunk_size or "
                     f"request_mode: stream."
                 )
-
-        self.request_mode = config.get("generation_params", {}).get("request_mode", "chunk")
-        self.regex_interval = int(config.get("regex_validation_interval", 20))
 
         if self.request_mode == "stream":
             if gen.get("probe_stream_logprobs", True):
@@ -456,21 +477,48 @@ class ApiAntiSlopSampler:
         return ok
 
 
-    def _run_validators(self, state: GenerationState) -> Optional[ViolationInfo]:
+    def _run_validators(
+        self, state: GenerationState, *, final: bool = False
+    ) -> Optional[ViolationInfo]:
         """
         Query every validator and return the violation that starts at the
         **lowest token index**.  If two violations start at the same index
         we keep the one from the validator that appears first in
         self.validators so existing priority ties stay stable.
+
+        *final* is forwarded to validators that understand it (phrase, n-gram).
+        While the text is still growing they suppress matches that end at the end
+        of the text, because the next token may still extend that word.  Without
+        this, a ban on ``"la"`` fired the instant the model emitted ``" la"``,
+        the back-tracker rewrote the token, the model re-emitted the same prefix,
+        and generation looped at the same index — the repeated
+        ``Back-tracking @tok=N orig=' la'`` pattern.
         """
         earliest: Optional[ViolationInfo] = None
         for v in self.validators:
-            vio = v.check(state)
+            vio = self._check_one(v, state, final)
             if not vio:
                 continue
             if (earliest is None) or (vio.violation_index < earliest.violation_index):
                 earliest = vio
         return earliest
+
+    @staticmethod
+    def _check_one(
+        validator: BaseValidator, state: GenerationState, final: bool
+    ) -> Optional[ViolationInfo]:
+        """Call *validator*, passing ``final`` only if it accepts the keyword.
+
+        Third-party or older validators keep the single-argument signature; a
+        TypeError from the keyword is not swallowed, so a genuine bug inside a
+        validator still surfaces.
+        """
+        try:
+            return validator.check(state, final=final)
+        except TypeError as exc:
+            if "final" not in str(exc):
+                raise
+            return validator.check(state)
 
     # ------------------------------------------------------------------ #
     #  Fast sanity-check for a candidate                                 #
@@ -480,6 +528,7 @@ class ApiAntiSlopSampler:
         state: GenerationState,
         truncate_idx: int,
         alt_token: str,
+        final: bool = False,
     ) -> tuple[bool, tuple[str, str] | None]:
         """
         (passes_all, (validator_name, detail_key) | None)
@@ -500,16 +549,16 @@ class ApiAntiSlopSampler:
         # Create a minimal hypothetical state for validation
         # We need to properly initialize the decoded buffer for validators
         hypo_tokens = state.generated_token_strings[:truncate_idx] + [alt_token]
-        hypo_state = GenerationState(state.prompt_string)
-        # Manually set the tokens and rebuild caches
-        hypo_state.generated_token_strings = hypo_tokens
-        # Rebuild decoded buffer and lens to match the tokens
-        from state.generation_state import _decode_token
-        hypo_state._decoded_buffer = "".join(_decode_token(t) for t in hypo_tokens)
-        hypo_state._decoded_lens = [len(_decode_token(t)) for t in hypo_tokens]
+        # `hypothetical()` skips __init__'s logging: one back-track tests up to
+        # `max_retries_per_position` candidates, and logging an initialised-state
+        # line for each buried the actual events (20+ lines per back-track).
+        hypo_state = GenerationState.hypothetical(state.prompt_string, hypo_tokens)
 
+        # While generation is running the candidate is not the end of the text:
+        # more tokens follow, so a match touching the end is provisional.  In the
+        # final sweep nothing follows, so it is definitive.
         for v in self.validators:
-            vio = v.check(hypo_state)
+            vio = self._check_one(v, hypo_state, final)
             if not vio:
                 continue
 
@@ -544,7 +593,20 @@ class ApiAntiSlopSampler:
         # ------------------------------------------------------------------ #
     #  Back-tracking                                                     #
     # ------------------------------------------------------------------ #
-    def _perform_backtrack(self, state: GenerationState, vio: ViolationInfo) -> bool:
+    def _perform_backtrack(
+        self,
+        state: GenerationState,
+        vio: ViolationInfo,
+        final: bool = False,
+    ) -> bool:
+        """Resample the violating token from its cached top-logprob list.
+
+        *final* says the text will not grow any more (the post-generation sweep).
+        It is forwarded to the candidate check so that a replacement which merely
+        *looks* fine because the word is unfinished is not accepted: in the final
+        sweep there is no next chunk to complete it, so a match touching the end
+        of the text is definitive.
+        """
         idx         = vio.violation_index
         banned_token   = vio.original_token_string
         lp_list     = state.get_logprobs(idx)
@@ -571,12 +633,26 @@ class ApiAntiSlopSampler:
             f"Back-tracking @tok={idx} orig='{banned_token}' ban='{vio.details}'."
         )
 
+        # Enforce the per-position budget.  `max_retries_per_position` was read
+        # from config and never checked, so a position whose candidate list was
+        # entirely banned could be re-entered without limit: each pass resampled
+        # from the same cached logprobs, re-fired the same violation, and
+        # generation made no progress (the repeated `Back-tracking @tok=N
+        # orig=' la'` lines in the log).
+        if len(tried_here) >= self.max_retries_per_position:
+            logger.error(
+                "Back-track: exhausted %d alternatives at token %d; "
+                "suppressing the violation and continuing.",
+                self.max_retries_per_position, idx,
+            )
+            return _abort()
+
         # ── utility: validate a single token once per call ───────────────
         validation_cache = {}              # tok_str -> bool
         def _is_valid(tok_str: str) -> bool:
             if tok_str in validation_cache:
                 return validation_cache[tok_str]
-            ok, _ = self._check_hypothetical_state(state, idx, tok_str)
+            ok, _ = self._check_hypothetical_state(state, idx, tok_str, final=final)
             validation_cache[tok_str] = ok
             return ok
 
@@ -838,12 +914,12 @@ class ApiAntiSlopSampler:
                 logger.error(f"Error in on_chunk_yielded_callback: {e_cb}", exc_info=True)
         return text_to_yield
 
-    def _run_validators_skip_regex(self, state):
+    def _run_validators_skip_regex(self, state, *, final: bool = False):
         earliest = None
         for v in self.validators:
             if v.__class__.__name__ == "RegexValidator":
                 continue
-            vio = v.check(state)
+            vio = self._check_one(v, state, final)
             if vio and (earliest is None or vio.violation_index < earliest.violation_index):
                 earliest = vio
         return earliest
@@ -1149,6 +1225,16 @@ class ApiAntiSlopSampler:
             if suppress:
                 stream_kwargs["suppress_tokens"] = suppress
 
+            # One cancellation handle per stream.  The client is shared across all
+            # concurrent requests in server mode, so the old client-wide
+            # `cancel_current_stream()` aborted *everyone's* stream whenever one
+            # request backtracked — producing the "Stream closed without [DONE]"
+            # storm and truncating healthy generations.
+            cancel_token = None
+            if hasattr(self.api_client, "new_stream_token"):
+                cancel_token = self.api_client.new_stream_token()
+                stream_kwargs["cancel_token"] = cancel_token
+
             stream = self.api_client.generate_stream(
                 prompt_text     = api_prompt,
                 max_tokens      = remaining,
@@ -1205,9 +1291,14 @@ class ApiAntiSlopSampler:
                             vio_full = self._run_validators(state)
                             vio = vio_full or vio
 
-                        # Cancel and drain the stream before backtracking so the
-                        # HTTP connection is fully released.
-                        self.api_client.cancel_current_stream()
+                        # Cancel and drain THIS stream before backtracking so the
+                        # HTTP connection is fully released.  Scoped to this
+                        # stream only: cancelling every stream on the shared client
+                        # broke concurrent requests.
+                        if cancel_token is not None:
+                            self.api_client.cancel_stream(cancel_token)
+                        else:
+                            self.api_client.cancel_current_stream()
                         try:
                             for _ in stream:
                                 pass
@@ -1223,6 +1314,13 @@ class ApiAntiSlopSampler:
                             fixed, state.get_generated_length(),
                             len(state.get_generated_text()),
                         )
+
+                        # Back-tracking rewrites the tail, so the "already emitted"
+                        # watermark may now point past the end of the state.  Left
+                        # alone it made the next safe-prefix slice empty for the
+                        # rest of the run, silently dropping all later text.
+                        if last_yield > state.get_generated_length():
+                            last_yield = state.get_generated_length()
 
                         try:
                             self.api_client.reset_connection_pool()
@@ -1392,7 +1490,47 @@ class ApiAntiSlopSampler:
                             )
                     if not fixed:
                         self._suppress_violation(vio)
+                    if last_yield > state.get_generated_length():
+                        last_yield = state.get_generated_length()
                     regex_since = 0
+
+        # ---------------- final validation sweep --------------------------
+        # Validators defer a match that touches the end of the text while the
+        # stream is still running, because the next token may extend that word.
+        # Now that generation has stopped, that deferral has to be resolved: run
+        # one definitive pass and fix whatever it finds.  Without this, a banned
+        # phrase at the very end of the response would never be caught.
+        #
+        # The sweep repeats because fixing one violation can expose another
+        # earlier in the rewritten tail, and each pass is bounded by the same
+        # per-position budget the live loop uses.
+        for _sweep in range(max(1, self.max_consecutive_stops)):
+            vio = self._run_validators(state, final=True)
+            if not vio:
+                break
+            time.sleep(0.05)
+            fixed = self._perform_backtrack(state, vio, final=True)
+            event = {
+                "type":  vio.validator_type,
+                "index": vio.violation_index,
+                "details": vio.details,
+                "original_token_string": vio.original_token_string,
+                "fixed": fixed,
+            }
+            self.events.append(event)
+            if self.on_ban_event_callback:
+                try:
+                    self.on_ban_event_callback(event)
+                except Exception as e_cb:
+                    logger.error(
+                        "Error in on_ban_event_callback: %s", e_cb, exc_info=True,
+                    )
+            if not fixed:
+                # Suppressed so the next pass does not report it again; the
+                # loop would otherwise spin on an unfixable position.
+                self._suppress_violation(vio)
+            if last_yield > state.get_generated_length():
+                last_yield = state.get_generated_length()
 
         # ---------------- flush tail --------------------------------------
         if state.get_generated_length() > last_yield:
@@ -1636,6 +1774,33 @@ class ApiAntiSlopSampler:
                 ):
                     break
                 # rejected early end-of-turn stop → loop back and keep going
+
+        # ── final validation sweep ─────────────────────────────────────────
+        # Same reasoning as in stream mode: a match touching the end of the text
+        # was deferred while the text was still growing, so it must be resolved
+        # definitively now that generation has stopped.
+        for _sweep in range(max(1, self.max_consecutive_stops)):
+            vio = self._run_validators(state, final=True)
+            if not vio:
+                break
+            fixed = self._perform_backtrack(state, vio, final=True)
+            event = {
+                "type":  vio.validator_type,
+                "index": vio.violation_index,
+                "details": vio.details,
+                "original_token_string": vio.original_token_string,
+                "fixed": fixed,
+            }
+            self.events.append(event)
+            if self.on_ban_event_callback:
+                try:
+                    self.on_ban_event_callback(event)
+                except Exception as e_cb:
+                    logger.error(f"Error in on_ban_event_callback: {e_cb}", exc_info=True)
+            if not fixed:
+                self._suppress_violation(vio)
+            if last_yield_idx > state.get_generated_length():
+                last_yield_idx = state.get_generated_length()
 
         # ── flush residual tail ────────────────────────────────────────────
         if state.get_generated_length() > last_yield_idx:

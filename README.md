@@ -233,7 +233,23 @@ This value is applied at server startup and also sizes the upstream HTTP connect
 
 #### Chunk mode and throughput
 
-In `request_mode: chunk`, every chunk is a separate upstream call that re-sends the entire prompt. A single request therefore costs roughly `max_new_tokens / chunk_size` sequential prefill round-trips — `chunk_size: 20` with `max_new_tokens: 600` means ~30 of them, multiplied by your concurrency. AntiSlop logs a warning at sampler construction when this ratio reaches 10 or more. If you are serving many concurrent clients, prefer a larger `chunk_size` or `request_mode: stream`, which removes the round-trip cost entirely.
+In `request_mode: chunk`, every chunk is a separate upstream call that re-sends the entire prompt. A single request therefore costs roughly `max_new_tokens / chunk_size` sequential prefill round-trips — `chunk_size: 20` with `max_new_tokens: 600` means ~30 of them, multiplied by your concurrency. AntiSlop logs a warning at sampler construction when this ratio reaches 10 or more. The warning is **chunk mode only**: `request_mode: stream` makes a single upstream request and does not re-send the prompt, so the ratio does not apply to it. If you are serving many concurrent clients, prefer a larger `chunk_size` or `request_mode: stream`, which removes the round-trip cost entirely.
+
+### Short banlist entries in stream mode
+
+A banlist entry that is a prefix of a longer word — `la`, for example — used to trigger back-tracking the instant the model had emitted `" la"`, before the next token could extend it to `"land"` or `"last"`. The back-tracker rewrote the token, the model re-emitted the same prefix, and generation looped at that index indefinitely: no token was ever added, so `max_new_tokens` was never reached and the request never finished.
+
+A match that ends at the **end of the text produced so far** is now treated as *provisional* while generation is running. It is deferred until more text arrives (which decides whether the word really is banned) or the final sweep runs. Once generation stops, a final validation sweep re-checks the text with the deferral disabled, so a banned phrase at the very end of a response is still caught.
+
+A match that already ends in a non-word character needs no lookahead and still fires immediately. Word-boundary matching itself is unchanged, so `la` never matches inside `land`.
+
+> **Note:** this affects short entries only. Prefer multi-word phrases where you can — a one- or two-character entry is more likely to collide with ordinary prose.
+
+#### Back-tracking limits
+
+`backtracking.max_retries_per_position` (default `100`) is the number of alternative tokens tried at a single position before the violation is given up on and suppressed. It was previously read from config but never enforced; it now bounds the work done at any one position.
+
+If you are building on `ApiClient` directly, note that a stream can be cancelled **individually**: create a handle with `client.new_stream_token()` and pass it as `cancel_token=` to `generate_stream()`, then call `client.cancel_stream(token)`. The older client-wide `cancel_current_stream()` aborts every stream open on that client, which is only safe when the client serves a single request (batch mode).
 
 ### Handling premature end-of-turn markers
 
@@ -342,7 +358,47 @@ While `antislop-vllm` is based on the concepts of the original `antislop-sampler
 *   `banlists/`: Directory for example ban list files (JSON format). **Users should curate their own lists.**
 *   `data/`: Can store auxiliary data like human writing profiles for `auto_unslop.py`.
 *   `results/`: Default output directory for batch generations and `auto_unslop.py` experiments.
+*   `tests/`: Regression suite (see [Running the tests](#running-the-tests)). `_platform.py` holds the board detection and per-test timeout.
 *   `example_run_antislop_vllm.ipynb`: Jupyter notebook with usage examples.
+
+## Running the tests
+
+The regression suite lives in `tests/` and needs no GPU, network, or vLLM — the
+backend is a scripted fake and the heavy optional imports are stubbed. Run an
+individual suite directly:
+
+```bash
+python -m tests.test_early_eos          # truncation / early end-of-turn
+python -m tests.test_partial_word_bans  # back-tracking storms, cancellation
+python -m tests.test_config_and_sse      # config merge and SSE parsing
+```
+
+Each test has a **30-second budget**. Several of them exist because the code under
+test used to loop forever, so a regression shows up as a hang rather than a failed
+assertion; the budget turns that into a reported failure instead of a wedged
+runner.
+
+### Skipping the suite on small ARM boards
+
+Some tests deliberately exercise paths that used to fail to terminate. On a
+constrained board that is disproportionately disruptive, so the suite skips itself
+on RK3588-class boards (Orange Pi 5 / 5 Plus) by default. Detection reads
+`/proc/device-tree/model` and `/proc/cpuinfo`; it keys on the **board**, not on the
+architecture, because `aarch64` alone also covers Graviton, Ampere and Apple
+silicon.
+
+| Variable | Effect |
+|---|---|
+| `ANTISLOP_SKIP_TESTS=1` | skip unconditionally |
+| `ANTISLOP_RUN_TESTS=1` | run unconditionally, overriding detection |
+
+```bash
+python -m tests._platform        # show the detected board and skip decision
+ANTISLOP_RUN_TESTS=1 python -m tests.test_partial_word_bans   # force a run
+```
+
+A skipped suite prints `SKIP` and exits `0`, so it will not fail CI on such a
+board.
 
 ## Known Issues
 

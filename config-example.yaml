@@ -88,6 +88,12 @@ generation_params:
   # which covers the Gemma / Llama-3 / ChatML / Mistral / Qwen families.
   # special_token_pattern: '<\|?/?[a-z_]{1,20}\|?>'
 
+  # NOTE: short banlist entries (a prefix of a longer word, e.g. "la") are safe
+  # in stream mode.  A match that ends at the end of the text produced so far is
+  # treated as provisional while generation runs, and re-checked by a final sweep
+  # once it stops, so the back-tracker no longer rewrites a token the next chunk
+  # was about to disambiguate.
+
   # Whether a backend `stop` that lands on a natural text boundary (sentence
   # punctuation, a closing bracket, a newline) is accepted as the real end of the
   # turn.  A stop in the MIDDLE of a sentence is treated as a premature EOS and
@@ -140,7 +146,14 @@ backtracking:
   #   when resampling after backtracking, if we don't find a valid replacement token
   #   we progressively disable sampling options (temp, then min_p, then top_p, then top_k)
   #   until we find a non-banned replacement or run out of candidates.
-  force_backtrack: true 
+  force_backtrack: true
+
+  # Number of alternative tokens to try at a single position before giving up on
+  # the violation and suppressing it.  This bounds the work done at one position;
+  # without it a position whose whole candidate list was banned could be
+  # re-entered indefinitely.  Raise it if valid responses are being left with a
+  # banned phrase in them, lower it to bound latency.
+  max_retries_per_position: 100
 
 # N-Gram Validator Configuration (Optional)
 ngram_validator:

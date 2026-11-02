@@ -211,7 +211,7 @@ class GenerationState:
     # ....................................................................... #
     #  Construction                                                           #
     # ....................................................................... #
-    def __init__(self, prompt_string: str) -> None:
+    def __init__(self, prompt_string: str, log_init: bool = True) -> None:
         if not isinstance(prompt_string, str):
             raise TypeError("prompt_string must be a string")
 
@@ -225,10 +225,31 @@ class GenerationState:
         # --- logprobs cache (unchanged) -----------------------------------
         self.logprobs_cache: Dict[int, List[Tuple[str, float]]] = {}
 
-        logger.info(
-            f"GenerationState initialised. Prompt length (chars) = "
-            f"{len(prompt_string)}"
-        )
+        # Back-tracking builds one of these per candidate token to test it, so
+        # this must not log: a single backtrack with 20 candidates produced 20
+        # "GenerationState initialised" lines and buried the real events.
+        if log_init:
+            logger.info(
+                "GenerationState initialised. Prompt length (chars) = %d",
+                len(prompt_string),
+            )
+
+    @classmethod
+    def hypothetical(cls, prompt_string: str, tokens: List[str]) -> "GenerationState":
+        """Build a throw-away state for ``tokens`` without logging.
+
+        Used by the back-tracker to test a candidate token.  It skips
+        ``__init__``'s logging and builds the decoded caches directly, which is
+        the only thing a validator needs; constructing a full state per
+        candidate was both noisy and O(n) per candidate.
+        """
+        obj = cls.__new__(cls)
+        obj.prompt_string = prompt_string
+        obj.generated_token_strings = list(tokens)
+        obj._decoded_lens = [len(_decode_token(t)) for t in tokens]
+        obj._decoded_buffer = _tokens_to_text(obj.generated_token_strings)
+        obj.logprobs_cache = {}
+        return obj
 
     # ....................................................................... #
     #  Token stream maintenance                                               #

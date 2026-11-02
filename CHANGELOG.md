@@ -9,6 +9,140 @@ so every entry is ordered and unambiguous without a manual version bump.
 
 ---
 
+## [2026.11.02.1315] — back-tracking storm on partial words, cross-request cancellation
+
+Fixes for a production log on a Gemma-class 31B IT model over vLLM in
+`request_mode: stream`, with a **custom** slop-phrase banlist that legitimately
+contained the short phrase `la`.
+
+Reported symptoms:
+
+* `Back-tracking @tok=2 orig=' la'` repeating at the *same* token index, each
+  followed by a burst of `GenerationState initialised` lines and a
+  `Connection pool reset`.
+* `Stream closed without [DONE] or finish_reason; reporting
+  finish_reason='stream_end'` on requests that had done nothing wrong.
+* Garbage output such as `LHNDD la`, `ownset-////`, `LH/RH/H1`.
+* A generation that never terminated at all (the test suite hung rather than
+  failing).
+
+### Fixed — back-tracking storm: validators fired on half-written words
+
+This is the root cause of the repeated `Back-tracking @tok=2 orig=' la'` lines and
+the run of `GenerationState initialised` messages that follow them.
+
+`detect_disallowed_sequence()` treated the **end of the text produced so far** as
+a word boundary. During decoding that text is only a prefix, so a ban on `la`
+fired the moment the model had emitted `" la"` — even though the next token was
+about to extend it to `"land"` or `"last"`. The back-tracker then rewrote the
+token, the model re-emitted the same prefix, and the sampler re-entered the same
+index indefinitely: no token was ever added, so `max_new_tokens` was never
+reached and the outer loop had no exit condition.
+
+A match that ends at the end of the text is now **provisional** while generation
+is still running, and is deferred until either more text arrives (which decides
+it) or the final sweep runs. A match that already ends in a non-word character
+needs no lookahead and still fires immediately.
+
+* `detect_disallowed_sequence()` gained `allow_end_of_text_match` (default `True`,
+  so existing callers keep the old behaviour).
+* `SlopPhraseValidator.check()` and `NGramValidator.check()` accept a `final`
+  keyword. While streaming they pass `False`; the post-generation sweep passes
+  `True`.
+* The N-gram validator additionally defers a match whose last word is the
+  still-growing final token, because `isalpha()` filtering makes a partly written
+  word look complete.
+
+To keep the guarantee that a banned phrase at the very end of a response is still
+caught, both request modes now run a **final validation sweep** after generation
+stops, before the tail is flushed. It repeats (bounded) because fixing one
+violation can expose another in the rewritten tail. `_perform_backtrack()` takes
+the same `final` flag, so a replacement is not accepted merely because the word
+looks unfinished.
+
+### Fixed — cross-request stream cancellation
+
+The cancellation flag lived on the `ApiClient`, and in server mode a single client
+is shared by every concurrent request. When request A back-tracked and called
+`cancel_current_stream()`, the next chunk of request B's unrelated stream saw the
+flag, closed its socket, and surfaced as `finish_reason='stream_end'` — which the
+sampler then retried. Under load this produced the `Stream closed without [DONE]`
+storm, restarted healthy generations, and (with a mid-stream restart) the
+fragmented output above.
+
+* New `api_client.StreamCancelToken`: one handle per stream, created by
+  `ApiClient.new_stream_token()` and passed to `generate_stream()` as
+  `cancel_token=`. `cancel_stream(token)` aborts exactly that stream.
+* A cancelled stream returns without emitting a `stream_end` chunk, so the sampler
+  does not treat an intentional abort as a backend event to retry.
+* `cancel_current_stream()` is retained for batch mode, where one client serves
+  one request, but it is no longer what the sampler calls.
+
+### Fixed — `max_retries_per_position` was read but never enforced
+
+`backtracking.max_retries_per_position` was loaded into an attribute that nothing
+consulted, so a position whose entire candidate list was banned could be
+re-entered without limit. It is now an actual budget: when it is exhausted the
+violation is suppressed and generation moves on.
+
+### Fixed — silent text loss after back-tracking
+
+`_generate_streamwise()` tracks a `last_yield` watermark of already-emitted
+tokens. Back-tracking truncates the state, so the watermark could point past the
+end of the text; every subsequent safe-prefix slice was then empty and all later
+text was dropped silently. The watermark is now clamped after every back-track
+and every sweep.
+
+### Fixed — noisy, misleading logs
+
+A sampler is constructed **per request** in server mode, so anything logged from
+`__init__` was emitted once per request. The log in the report shows all of these.
+
+* `GenerationState initialised. Prompt length (chars) = …` was logged by every
+  throw-away state the back-tracker built to test a candidate token — 20 lines per
+  back-track, which buried the real events. New
+  `GenerationState.hypothetical()` builds a candidate state without logging and
+  without the redundant rebuild; `__init__` gained `log_init`.
+* The `chunk_size … ~N sequential upstream round-trips` warning fired even in
+  stream mode, because `request_mode` was read *after* the warning. It is now
+  resolved first and the warning is chunk-mode only.
+* `Tiktoken model '…' not found` is logged once per model name, and
+  `tail-prefix filter requested but no chat-template tokenizer available` once per
+  process.
+
+### Added — test suite can be excluded on small ARM boards
+
+`tests/_platform.py` detects the host board from `/proc/device-tree/model` (and
+`/proc/cpuinfo`) and skips the suite on RK3588-class boards such as the Orange Pi
+5 Plus. Detection is by **board**, not by architecture: `aarch64` alone also
+covers Graviton, Ampere and Apple silicon.
+
+* `ANTISLOP_SKIP_TESTS=1` skips unconditionally.
+* `ANTISLOP_RUN_TESTS=1` runs unconditionally, overriding detection.
+* Every test now has a `TEST_TIMEOUT_SEC` (30 s) budget implemented with
+  `SIGALRM`, so a regression that makes the sampler loop forever is reported as a
+  failure instead of wedging the runner. It deliberately does **not** use
+  `multiprocessing`: forking a process that already owns threads and a
+  `ProcessPoolExecutor` (the regex validator keeps one) can deadlock in the child,
+  which looks exactly like the hang the timeout exists to catch.
+
+### Added
+
+* `tests/test_partial_word_bans.py`: 11 regression tests covering the deferred
+  end-of-text match, the final sweep, per-stream cancellation, the back-track
+  budget and the silent candidate-state logging.
+
+### Changed — behaviour
+
+* A banned phrase that is only a **prefix of a word still being written** no
+  longer triggers back-tracking. It is caught by the final sweep if the word
+  really does complete as a banned phrase.
+* Short banlist entries such as `la` are now usable in `request_mode: stream`
+  without a restart loop. They still match only on word boundaries, so `land` and
+  `last` are unaffected.
+
+---
+
 ## [2026.11.02.1126] — truncated assistant turns and special-token leakage
 
 Fixes for two reported symptoms on a 2000-line dataset generated against a

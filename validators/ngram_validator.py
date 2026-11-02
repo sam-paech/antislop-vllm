@@ -158,7 +158,19 @@ class NGramValidator(BaseValidator):
         return cleaned_words_map
 
 
-    def check(self, state: GenerationState) -> Optional[ViolationInfo]:
+    def check(
+        self, state: GenerationState, *, final: bool = False
+    ) -> Optional[ViolationInfo]:
+        """Return the earliest banned n-gram, or None.
+
+        *final* is False while the text is still growing.  An n-gram whose last
+        word touches the end of the text is then **provisional**: the model may
+        still be in the middle of that word (``"said"`` → ``"said, his"``), and
+        ``isalpha()`` filtering makes a partially written word look like a
+        complete one.  Reporting it immediately made the back-tracker rewrite a
+        token the next chunk would have disambiguated.  The final sweep after
+        generation stops passes ``final=True``.
+        """
         if self.is_disabled or not self.banned_ngrams_tuples or state.get_generated_length() == 0 or self.min_ngram_len == 0:
             return None
 
@@ -213,6 +225,17 @@ class NGramValidator(BaseValidator):
             return None
 
         violation_char_pos, matched_ngram_tuple, _ = earliest_violation
+
+        # Defer a match that ends inside the not-yet-complete final word.
+        # raw_tokens_with_char_spans is ordered, so its last token ends at (or
+        # near) the end of the text; if the violating n-gram's final word is that
+        # last token, more characters are still to come.
+        if not final and raw_tokens_with_char_spans:
+            _last_tok_str, last_start, last_end = raw_tokens_with_char_spans[-1]
+            if last_end >= len(generated_text.rstrip()) and last_start >= violation_char_pos:
+                # The only word at or after the violation start is the incomplete
+                # tail word -> provisional, wait for more text.
+                return None
         
         # Convert character position to API token index
         tok_idx = self._char_to_token_index(state, violation_char_pos)

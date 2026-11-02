@@ -73,6 +73,7 @@ def detect_disallowed_sequence(
     min_phrase_len: int,
     check_n_chars_back: int = 1,
     require_word_boundaries: bool = True,
+    allow_end_of_text_match: bool = True,
 ) -> Tuple[Optional[str], Optional[int]]:
     """
     Scan the last *check_n_chars_back* characters of *text* for any phrase
@@ -97,6 +98,19 @@ def detect_disallowed_sequence(
     banned string "cat["
       - *will* trigger a ban on "cat[morecat]", because the banned string
         ends with a non-word character.    
+
+    *allow_end_of_text_match* controls the **provisional** tail of a streamed
+    generation.  During decoding, ``text`` is only the prefix produced so far, so
+    a match that ends at the very last character has no right-hand neighbour yet.
+    Treating that as a boundary made a ban on ``"la"`` fire the moment the model
+    had emitted ``" la"`` — even though the next token was about to extend it to
+    ``"land"``.  The back-tracker then rewrote the token, the model re-emitted the
+    same prefix, and the sampler looped at the same token index forever.  Passing
+    ``False`` while generation is still running defers such a match until either
+    more text arrives (which decides it) or the final sweep runs with ``True``.
+
+    A match ending in a non-word character needs no lookahead and is never
+    deferred, because the ban already demands a non-word character there.
 
     If nothing is found, returns *(None, None)*.
     """
@@ -133,9 +147,17 @@ def detect_disallowed_sequence(
                 else global_pos == 0
                 or not _is_word_char(text_lower[global_pos - 1])
             )
+
+            # A match whose right edge is the end of the *current* text is
+            # provisional: the next token may extend the word and break the
+            # boundary.  Defer it unless this is the final pass.
+            at_text_end = right_pos >= text_len
+            if need_right and at_text_end and not allow_end_of_text_match:
+                continue
+
             right_ok = (
                 True if not need_right
-                else right_pos >= text_len
+                else at_text_end
                 or not _is_word_char(text_lower[right_pos])
             )
 

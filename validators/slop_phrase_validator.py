@@ -51,7 +51,18 @@ class SlopPhraseValidator(BaseValidator):
         )
 
 
-    def check(self, state: GenerationState) -> Optional[ViolationInfo]:
+    def check(
+        self, state: GenerationState, *, final: bool = False
+    ) -> Optional[ViolationInfo]:
+        """Return the earliest banned phrase, or None.
+
+        *final* is False while the text is still growing.  In that case a match
+        whose right edge is the end of the text is **provisional** and is not
+        reported: the next token may extend the word (``"la"`` → ``"land"``), so
+        banning it immediately caused the back-tracker to rewrite a token the
+        model was about to disambiguate itself, looping at the same index.
+        The final sweep after generation stops passes ``final=True``.
+        """
         if not self.slop_phrases_keys or state.get_generated_length() == 0 or self.min_phrase_len == 0:
             return None
 
@@ -73,6 +84,10 @@ class SlopPhraseValidator(BaseValidator):
             min_phrase_len=self.min_phrase_len,
             check_n_chars_back=len(text_to_scan),
             require_word_boundaries=self.match_requires_word_boundaries,
+            # A match touching the end of the text is only definitive once
+            # generation has stopped.  While it is still running the next token
+            # may extend the word and dissolve the boundary.
+            allow_end_of_text_match=final,
         )
 
         if not phrase:

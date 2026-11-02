@@ -11,7 +11,7 @@ import copy
 import sys
 import traceback
 
-from tests import _stubs
+from tests import _platform, _stubs
 
 _stubs.install()
 
@@ -93,22 +93,9 @@ def test_sse_parsing_ignores_comments_and_joins_multiline():
 
 
 def main() -> int:
-    tests = [
-        (name, obj)
-        for name, obj in sorted(globals().items())
-        if name.startswith("test_") and callable(obj)
-    ]
-    failures = 0
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"PASS  {name}")
-        except Exception:
-            failures += 1
-            print(f"FAIL  {name}")
-            traceback.print_exc()
-    print(f"\n{len(tests) - failures}/{len(tests)} passed")
-    return 1 if failures else 0
+    if _platform.report_skip("test_config_and_sse"):
+        return 0
+    return _platform.run_suite("test_config_and_sse", globals())
 
 
 if __name__ == "__main__":
