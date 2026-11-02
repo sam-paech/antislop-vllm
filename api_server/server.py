@@ -91,10 +91,17 @@ def setup_shared_resources(
     )
 
 
-def _run_generation_for_request(request_data: Dict[str, Any]) -> Dict[str, Any]:
+def _run_generation_for_request(
+    request_data: Dict[str, Any],
+    on_text: Optional[Any] = None,
+) -> Dict[str, Any]:
     """
     The actual worker function that runs in a thread pool.
     It creates a sampler and generates the response.
+
+    *on_text*, when given, is called with each accepted text fragment as it is
+    produced, so the SSE endpoint can forward tokens while the generation is
+    still running.  The full text is still returned in the result.
     """
     # Retrieve shared resources
     config = SHARED_RESOURCES["config"]
@@ -147,6 +154,17 @@ def _run_generation_for_request(request_data: Dict[str, Any]) -> Dict[str, Any]:
     top_p_req = request_data.get("top_p")
     top_k_req = request_data.get("top_k")
 
+    # A client-supplied `stop` used to be dropped entirely, so client-side stop
+    # sequences silently did nothing.  Apply them on top of the configured ones.
+    stop_req = request_data.get("stop")
+    if stop_req is not None:
+        if isinstance(stop_req, str):
+            stop_req = [stop_req]
+        configured = list(sampler.stop_sequences or [])
+        sampler.stop_sequences = configured + [
+            str(s) for s in stop_req if str(s)
+        ] or None
+
     # Override ban_strength if provided in request
     ban_strength_req = request_data.get("ban_strength")
     if ban_strength_req is not None:
@@ -154,14 +172,21 @@ def _run_generation_for_request(request_data: Dict[str, Any]) -> Dict[str, Any]:
 
     # --- 4. Generate Response ---
     try:
-        full_response_parts = list(sampler.generate(
+        full_response_parts = []
+        for piece in sampler.generate(
             prompt=prompt_text,
             max_new_tokens=max_tokens_req,
             temperature=temperature_req,
             min_p=min_p_req,
             top_p=top_p_req,
             top_k=top_k_req,
-        ))
+        ):
+            full_response_parts.append(piece)
+            if on_text is not None and piece:
+                try:
+                    on_text(piece)
+                except Exception as e_cb:
+                    logger.warning(f"on_text callback failed: {e_cb}")
         full_response = "".join(full_response_parts)
     except requests.HTTPError as e:
         # Upstream provided an HTTP response — propagate its status/body
@@ -213,9 +238,10 @@ def _run_generation_for_request(request_data: Dict[str, Any]) -> Dict[str, Any]:
     created_timestamp = int(time.time())
     model_name = request_data.get("model", config.get("model_name", "antislop-model"))
 
-    # The finish reason can be inferred from the last chunk in a more complex setup,
-    # but for now, 'stop' is a reasonable default for a completed generation.
-    finish_reason = "stop"
+    # Report the reason the sampler actually ended for.  This used to be hard-coded
+    # to "stop", which meant a truncated (`length`) or failed (`error`) generation
+    # was indistinguishable from a complete one for any client building a dataset.
+    finish_reason = sampler.finish_reason or "stop"
 
     response_payload = {
         "id": response_id,
@@ -242,11 +268,95 @@ def _run_generation_for_request(request_data: Dict[str, Any]) -> Dict[str, Any]:
     return response_payload
 
 
+def _sse_event(payload: Dict[str, Any]) -> str:
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+async def _stream_generation(request_data: Dict[str, Any]):
+    """
+    Stream an OpenAI-compatible ``chat.completion.chunk`` sequence.
+
+    Previously the server always returned a single non-streaming JSON body, even when
+    the client asked for ``stream: true``.  An OpenAI SDK client in streaming mode
+    then had to parse a non-SSE body, which is one of the ways a caller ends up
+    with a truncated assistant turn: the first ``[DONE]``-less payload is treated
+    as the whole answer.
+
+    Generation itself runs in a worker thread; chunks are handed to the event loop
+    through a queue so the blocking sampler never stalls the server.
+    """
+    import asyncio
+    import uuid as _uuid
+
+    queue: "asyncio.Queue[Any]" = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    response_id = f"chatcmpl-{_uuid.uuid4()}"
+    created = int(time.time())
+    model_name = request_data.get("model", SHARED_RESOURCES["config"].get("model_name", "antislop-model"))
+
+    def worker() -> None:
+        try:
+            result = _run_generation_for_request(request_data, on_text=lambda t: loop.call_soon_threadsafe(queue.put_nowait, ("text", t)))
+        except Exception as e:  # pragma: no cover - defensive
+            loop.call_soon_threadsafe(queue.put_nowait, ("error", str(e)))
+            return
+        loop.call_soon_threadsafe(queue.put_nowait, ("done", result))
+
+    loop.run_in_executor(None, worker)
+
+    # opening chunk with the assistant role
+    yield _sse_event({
+        "id": response_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model_name,
+        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+    })
+
+    while True:
+        kind, payload = await queue.get()
+        if kind == "text":
+            if not payload:
+                continue
+            yield _sse_event({
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_name,
+                "choices": [{"index": 0, "delta": {"content": payload}, "finish_reason": None}],
+            })
+        elif kind == "error":
+            yield _sse_event({"error": {"message": payload, "type": "upstream_error"}})
+            yield "data: [DONE]\n\n"
+            return
+        else:
+            result = payload
+            if "error" in result:
+                body = result.get("error_body") or json.dumps(result)
+                yield _sse_event({"error": {"message": body, "type": "upstream_error"}})
+                yield "data: [DONE]\n\n"
+                return
+            finish_reason = result["choices"][0].get("finish_reason") or "stop"
+            yield _sse_event({
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_name,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+                "usage": result.get("usage"),
+            })
+            yield "data: [DONE]\n\n"
+            return
+
+
 @app.post("/v1/chat/completions")
 async def create_chat_completion(request: Request):
     """
     OpenAI-compatible endpoint for chat completions.
-    This is non-streaming.
+
+    Supports both non-streaming (single JSON body) and ``stream: true`` (SSE),
+    which the dataset generator relies on.
     """
     try:
         request_data = await request.json()
@@ -255,6 +365,14 @@ async def create_chat_completion(request: Request):
             content=json.dumps({"error": "Invalid JSON in request body"}),
             status_code=status.HTTP_400_BAD_REQUEST,
             media_type="application/json"
+        )
+
+    if request_data.get("stream"):
+        from fastapi.responses import StreamingResponse
+        return StreamingResponse(
+            _stream_generation(request_data),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     # Run the blocking generation code in a thread pool

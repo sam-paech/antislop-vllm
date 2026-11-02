@@ -98,6 +98,9 @@ class ApiClient(BaseApiClient):
         pool_size: int,
     ):
         self._cancel_stream = False      # sampler sets this to abort
+        # Set once the backend rejects `bad_words`; stops us from paying a
+        # failed round-trip on every subsequent request.
+        self.suppress_tokens_unsupported = False
 
         if not base_url.endswith("/v1"):
             base_url = base_url.rstrip("/") + "/v1"
@@ -202,12 +205,60 @@ class ApiClient(BaseApiClient):
             )
 
     # ------------------------------------------------------------------ #
-    #  NEW: streaming generator                                          #
+    #  SSE parsing helpers                                               #
     # ------------------------------------------------------------------ #
-    # ------------------------------------------------------------------ #
-    #  NEW: streaming generator                                          #
-    # ------------------------------------------------------------------ #
-    def generate_stream(
+    @staticmethod
+    def _iter_sse_data(resp) -> Iterator[str]:
+        """
+        Yield the payload of every SSE ``data:`` event from *resp*.
+
+        ``requests``' ``iter_lines(decode_unicode=True)`` decodes each line in
+        isolation, so a multi-byte UTF-8 character split across two TCP packets
+        is mangled into U+FFFD.  That corrupts the JSON on that line, and the
+        old code responded by *silently skipping the line* — i.e. dropping
+        generated tokens in the middle of a response.  We therefore read raw
+        bytes, buffer them, and decode whole lines at once.
+
+        Multi-line ``data:`` events are joined with "\n" as the SSE spec
+        requires; ``event:``/``id:``/``:`` comment lines are ignored.
+        """
+        buf = bytearray()
+        data_lines: List[str] = []
+
+        for chunk in resp.iter_content(chunk_size=8192):
+            if not chunk:
+                continue
+            buf.extend(chunk)
+            while True:
+                nl = buf.find(b"\n")
+                if nl == -1:
+                    break
+                raw_line = bytes(buf[:nl])
+                del buf[: nl + 1]
+                if raw_line.endswith(b"\r"):
+                    raw_line = raw_line[:-1]
+
+                line = raw_line.decode("utf-8", errors="replace")
+                if not line:
+                    # Blank line terminates the event.
+                    if data_lines:
+                        yield "\n".join(data_lines)
+                        data_lines = []
+                    continue
+                if line.startswith(":"):
+                    continue                      # comment / keep-alive
+                if line.startswith("data:"):
+                    # The spec allows both "data: x" and "data:x".
+                    payload = line[5:]
+                    if payload.startswith(" "):
+                        payload = payload[1:]
+                    data_lines.append(payload)
+                # other fields (event:, id:, retry:) are not used
+
+        if data_lines:
+            yield "\n".join(data_lines)
+
+    def _build_stream_payload(
         self,
         prompt_text: str,
         max_tokens: int,
@@ -216,20 +267,9 @@ class ApiClient(BaseApiClient):
         top_p: Optional[float],
         top_k: Optional[int],
         min_p: Optional[float],
-        timeout: int,
         stop_sequences: Optional[List[str]],
-        **kwargs,
-    ):
-        """
-        Stream /v1/completions and yield one ApiChunkResult **per token**.
-
-        * Supports vLLM, OpenAI, and OpenRouter.
-        * Keeps the same provider-specific payload tweaks used in
-        generate_chunk().
-        * Early-abort when self._cancel_stream is set by the sampler.
-        """
-
-        # ---------- build request payload ----------------------------------
+        kwargs: Dict[str, object],
+    ) -> Dict[str, object]:
         payload: Dict[str, object] = {
             "model":       self.model_name,
             "prompt":      prompt_text,
@@ -262,6 +302,59 @@ class ApiClient(BaseApiClient):
                 "logprobs":     top_logprobs,                  # ← vLLM wants int
                 "top_logprobs": top_logprobs,
             })
+        return payload
+
+    # ------------------------------------------------------------------ #
+    #  Streaming generator                                               #
+    # ------------------------------------------------------------------ #
+    def generate_stream(
+        self,
+        prompt_text: str,
+        max_tokens: int,
+        top_logprobs: int,
+        temperature: float,
+        top_p: Optional[float],
+        top_k: Optional[int],
+        min_p: Optional[float],
+        timeout: int,
+        stop_sequences: Optional[List[str]],
+        **kwargs,
+    ):
+        """
+        Stream /v1/completions and yield one ApiChunkResult **per token**.
+
+        Guarantees, relied upon by the sampler:
+
+        * Exactly one chunk with a non-``None`` ``finish_reason`` is yielded at
+          the end, whatever happens (``stop``/``length`` from the backend, or
+          ``stream_end`` for a clean ``[DONE]``, or ``error``/``timeout``).  A
+          generator that just *stops* without a terminal chunk used to leave the
+          sampler's outer loop with no exit condition.
+        * ``finish_reason`` is **latched**: vLLM sends it on a final chunk that
+          often carries no text, and the old code overwrote the latched value
+          with ``None`` on every ordinary chunk.
+        * The SSE ``text`` delta is preserved even when ``logprobs`` is absent,
+          so text can never be lost between backend and caller.
+
+        ``suppress_tokens`` (list of literal strings) is forwarded as ``bad_words``
+        when the backend supports it; see :meth:`_post_stream`.
+        """
+
+        suppress_tokens = kwargs.pop("suppress_tokens", None)
+
+        payload = self._build_stream_payload(
+            prompt_text=prompt_text,
+            max_tokens=max_tokens,
+            top_logprobs=top_logprobs,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            stop_sequences=stop_sequences,
+            kwargs=kwargs,
+        )
+        if suppress_tokens:
+            payload["bad_words"] = list(suppress_tokens)
 
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -289,9 +382,28 @@ class ApiClient(BaseApiClient):
                     stream=True,
                     timeout=timeout,
                 ))
+                if resp.status_code == 400 and "bad_words" in payload:
+                    # Not every OpenAI-compatible backend accepts bad_words.
+                    # Degrade to a normal request rather than failing the
+                    # generation: the sampler has its own scrubber as a fallback.
+                    resp.close()
+                    logger.warning(
+                        "Backend rejected 'bad_words'; disabling token "
+                        "suppression for this stream and retrying without it."
+                    )
+                    self.suppress_tokens_unsupported = True
+                    payload.pop("bad_words", None)
+                    resp = stack.enter_context(session.post(
+                        self.completion_endpoint,
+                        headers=headers,
+                        json=payload,
+                        stream=True,
+                        timeout=timeout,
+                    ))
                 resp.raise_for_status()
 
-                for raw in resp.iter_lines(decode_unicode=True):
+                saw_done = False
+                for raw in self._iter_sse_data(resp):
 
                     # ---- sampler asked to abort? ------------------------------
                     if self._cancel_stream:
@@ -299,26 +411,25 @@ class ApiClient(BaseApiClient):
                         self._cancel_stream = False
                         break
 
-                    if not raw or raw == "\n":
+                    if not raw or not raw.strip():
                         continue
 
-                    if raw.startswith("data: "):
-                        raw = raw[6:]
-
                     if raw.strip() == "[DONE]":
-                        # signal natural end-of-stream
-                        yield ApiChunkResult(
-                            generated_text="",
-                            finish_reason="stream_end",
-                        )
+                        saw_done = True
                         break
 
                     # ---------- parse SSE JSON ---------------------------------
                     try:
                         obj = json.loads(raw)
                     except json.JSONDecodeError:
-                        logger.warning("Malformed SSE line: %s", raw[:160])
-                        continue
+                        # A malformed event means we do not know what text it
+                        # carried.  Skipping it would silently drop tokens, so
+                        # surface it as an error the sampler can retry instead.
+                        logger.warning("Malformed SSE event: %s", raw[:160])
+                        raise requests.HTTPError(
+                            f"Malformed SSE event from backend: {raw[:160]!r}",
+                            response=resp,
+                        )
 
                     # Pass-through OpenAI-style streamed error packets
                     if isinstance(obj, dict) and obj.get("error"):
@@ -330,13 +441,24 @@ class ApiClient(BaseApiClient):
                         continue
                     choice = obj["choices"][0]
 
-                    # Track finish_reason from the last chunk
-                    last_finish_reason = choice.get("finish_reason")
+                    # Latch the finish reason: it is usually only present on the
+                    # last chunk, and that chunk frequently has no text.  The old
+                    # code overwrote the latched value with None on every
+                    # ordinary chunk, so the reason was lost entirely.
+                    if choice.get("finish_reason"):
+                        last_finish_reason = choice["finish_reason"]
 
                     # -- incremental text fragment ------------------------------
                     generated_text = choice.get("text", "")
-                    # (some providers use .delta.content / .message.content – those
-                    # branches are left in generate_chunk; for vLLM we only need .text)
+                    if not generated_text:
+                        # Some providers only fill .delta.content / .message.content
+                        delta = choice.get("delta")
+                        if isinstance(delta, dict):
+                            generated_text = delta.get("content") or ""
+                        if not generated_text:
+                            message = choice.get("message")
+                            if isinstance(message, dict):
+                                generated_text = message.get("content") or ""
 
                     # -- extract logprobs --------------------------------------
                     token_strings: List[str] = []
@@ -344,11 +466,20 @@ class ApiClient(BaseApiClient):
 
                     lp_obj = choice.get("logprobs")
                     if lp_obj and isinstance(lp_obj, dict):
-                        token_strings = lp_obj.get("tokens", [])
+                        token_strings = lp_obj.get("tokens", []) or []
                         # vLLM: top_logprobs is list[dict] aligned with tokens
-                        for idx, alt_dict in enumerate(lp_obj.get("top_logprobs", [])):
+                        for idx, alt_dict in enumerate(lp_obj.get("top_logprobs", []) or []):
                             if isinstance(alt_dict, dict):
                                 rel_logprobs[idx] = list(alt_dict.items())
+
+                    # No logprobs but there is text: hand the text over as a
+                    # single opaque token so it still reaches the generation
+                    # state (and the scrubber) instead of being dropped.
+                    if not token_strings and generated_text:
+                        token_strings = [generated_text]
+
+                    if not token_strings and not last_finish_reason:
+                        continue
 
                     yield ApiChunkResult(
                         generated_text=generated_text,
@@ -357,9 +488,32 @@ class ApiClient(BaseApiClient):
                         finish_reason=last_finish_reason,
                     )
 
+                # Always emit exactly one terminal chunk.  Without this the
+                # sampler's outer loop has no exit condition when the backend
+                # closes the socket without sending [DONE] or a finish_reason.
+                if self._cancel_stream:
+                    self._cancel_stream = False
+                    return
+
+                if saw_done and not last_finish_reason:
+                    last_finish_reason = "stream_end"
+                elif not last_finish_reason:
+                    logger.warning(
+                        "Stream closed without [DONE] or finish_reason; "
+                        "reporting finish_reason='stream_end' so the sampler can "
+                        "decide whether to retry."
+                    )
+                    last_finish_reason = "stream_end"
+
+                yield ApiChunkResult(
+                    generated_text="",
+                    token_strings=[],
+                    logprobs={},
+                    finish_reason=last_finish_reason,
+                )
+
         except requests.exceptions.Timeout:
             logger.warning("Stream timed out. Yielding final chunk with finish_reason='timeout'.")
-            # Yield a final chunk to signal the end, even if incomplete
             yield ApiChunkResult(
                 generated_text="",
                 token_strings=[],
@@ -369,15 +523,14 @@ class ApiClient(BaseApiClient):
             raise
         except Exception as e:
             logger.warning(f"Stream ended unexpectedly: {e}")
-            # If we have a finish_reason from earlier, the stream likely completed
-            # Otherwise, signal an abnormal end
-            if not last_finish_reason:
-                yield ApiChunkResult(
-                    generated_text="",
-                    token_strings=[],
-                    logprobs={},
-                    finish_reason="error",
-                )
+            # Always give the caller a terminal chunk so it can distinguish
+            # "the backend finished" from "the connection broke".
+            yield ApiChunkResult(
+                generated_text="",
+                token_strings=[],
+                logprobs={},
+                finish_reason=last_finish_reason or "error",
+            )
             raise
 
 
