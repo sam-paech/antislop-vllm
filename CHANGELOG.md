@@ -9,6 +9,103 @@ so every entry is ordered and unambiguous without a manual version bump.
 
 ---
 
+## [2026.11.02.1530] — tests: fix the excluded sampler-filter suite, add a run lock
+
+### Fixed — `tests/test_sampler_filters.py` was broken and excluded from the suite
+
+The suite failed with ``AttributeError: 'ApiAntiSlopSampler' object has no attribute
+'max_retries_per_position'``. The cause was the test, not the sampler: it built the
+sampler with ``object.__new__(ApiAntiSlopSampler)`` and a hand-written list of
+attributes, so it bypassed ``__init__``. Every attribute the sampler later gained was
+missing from that list, and the test failed on an ``AttributeError`` that said nothing
+about the behaviour it was supposed to check.
+
+* The test now builds the sampler through the real constructor, so a new required
+attribute is picked up for free and a real misconfiguration surfaces as itself.
+* Its candidate-check stub now accepts the ``final`` keyword, which the sampler passes
+  through to distinguish a mid-stream candidate from a final-sweep one.
+* Added ``test_backtrack_stops_at_the_configured_budget``: a position whose candidates
+  are all rejected must be ended by ``max_retries_per_position``, not re-entered
+  without limit. This is the second half of the back-tracking storm.
+* Registered in ``run_all.SUITES``; the suite is no longer excluded.
+
+### Added — an exclusive run lock for shared checkouts
+
+Several agents may share this checkout, and nothing here is isolated per agent. Two
+concurrent runs interleaved their output and competed for the same four cores, which is
+exactly what the single-threaded, short-timer design exists to prevent.
+
+* ``tests/run_all.py`` takes an exclusive ``flock`` on ``tests/.runlock`` for the
+  duration of the run.
+* A second concurrent run refuses to start and exits ``2``, with a message naming the
+  lock, rather than queueing silently.
+* ``flock`` rather than a plain lockfile is deliberate: the kernel drops it when the
+  holder dies, including on ``SIGKILL``, so a killed run cannot wedge every later run
+  in the checkout.
+
+### Added
+
+* ``AGENTS.md``: the test-first (red, green, refactor) workflow, the single-thread /
+  timer / abort rules, the concurrency rules for agents sharing a checkout, and the
+  definition of done.
+
+## [2026.11.02.1521] — tests: single-threaded, short timers, abortable, no board exclusion
+
+The previous entry made the suite skip itself on RK3588-class boards because a
+non-terminating test pegged a core with no way to stop it. That is a workaround, not a
+fix: the board could not run its own tests. This replaces it with containment, and the
+Orange Pi 5 Plus runs the suite again.
+
+### Changed — the suite is now single-threaded
+
+* `tests/run_all.py` runs the suites **one at a time**, each in its own process group,
+  and tests run one after another in the main thread. There is no parallelism to
+  oversubscribe a 4-core board with.
+* `tests/_runner.py` pins `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`,
+  `MKL_NUM_THREADS`, `NUMEXPR_NUM_THREADS`, `VECLIB_MAXIMUM_THREADS` and
+  `TOKENIZERS_PARALLELISM=false` at import, before `core.sampler` is imported.
+* `RegexValidator`'s `ProcessPoolExecutor` is now created **lazily** on first `check()`
+  instead of forking 16 processes at import, and its default worker count is capped at
+  the CPU count (`ANTISLOP_REGEX_MAX_WORKERS` overrides; the harness pins it to 1).
+  Importing `validators` no longer starts a single process.
+* A suite reports any thread still alive when it finishes.
+
+### Changed — short timers, and a hard kill behind them
+
+* Per-test budget is now `ANTISLOP_TEST_TIMEOUT`, default **10 s** (was 30), enforced
+  in-process with `SIGALRM`.
+* Per-suite budget is `ANTISLOP_SUITE_TIMEOUT`, default **60 s**, enforced by
+  `run_all.py`, which `SIGTERM`s and then `SIGKILL`s the suite's whole **process
+  group**. `SIGALRM` cannot interrupt a blocking C call or a catastrophic regex, so a
+  kill is the only thing that reliably reclaims the machine; killing the group also
+  takes out the validator's pool workers, which would otherwise be orphaned and keep
+  burning cores.
+* The full suite runs in about 2 s on an Orange Pi 5 Plus, so a test that reaches its
+  budget is a loop that does not terminate, not a slow machine.
+
+### Added — a run can be aborted at any time
+
+* `touch tests/.abort` (or `ANTISLOP_TEST_ABORT_FILE=<path>`) stops the run; the
+  sentinel is polled every 50 ms *inside* each test, not just between them, so a hung
+  test does not have to reach its budget first.
+* `Ctrl-C`, `SIGTERM` and `SIGHUP` to the runner do the same, and take the child
+  suite down with them.
+* An aborted run prints `ABORTED` with the reason and exits `130`; `run_all` removes a
+  stale abort file on the next start.
+
+### Removed — the Orange Pi / RK3588 exclusion
+
+* `tests/_platform.py` is gone, along with `ANTISLOP_SKIP_TESTS` and
+  `ANTISLOP_RUN_TESTS`: there is no board detection and nothing is skipped by
+  hardware. The suite no longer needs an override to run on the board it was written for.
+
+### Added
+
+* `tests/test_harness.py`: 9 tests for the harness itself — the timeout fires on a
+  non-terminating loop, the abort file is noticed mid-test, the thread pools are pinned,
+  the regex pool stays lazy and single-worker, and importing the sampler starts no
+  threads.
+
 ## [2026.11.02.1315] — back-tracking storm on partial words, cross-request cancellation
 
 Fixes for a production log on a Gemma-class 31B IT model over vLLM in
@@ -111,6 +208,9 @@ A sampler is constructed **per request** in server mode, so anything logged from
   process.
 
 ### Added — test suite can be excluded on small ARM boards
+
+> Superseded by [2026.11.02.1521], which replaced the exclusion with a
+> single-threaded, timed, abortable runner. `tests/_platform.py` no longer exists.
 
 `tests/_platform.py` detects the host board from `/proc/device-tree/model` (and
 `/proc/cpuinfo`) and skips the suite on RK3588-class boards such as the Orange Pi

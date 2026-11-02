@@ -1,6 +1,8 @@
 # validators/regex_validator.py
 import logging
+import os
 import re
+import threading
 import time
 from concurrent.futures import ProcessPoolExecutor, TimeoutError
 from typing import List, Optional, Dict, Tuple, Any
@@ -15,9 +17,52 @@ logger = logging.getLogger(__name__)
 #  Global config ― tweak here when necessary
 # ────────────────────────────────────────────────────────────────────────────
 REGEX_TIMEOUT_SEC: float = 2          # seconds before we abort a search
-REGEX_MAX_WORKERS: int   = 16             # keep this many “hot” workers alive
-# Create the process pool once – stays alive for the interpreter lifetime
-_REGEX_POOL = ProcessPoolExecutor(max_workers=REGEX_MAX_WORKERS)
+
+
+def _default_max_workers() -> int:
+    """Workers to keep “hot”.
+
+    Capped at the CPU count: 16 workers on a 4-core board just oversubscribes it, and
+    each one is a forked interpreter that outlives a killed parent unless it is in the
+    same process group.  ``ANTISLOP_REGEX_MAX_WORKERS`` overrides (the test harness
+    pins it to 1).
+    """
+    raw = os.environ.get("ANTISLOP_REGEX_MAX_WORKERS")
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError:
+            logger.warning(
+                "Ignoring ANTISLOP_REGEX_MAX_WORKERS=%r: not an integer.", raw
+            )
+        else:
+            if value >= 1:
+                return value
+            logger.warning(
+                "Ignoring ANTISLOP_REGEX_MAX_WORKERS=%r: must be >= 1.", raw
+            )
+    return max(1, min(16, os.cpu_count() or 1))
+
+
+REGEX_MAX_WORKERS: int = _default_max_workers()
+
+# The pool is created on first use, not at import time.  Importing this module used to
+# fork 16 processes as a side effect, which made `import validators` expensive and
+# meant a test run spawned workers it never used.
+_REGEX_POOL: Optional[ProcessPoolExecutor] = None
+_REGEX_POOL_LOCK = threading.Lock()
+
+
+def _get_regex_pool() -> ProcessPoolExecutor:
+    global _REGEX_POOL
+    pool = _REGEX_POOL
+    if pool is not None:
+        return pool
+    with _REGEX_POOL_LOCK:
+        if _REGEX_POOL is None:
+            _REGEX_POOL = ProcessPoolExecutor(max_workers=REGEX_MAX_WORKERS)
+        return _REGEX_POOL
+
 
 # --------------------------------------------------------------------------- #
 #  Helper run in a separate process                                           #
@@ -106,7 +151,7 @@ class RegexValidator(BaseValidator):
         # ── timing probe ---------------------------------------------------
         t0 = time.perf_counter()
 
-        future = _REGEX_POOL.submit(
+        future = _get_regex_pool().submit(
             _regex_search_worker,
             (self._big_re.pattern, self._big_re.flags, text)
         )

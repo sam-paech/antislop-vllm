@@ -11,7 +11,7 @@ import copy
 import sys
 import traceback
 
-from tests import _platform, _stubs
+from tests import _runner, _stubs
 
 _stubs.install()
 
@@ -93,9 +93,7 @@ def test_sse_parsing_ignores_comments_and_joins_multiline():
 
 
 def main() -> int:
-    if _platform.report_skip("test_config_and_sse"):
-        return 0
-    return _platform.run_suite("test_config_and_sse", globals())
+    return _runner.run_suite("test_config_and_sse", globals())
 
 
 if __name__ == "__main__":

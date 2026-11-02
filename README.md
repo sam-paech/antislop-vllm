@@ -358,47 +358,93 @@ While `antislop-vllm` is based on the concepts of the original `antislop-sampler
 *   `banlists/`: Directory for example ban list files (JSON format). **Users should curate their own lists.**
 *   `data/`: Can store auxiliary data like human writing profiles for `auto_unslop.py`.
 *   `results/`: Default output directory for batch generations and `auto_unslop.py` experiments.
-*   `tests/`: Regression suite (see [Running the tests](#running-the-tests)). `_platform.py` holds the board detection and per-test timeout.
+*   `tests/`: Regression suite (see [Running the tests](#running-the-tests)). `_runner.py` holds the single-thread setup, the per-test timer and the abort check; `run_all.py` runs the suites one at a time under a run lock and a hard kill watchdog. See [`AGENTS.md`](AGENTS.md) for the test-first workflow.
 *   `example_run_antislop_vllm.ipynb`: Jupyter notebook with usage examples.
 
 ## Running the tests
 
 The regression suite lives in `tests/` and needs no GPU, network, or vLLM — the
-backend is a scripted fake and the heavy optional imports are stubbed. Run an
-individual suite directly:
+backend is a scripted fake and the heavy optional imports are stubbed.
 
 ```bash
-python -m tests.test_early_eos          # truncation / early end-of-turn
-python -m tests.test_partial_word_bans  # back-tracking storms, cancellation
+python -m tests.run_all                 # every suite, one at a time (recommended)
+python -m tests.run_all early_eos        # a subset, by name
+python -m tests.run_all --list          # what would run
+```
+
+Individual suites also run standalone, which is handy while iterating:
+
+```bash
+python -m tests.test_early_eos           # truncation / early end-of-turn
+python -m tests.test_partial_word_bans   # back-tracking storms, cancellation
 python -m tests.test_config_and_sse      # config merge and SSE parsing
+python -m tests.test_sampler_filters    # min-p floor vs. the rejected top token
+python -m tests.test_harness            # the harness itself
 ```
 
-Each test has a **30-second budget**. Several of them exist because the code under
-test used to loop forever, so a regression shows up as a hang rather than a failed
-assertion; the budget turns that into a reported failure instead of a wedged
-runner.
+Prefer `run_all` over a shell loop: it is the only entry point that enforces the
+hard kill and the run lock described below.
 
-### Skipping the suite on small ARM boards
+### Nothing here can wedge the board
 
-Some tests deliberately exercise paths that used to fail to terminate. On a
-constrained board that is disproportionately disruptive, so the suite skips itself
-on RK3588-class boards (Orange Pi 5 / 5 Plus) by default. Detection reads
-`/proc/device-tree/model` and `/proc/cpuinfo`; it keys on the **board**, not on the
-architecture, because `aarch64` alone also covers Graviton, Ampere and Apple
-silicon.
+The suite runs on small ARM boards (it is developed on an Orange Pi 5 Plus) and is
+designed so that a regression cannot take the machine down. Several tests exist
+precisely because the sampler used to loop forever, so a hang is the failure mode
+they are meant to catch — not an accident to be avoided.
 
-| Variable | Effect |
-|---|---|
-| `ANTISLOP_SKIP_TESTS=1` | skip unconditionally |
-| `ANTISLOP_RUN_TESTS=1` | run unconditionally, overriding detection |
+*   **Single-threaded.** Suites run one after another and tests run one at a time in
+the main thread. `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`,
+`NUMEXPR_NUM_THREADS`, `VECLIB_MAXIMUM_THREADS` and `TOKENIZERS_PARALLELISM` are
+pinned at import, and the regex validator's process pool is pinned to one worker and
+created lazily instead of forking 16 processes at import time. A suite reports any
+thread still alive when it finishes.
+*   **Short timers.** Each test gets `ANTISLOP_TEST_TIMEOUT` seconds (default **10**),
+enforced in-process with `SIGALRM`. A test that overruns is reported as a failure.
+*   **Automatic kill.** Each suite gets `ANTISLOP_SUITE_TIMEOUT` seconds (default
+**60**) from `run_all.py`, which then `SIGTERM`s and, if needed, `SIGKILL`s the
+suite's **whole process group**. This is the backstop for a hang `SIGALRM` cannot
+break — a blocking C call, or a catastrophic regex — and killing the group also takes
+out the validator's pool workers, which would otherwise survive as orphans and keep
+pegging cores.
+
+### One run at a time
+
+Several agents may share a checkout, and nothing here is isolated per agent. `run_all`
+takes an exclusive `flock` on `tests/.runlock` for the duration, and a second run
+refuses to start with exit code `2` rather than interleaving its output and competing
+for the same four cores:
+
+```
+BUSY  another run holds …/tests/.runlock.
+      Another agent is using this checkout; wait for it to finish.
+```
+
+`flock` rather than a plain lockfile is deliberate: the kernel drops it when the
+holder dies, including on `SIGKILL`, so a killed run cannot wedge the checkout. Do not
+delete `tests/.runlock` while a run is in progress.
+
+### Aborting a run
+
+Whoever started the tests can stop them at any point, without waiting for the current
+test or suite:
 
 ```bash
-python -m tests._platform        # show the detected board and skip decision
-ANTISLOP_RUN_TESTS=1 python -m tests.test_partial_word_bans   # force a run
+touch tests/.abort     # checked inside every test, every 50 ms
 ```
 
-A skipped suite prints `SKIP` and exits `0`, so it will not fail CI on such a
-board.
+`Ctrl-C`, `SIGTERM` or `SIGHUP` to the runner does the same thing. The run stops,
+prints `ABORTED` with the reason and exit code `130`, and `run_all` removes a stale
+abort file on the next start.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `ANTISLOP_TEST_TIMEOUT` | `10` | per-test budget, seconds |
+| `ANTISLOP_SUITE_TIMEOUT` | `60` | per-suite hard-kill budget, seconds |
+| `ANTISLOP_TEST_ABORT_FILE` | `tests/.abort` | abort sentinel path |
+| `ANTISLOP_REGEX_MAX_WORKERS` | CPU count, max 16 | regex validator pool size (tests pin it to 1) |
+
+Exit codes: `0` all passed, `1` failures or a kill, `2` another run holds the lock,
+`130` aborted.
 
 ## Known Issues
 

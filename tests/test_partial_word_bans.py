@@ -19,7 +19,7 @@ from __future__ import annotations
 import sys
 import traceback
 
-from tests import _platform, _stubs
+from tests import _runner, _stubs
 
 _stubs.install()
 
@@ -275,9 +275,7 @@ def test_backtrack_budget_is_enforced():
 
 
 def main() -> int:
-    if _platform.report_skip("test_partial_word_bans"):
-        return 0
-    return _platform.run_suite("test_partial_word_bans", globals())
+    return _runner.run_suite("test_partial_word_bans", globals())
 
 
 if __name__ == "__main__":
