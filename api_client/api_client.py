@@ -41,6 +41,38 @@ _SESSIONS_LOCK = threading.RLock()
 _SHARED_POOLS: Dict[str, _SessionPool] = {}
 
 
+class StreamCancelToken:
+    """Cancellation handle for **one** upstream stream.
+
+    A single ``ApiClient`` instance is shared by every concurrent request in server
+    mode (``SHARED_RESOURCES["api_client"]``).  The old ``_cancel_stream``
+    boolean therefore belonged to the *client*, not to a stream: when request A
+    backtracked and called ``cancel_current_stream()``, the next chunk of request
+    B's unrelated stream saw the flag, closed its socket, and surfaced as
+    ``finish_reason='stream_end'``.  Under load that produced a storm of
+    "Stream closed without [DONE] or finish_reason" warnings and truncated or
+    restarted generations that were perfectly healthy.
+
+    A token is created per stream and passed into :meth:`ApiClient.generate_stream`,
+    so cancelling one stream can never affect another.
+    """
+
+    __slots__ = ("_event",)
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+
+    def cancel(self) -> None:
+        self._event.set()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._event.is_set()
+
+    def reset(self) -> None:
+        self._event.clear()
+
+
 @contextmanager
 def _lease_session(base_url: str, pool_size: int) -> Iterator[requests.Session]:
     """
@@ -97,10 +129,16 @@ class ApiClient(BaseApiClient):
         base_url: str,
         pool_size: int,
     ):
-        self._cancel_stream = False      # sampler sets this to abort
         # Set once the backend rejects `bad_words`; stops us from paying a
         # failed round-trip on every subsequent request.
         self.suppress_tokens_unsupported = False
+        # Legacy, client-wide cancellation.  Kept only so older callers do not
+        # crash; it is NOT used to cancel an individual stream any more (see
+        # StreamCancelToken for why).
+        self._cancel_stream = False
+        # Tokens of the streams currently open on this client.
+        self._active_tokens: set = set()
+        self._tokens_lock = threading.Lock()
 
         if not base_url.endswith("/v1"):
             base_url = base_url.rstrip("/") + "/v1"
@@ -151,8 +189,44 @@ class ApiClient(BaseApiClient):
         s.mount("https://", adapter)
         return s
 
+    def new_stream_token(self) -> StreamCancelToken:
+        """Create a cancellation handle for one stream.
+
+        Pass the returned token to :meth:`generate_stream` as
+        ``cancel_token=...`` and call :meth:`cancel_stream` on it to abort that
+        stream only.
+        """
+        return StreamCancelToken()
+
+    def register_stream_token(self, token: Optional[StreamCancelToken]) -> None:
+        if token is None:
+            return
+        with self._tokens_lock:
+            self._active_tokens.add(token)
+
+    def unregister_stream_token(self, token: Optional[StreamCancelToken]) -> None:
+        if token is None:
+            return
+        with self._tokens_lock:
+            self._active_tokens.discard(token)
+
+    def cancel_stream(self, token: Optional[StreamCancelToken]) -> None:
+        """Cancel exactly one stream.  No-op when *token* is None."""
+        if token is not None:
+            token.cancel()
+
     def cancel_current_stream(self):
+        """Cancel every stream open on this client.
+
+        Retained for backwards compatibility, but this is only safe when the
+        client serves a single request (batch mode).  Server mode shares one client
+        across all in-flight requests and must use a per-stream token instead.
+        """
         self._cancel_stream = True
+        with self._tokens_lock:
+            tokens = list(self._active_tokens)
+        for tok in tokens:
+            tok.cancel()
 
     def reset_connection_pool(self):
         """
@@ -318,6 +392,7 @@ class ApiClient(BaseApiClient):
         min_p: Optional[float],
         timeout: int,
         stop_sequences: Optional[List[str]],
+        cancel_token: Optional[StreamCancelToken] = None,
         **kwargs,
     ):
         """
@@ -338,9 +413,14 @@ class ApiClient(BaseApiClient):
 
         ``suppress_tokens`` (list of literal strings) is forwarded as ``bad_words``
         when the backend supports it; see :meth:`_post_stream`.
+
+        ``cancel_token`` scopes cancellation to *this* stream.  Without it, one
+        request backtracking used to abort every other in-flight stream on the
+        shared client (see :class:`StreamCancelToken`).
         """
 
         suppress_tokens = kwargs.pop("suppress_tokens", None)
+        self.register_stream_token(cancel_token)
 
         payload = self._build_stream_payload(
             prompt_text=prompt_text,
@@ -403,12 +483,13 @@ class ApiClient(BaseApiClient):
                 resp.raise_for_status()
 
                 saw_done = False
+                cancelled = False
                 for raw in self._iter_sse_data(resp):
 
-                    # ---- sampler asked to abort? ------------------------------
-                    if self._cancel_stream:
+                    # ---- sampler asked to abort THIS stream? ------------------
+                    if (cancel_token is not None and cancel_token.cancelled) or self._cancel_stream:
+                        cancelled = True
                         resp.close()
-                        self._cancel_stream = False
                         break
 
                     if not raw or not raw.strip():
@@ -491,8 +572,9 @@ class ApiClient(BaseApiClient):
                 # Always emit exactly one terminal chunk.  Without this the
                 # sampler's outer loop has no exit condition when the backend
                 # closes the socket without sending [DONE] or a finish_reason.
-                if self._cancel_stream:
-                    self._cancel_stream = False
+                if cancelled or self._cancel_stream:
+                    # A cancelled stream is not a backend event: report it as such
+                    # instead of 'stream_end', which the sampler would retry.
                     return
 
                 if saw_done and not last_finish_reason:
@@ -522,6 +604,12 @@ class ApiClient(BaseApiClient):
             )
             raise
         except Exception as e:
+            if cancel_token is not None and cancel_token.cancelled:
+                # Closing the socket from the reader side surfaces as a transport
+                # error.  That is an intentional abort, not a backend failure, so
+                # do not report it as one.
+                logger.debug("Stream cancelled by the sampler: %s", e)
+                return
             logger.warning(f"Stream ended unexpectedly: {e}")
             # Always give the caller a terminal chunk so it can distinguish
             # "the backend finished" from "the connection broke".
@@ -532,6 +620,8 @@ class ApiClient(BaseApiClient):
                 finish_reason=last_finish_reason or "error",
             )
             raise
+        finally:
+            self.unregister_stream_token(cancel_token)
 
 
 
