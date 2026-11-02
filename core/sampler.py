@@ -21,6 +21,7 @@ inspection or metrics.
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
 import time
@@ -30,9 +31,10 @@ from typing import Dict, Generator, List, Optional, Tuple, Callable, Any
 import tiktoken # Added tiktoken
 
 from api_client.base_client import BaseApiClient
-from core.models import ViolationInfo
+from core.models import ApiChunkResult, ViolationInfo
 from state.generation_state import (
     GenerationState,
+    SpecialTokenScrubber,
     _decode_token,
     _tokens_to_text,
 )
@@ -51,6 +53,11 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 _BANNED_PREFIX_CACHE: dict[str, frozenset[str]] = {}
 _BANNED_PREFIX_LOCK = Lock()
+
+# Cached result of the streamed-logprobs probe, keyed by api base_url.
+# Only *successful* probes are cached, so a backend that is briefly unavailable
+# still gets re-probed on the next request instead of failing permanently.
+_STREAM_PROBE_CACHE: dict[str, bool] = {}
 
 
 def _build_banned_prefix_set(chat_tpl, validators) -> frozenset[str]:
@@ -218,19 +225,12 @@ class ApiAntiSlopSampler:
         self.stop_sequences = gen.get("stop_sequences")
         self.timeout = gen.get("timeout", 120)
 
-        # ── early end-of-turn (EOS) handling ────────────────────────────────
+        # ── end-of-turn marker list ─────────────────────────────────────────
         # Gemma-class models sampling at temperature > 0 emit their end-of-turn
-        # marker (e.g. <end_of_turn> / <turn|>) prematurely ~20% of the time;
-        # vLLM then reports finish_reason="stop".  Two bugs followed:
-        #   • Bug 1 — the marker token was flushed into the visible output.
-        #   • Bug 2 — a mid-sentence stop truncated the response.
-        # The fix strips any trailing end-of-turn marker token(s) from each
-        # chunk *before* they enter the generation state (so they never leak
-        # out), and treats the accompanying "stop" as an early, non-terminal
-        # signal — continuing generation until max_consecutive_stops such
-        # stops are seen back-to-back (safety valve against infinite loops).
-        # A "stop" WITHOUT a marker is still treated as genuinely terminal,
-        # so user-configured stop_sequences keep working.
+        # marker (<end_of_turn> / <turn|>) mid-response.  vLLM reports that as
+        # finish_reason="stop" and *strips the token itself* from the response,
+        # so the marker list below cannot be used for detection -- only for
+        # scrubbing tokens that do leak through.
         # NOTE: `[]` is falsy, so a plain `or DEFAULT` would silently re-enable
         # the feature for anyone who set `end_of_turn_markers: []` to turn it
         # off.  Only fall back to the defaults when the key is *absent*.
@@ -241,10 +241,50 @@ class ApiAntiSlopSampler:
             str(m).strip().lower() for m in eos_markers if str(m).strip()
         ]
         self.max_consecutive_stops = max(1, int(gen.get("max_consecutive_stops", 3)))
-        # Counter for consecutive early end-of-turn stops (safety valve).
+        # Consecutive *no-progress* early stops (safety valve); see _handle_stop.
         self._consecutive_stops = 0
         self.chat_formatter = chat_template_formatter
         self.force_backtrack = bool(config.get("backtracking", {}).get("force_backtrack", False))
+
+        # ── stop / end-of-turn policy ───────────────────────────────────────
+        # The original early-EOS feature only fired when a marker *token* showed
+        # up in `logprobs.tokens`.  vLLM strips the stop token before
+        # serialising a response, so that token never arrives and the feature
+        # never fired: every premature `<end_of_turn>` silently truncated the
+        # answer.  Detection now rests on observable evidence (did the attempt
+        # produce text, and does that text end on a natural boundary); the
+        # marker list is used only for *scrubbing* leaked control tokens.
+        #
+        # stop_on_clean_end: accept a backend stop that lands on a natural text
+        #   boundary.  Set false to always keep generating — never truncate, at
+        #   the cost of occasionally running on past the real end of turn.
+        self.stop_on_clean_end = bool(gen.get("stop_on_clean_end", True))
+        clean_end = gen.get("clean_end_chars")
+        if clean_end is None:
+            clean_end = [".", "!", "?", "…", '"', "'", "\u201d", "\u2019", ")", "]", "}", "\n"]
+        self.clean_end_chars: Tuple[str, ...] = tuple(str(c) for c in clean_end if str(c))
+
+        # Hard cap on upstream stream attempts per generation, so a backend that
+        # closes the socket without [DONE] cannot spin forever.
+        self.max_stream_attempts = max(
+            2, int(gen.get("max_stream_attempts", self.max_consecutive_stops * 4))
+        )
+
+        # Ask the backend to suppress end-of-turn markers on *restart* requests.
+        # After a premature EOS the continuation prompt ends exactly where the
+        # model already chose to stop, so the same token is again the argmax and
+        # the sampler would just burn its restart budget.  Backends that reject
+        # `bad_words` disable this automatically (see api_client).
+        self.restart_suppress_markers = bool(gen.get("restart_suppress_markers", True))
+
+        # Text-level scrubber for control tokens that leak into the output.
+        self.special_token_pattern = gen.get("special_token_pattern")
+
+        # Real reason the generation ended; surfaced by the API server so a
+        # truncated record is distinguishable from a complete one.
+        self.finish_reason: Optional[str] = None
+        # Counts attempts that produced no new tokens (infinite-loop guard).
+        self._no_progress_attempts = 0
 
         # Soft-ban strength (0..1). Applies to phrase/ngram, not regex.
         try:
@@ -252,6 +292,9 @@ class ApiAntiSlopSampler:
         except Exception:
             self.ban_strength = 1.0
         self.ban_strength = max(0.0, min(1.0, self.ban_strength))
+
+        # Opt-in dump of unresolvable backtrack positions (debugging aid only).
+        self.debug_fail_dump = bool(config.get("debug_fail_dump", False))
 
 
         # API retry policy (sampler-level)
@@ -320,10 +363,12 @@ class ApiAntiSlopSampler:
                     cached = _BANNED_PREFIX_CACHE.get(cache_key)
                     if cached is None:                               # first time ever
                         start = time.time()
-                        print('start prefix builder')
                         cached = _build_banned_prefix_set(chat_template_formatter, self.validators)
                         _BANNED_PREFIX_CACHE[cache_key] = cached
-                        print('built in', time.time() - start)
+                        logger.info(
+                            "Built banned-prefix token set in %.1fs (%d prefixes).",
+                            time.time() - start, len(cached),
+                        )
                 self._banned_prefix_token_strings = cached
 
 
@@ -360,17 +405,28 @@ class ApiAntiSlopSampler:
         self.regex_interval = int(config.get("regex_validation_interval", 20))
 
         if self.request_mode == "stream":
-            logger.info("Probing backend for streamed logprobs…")
-            ok = self._probe_stream_logprobs()
-            if not ok:
-                raise RuntimeError(
-                    "request_mode=stream but backend did not return logprobs in SSE "
-                    "events.  Use --request-mode=chunk instead."
-                )
+            if gen.get("probe_stream_logprobs", True):
+                # The probe result is cached per endpoint: a sampler is created
+                # per request in server mode, so an uncached probe meant one
+                # extra round-trip *on every single request*.
+                ok = self._probe_stream_logprobs()
+                if not ok:
+                    raise RuntimeError(
+                        "request_mode=stream but backend did not return logprobs in SSE "
+                        "events.  Use --request-mode=chunk instead."
+                    )
+            else:
+                logger.info("Skipping streamed-logprobs probe (probe_stream_logprobs: false).")
 
     def _probe_stream_logprobs(self) -> bool:
+        base_url = getattr(self.api_client, "base_url", None)
+        if base_url is not None and base_url in _STREAM_PROBE_CACHE:
+            return _STREAM_PROBE_CACHE[base_url]
+
+        logger.info("Probing backend for streamed logprobs…")
+        probe = None
         try:
-            probe = next(self.api_client.generate_stream(
+            gen = self.api_client.generate_stream(
                 prompt_text="Hello",
                 max_tokens=1,
                 top_logprobs=self.top_logprobs_count,
@@ -380,11 +436,24 @@ class ApiAntiSlopSampler:
                 min_p=self.min_p,
                 timeout=15,
                 stop_sequences=None,
-            ))
-            return bool(probe.logprobs)
+            )
+            try:
+                probe = next(gen)
+            finally:
+                # Close the generator so the HTTP response is released; leaving
+                # it open leaked a pooled connection on every probe.
+                try:
+                    gen.close()
+                except Exception:
+                    pass
+            ok = bool(probe.logprobs)
         except Exception as e:
             logger.error("Probe failed: %s", e)
-            return False
+            ok = False
+
+        if base_url is not None and ok:
+            _STREAM_PROBE_CACHE[base_url] = True
+        return ok
 
 
     def _run_validators(self, state: GenerationState) -> Optional[ViolationInfo]:
@@ -593,9 +662,22 @@ class ApiAntiSlopSampler:
                 break
 
         if not valid_pairs:
-            import json
-            with open('/workspace/auto-antislop/fails.txt', 'a') as f:
-                f.write(banned_token + ', ' + str(self.min_p) +', ' + str(self.top_logprobs_count) +  '\n' + json.dumps(lp_list) +  '\n\n')
+            # NOTE: this used to append to a hard-coded
+            # /workspace/auto-antislop/fails.txt.  That path does not exist in a
+            # normal deployment, so the debug write raised FileNotFoundError
+            # *inside* error handling and killed the generation.  It is now opt-in
+            # and writes next to the working directory.
+            if self.debug_fail_dump:
+                try:
+                    dump_path = os.path.join(os.getcwd(), "antislop_backtrack_fails.txt")
+                    with open(dump_path, "a", encoding="utf-8") as f:
+                        f.write(
+                            banned_token + ", " + str(self.min_p) + ", "
+                            + str(self.top_logprobs_count) + "\n"
+                            + json.dumps(lp_list) + "\n\n"
+                        )
+                except Exception as e_dump:
+                    logger.debug("Could not write backtrack fail dump: %s", e_dump)
             logger.error("Back-track: no valid next-token candidates found.")
             return _abort()
 
@@ -767,112 +849,172 @@ class ApiAntiSlopSampler:
         return earliest
 
     # ------------------------------------------------------------------ #
-    #  Early end-of-turn marker handling                                 #
+    #  End-of-turn markers, scrubbing and stop policy                    #
     # ------------------------------------------------------------------ #
-    def _is_end_of_turn_token(self, token: str) -> bool:
-        """True if *token* (raw or decoded, lower-cased) is a configured
-        end-of-turn marker.  Matching is done on both forms because the API
-        may render the same special token differently (canonical name vs.
-        tokenizer-internal name)."""
-        if not self.end_of_turn_markers or not token:
-            return False
-        marker_set = set(self.end_of_turn_markers)
-        return (
-            token.strip().lower() in marker_set
-            or _decode_token(token).strip().lower() in marker_set
+    def _new_scrubber(self) -> SpecialTokenScrubber:
+        """Fresh text-level scrubber for one generation run."""
+        return SpecialTokenScrubber(
+            markers=self.end_of_turn_markers,
+            pattern=self.special_token_pattern,
         )
 
+    def _is_end_of_turn_token(self, token: str) -> bool:
+        """True if *token* is a control/end-of-turn token.
+
+        Matching happens on the raw form, the stripped form and the decoded form
+        because the same special token is rendered differently by different
+        backends (canonical name vs. tokenizer-internal spelling).
+        """
+        if not token:
+            return False
+        scrubber = getattr(self, "_probe_scrubber", None)
+        if scrubber is None:
+            scrubber = self._new_scrubber()
+            self._probe_scrubber = scrubber
+        return scrubber.is_marker(token)
+
     def _sanitize_chunk_eos(self, chunk: "ApiChunkResult") -> int:
+        """Remove control tokens from *chunk* **in place**, anywhere in it.
+
+        The previous version only looked at the *tail* of
+        ``chunk.token_strings``, so a chunk shaped like
+        ``["text", "<turn|>", "\n"]`` kept the marker.  Removal is now done at
+        every position, and the per-token logprob map is re-indexed so
+        back-tracking still sees the right alternatives.
+
+        Returns the number of tokens removed.
         """
-        Remove every trailing end-of-turn marker token from *chunk* (and its
-        logprob entry) so the marker can never be appended to the generation
-        state or yielded to the user.  This runs on **every** chunk, whether
-        or not a stop signal is present, so a legitimately-final marker is
-        also scrubbed from the output (Bug 1).  Callers use the return value
-        together with :meth:`_handle_stop` to decide whether to continue.
-        Returns the number of marker tokens removed.
-        """
+        if not chunk.token_strings:
+            return 0
+
+        kept: List[str] = []
+        kept_logprobs: Dict[int, List[Tuple[str, float]]] = {}
         removed = 0
-        while chunk.token_strings and self._is_end_of_turn_token(
-            chunk.token_strings[-1]
-        ):
-            rel_pos = len(chunk.token_strings) - 1
-            chunk.token_strings.pop()
-            chunk.logprobs.pop(rel_pos, None)
-            removed += 1
+
+        for old_idx, tok in enumerate(chunk.token_strings):
+            if self._is_end_of_turn_token(tok):
+                removed += 1
+                continue
+            if old_idx in chunk.logprobs:
+                kept_logprobs[len(kept)] = chunk.logprobs[old_idx]
+            kept.append(tok)
+
+        if removed:
+            chunk.token_strings = kept
+            chunk.logprobs = kept_logprobs
         return removed
 
-    def _handle_stop(self, reason: Optional[str], had_eos_marker: bool) -> bool:
-        """
-        Decide how to react to a backend stop signal.
+    # -- evidence helpers ------------------------------------------------- #
+    def _ends_cleanly(self, text: str) -> bool:
+        """True when *text* ends on a natural boundary (sentence/paren/newline).
 
-        *had_eos_marker* is True when an end-of-turn marker token was stripped
-        anywhere in the current stream attempt (see
-        :meth:`_sanitize_chunk_eos`) — the tell-tale sign that the model
-        emitted its <end_of_turn> / <turn|> token prematurely (roughly one in
-        five samplings at temperature > 0).  Those marker tokens have already
-        been removed, so nothing leaks into the output.
+        Used to distinguish "the model finished its turn" from "the model
+        emitted EOS mid-sentence", which is the failure mode that truncated
+        ~35% of a temperature-1.0 Gemma dataset.
+        """
+        if not text:
+            return False
+        stripped = text.rstrip()
+        if not stripped:
+            # Only trailing whitespace: a newline is a legitimate end.
+            return text.endswith("\n")
+        if not self.stop_on_clean_end:
+            return False
+        return stripped.endswith(self.clean_end_chars)
+
+    def _hit_stop_sequence(self, text: str) -> bool:
+        if not self.stop_sequences or not text:
+            return False
+        return any(s and s in text for s in self.stop_sequences)
+
+    def _handle_stop(
+        self,
+        reason: Optional[str],
+        had_eos_marker: bool = False,
+        attempt_text: str = "",
+        produced_tokens: bool = True,
+    ) -> bool:
+        """Decide how to react to a backend stop signal.
+
+        Returns True to accept the stop (terminate the run), False to reject it
+        and keep generating.
+
+        The decision deliberately does **not** require having seen a marker
+        token.  vLLM detokenises the output and drops the stop token before
+        serialising a streamed chunk, so a premature ``<end_of_turn>`` arrives
+        as a plain ``finish_reason="stop"`` with no marker anywhere.  Keying on
+        the marker meant the old code always accepted such a stop, truncating
+        the answer — which is exactly the reported bug.
 
         Rules:
-        - ``"length"``            → per-request budget only; keep generating.
-        - ``"stop"`` + marker     → premature EOS; keep generating until
-                                    ``max_consecutive_stops`` early stops are
-                                    seen back-to-back (safety valve against an
-                                    infinite loop if the model keeps trying to
-                                    end its turn), then accept the stop.
-        - ``"stream_end"`` + marker → same as above.  vLLM closes the SSE
-                                    stream right after an EOS token, so the
-                                    marker usually surfaces as ``stream_end``
-                                    (from ``[DONE]``) rather than ``stop``.
-                                    Both are counted by the safety valve.
-        - ``"stop"`` w/o marker   → a real terminal signal (e.g. a user
-                                    stop-sequence); accept it immediately.
-        - other reason, no marker → genuine stream end; accept.
-
-        Returns True → accept the stop (terminate the run).
-        Returns False → reject it (keep generating).
+          * no reason                → not a stop at all; keep generating.
+          * ``length``               → per-request budget only; keep generating.
+          * ``error`` / ``timeout``  → transport failure; keep generating (the
+                                       caller retries) unless the attempt made
+                                       progress and we are out of budget.
+          * a user ``stop_sequence`` was found in ``attempt_text``
+                                     → genuinely terminal.
+          * ``stop`` / ``stream_end`` with text ending on a natural boundary
+                                     → genuinely terminal.
+          * ``stop`` / ``stream_end`` mid-sentence
+                                     → premature EOS; keep generating until
+                                       ``max_consecutive_stops`` *consecutive
+                                       no-progress* attempts, then give up.
         """
         if not reason:
-            self._consecutive_stops = 0
             return False
+
+        self.finish_reason = reason
+
         if reason == "length":
-            self._consecutive_stops = 0
             return False
 
-        logger.info(f"finish_reason={reason}")
+        if reason in ("error", "timeout"):
+            # Transport-level failure.  Never treat it as a completed
+            # generation: the caller's retry loop resumes from the partial text.
+            if not produced_tokens:
+                self._no_progress_attempts += 1
+            else:
+                self._no_progress_attempts = 0
+            return self._no_progress_attempts >= self.max_consecutive_stops
 
-        # Any stop that coincides with a stripped end-of-turn marker is a
-        # *premature* EOS, whatever name the backend gave it.  vLLM reports
-        # "stop" when the model emits the marker itself, but reports
-        # "stream_end" when the marker is followed by the [DONE] sentinel --
-        # which is the common case.  Both must be rejected AND both must count
-        # towards the safety valve.  Counting only "stop" left the
-        # "stream_end" path able to restart forever: no tokens are ever
-        # appended on that path, so max_new_tokens is never reached and the
-        # outer loop in _generate_streamwise() has no other exit.
-        #
-        # The counter stays genuinely *consecutive* because the `not reason`
-        # branch above resets it whenever a chunk arrives with no stop signal,
-        # i.e. whenever the model makes real progress.
-        if had_eos_marker and reason in ("stop", "stream_end"):
-            self._consecutive_stops += 1
-            if self._consecutive_stops < self.max_consecutive_stops:
-                logger.warning(
-                    "Early end-of-turn marker stripped (consecutive stop "
-                    "%d/%d, finish_reason=%r); continuing generation.",
-                    self._consecutive_stops, self.max_consecutive_stops, reason,
-                )
-                return False
-            logger.warning(
-                "End-of-turn markers hit %d consecutive stops; accepting the "
-                "stop (safety valve, finish_reason=%r).",
-                self.max_consecutive_stops, reason,
-            )
+        # A configured stop sequence is an explicit instruction from the caller.
+        if self._hit_stop_sequence(attempt_text):
+            logger.info("Stop sequence matched; ending generation.")
             self._consecutive_stops = 0
+            self._no_progress_attempts = 0
             return True
 
-        # "stop" without any marker (a user stop_sequence), or a normal end of
-        # stream with no early EOS involved → genuinely terminal.
+        if self._ends_cleanly(attempt_text):
+            self._consecutive_stops = 0
+            self._no_progress_attempts = 0
+            return True
+
+        # Mid-sentence stop: the model tried to end its turn too early.
+        #
+        # The strike counter only advances when the attempt produced *nothing*,
+        # so a model that writes 500 good tokens and then emits a stray EOS is
+        # not penalised for it.  That keeps the anti-infinite-loop guarantee
+        # (a model that immediately re-emits EOS every time still terminates)
+        # without truncating otherwise-healthy generations.
+        if produced_tokens:
+            self._consecutive_stops = 0
+        self._consecutive_stops += 1
+
+        if self._consecutive_stops < self.max_consecutive_stops:
+            logger.warning(
+                "Premature end of turn (finish_reason=%r, %d/%d consecutive "
+                "no-progress stops, marker_seen=%s); continuing generation.",
+                reason, self._consecutive_stops, self.max_consecutive_stops,
+                had_eos_marker,
+            )
+            return False
+
+        logger.warning(
+            "Giving up on premature end of turn after %d consecutive "
+            "no-progress stops (finish_reason=%r).",
+            self.max_consecutive_stops, reason,
+        )
         self._consecutive_stops = 0
         return True
 
@@ -905,6 +1047,9 @@ class ApiAntiSlopSampler:
 
         # fresh early-stop safety-valve budget for this generation run
         self._consecutive_stops = 0
+        self._no_progress_attempts = 0
+        self.finish_reason = None
+        self._probe_scrubber = self._new_scrubber()
 
         if self.request_mode == "stream":
             yield from self._generate_streamwise(
@@ -926,10 +1071,7 @@ class ApiAntiSlopSampler:
             )
 
     # ------------------------------------------------------------------ #
-    #  Streaming generation with proper restart on back-track            #
-    # ------------------------------------------------------------------ #
-    # ------------------------------------------------------------------ #
-    #  Streaming generation with proper restart on back-track            #
+    #  Streaming generation with restart + retry                          #
     # ------------------------------------------------------------------ #
     def _generate_streamwise(
         self,
@@ -940,17 +1082,72 @@ class ApiAntiSlopSampler:
         top_p: Optional[float],
         top_k: Optional[int],
     ):
-        state = GenerationState(prompt)
-        last_yield  = 0
-        regex_since = 0
+        """Generate token-by-token over an SSE stream.
 
+        Each pass of the outer loop is one *attempt*.  An attempt ends when the
+        backend stops, when a validator fires (→ backtrack and restart), or when
+        the transport fails (→ retry from the text produced so far).  Text is
+        released only after passing through the scrubber and the tail hold-back,
+        so neither a control token nor a half-written marker can escape.
+        """
+        state = GenerationState(prompt)
+        last_yield = 0
+        regex_since = 0
+        scrubber = self._new_scrubber()
+
+        # The stream holds back the last `holdback` characters so a marker split
+        # across two chunks is never emitted.  That means the caller sees text
+        # one holdback behind what has actually been generated.
+        pending_scrub = ""
+
+        def release(text: str, final: bool = False) -> Optional[str]:
+            """Push *text* through the scrubber; return what may be emitted."""
+            nonlocal pending_scrub
+            if final:
+                pending_scrub += scrubber.flush()
+                out, pending_scrub = pending_scrub, ""
+            else:
+                out = scrubber.feed(text)
+            if not out:
+                return None
+            return out
+
+        attempts = 0
         while state.get_generated_length() < max_new_tokens:
+            attempts += 1
+            if attempts > self.max_stream_attempts:
+                logger.error(
+                    "Reached max_stream_attempts=%d; ending generation with "
+                    "%d tokens (finish_reason will be reported as 'length').",
+                    self.max_stream_attempts, state.get_generated_length(),
+                )
+                self.finish_reason = "length"
+                break
 
             restart_stream = False
-            natural_end    = False
+            natural_end = False
+            transport_failed = False
+            last_reason: Optional[str] = None
 
             remaining = max_new_tokens - state.get_generated_length()
             api_prompt = state.prompt_string + state.get_generated_text()
+
+            len_before_attempt = state.get_generated_length()
+            attempt_text_start = len(state.get_generated_text())
+            saw_eos_marker = False
+
+            # Ask the backend not to re-emit the marker we just stripped.  After
+            # a premature EOS the continuation prompt ends exactly where the
+            # model already chose to stop, so without this the same token wins
+            # the argmax again and every restart is wasted.
+            suppress = None
+            if self.restart_suppress_markers and self.end_of_turn_markers and attempts > 1:
+                if not getattr(self.api_client, "suppress_tokens_unsupported", False):
+                    suppress = self.end_of_turn_markers
+
+            stream_kwargs = {}
+            if suppress:
+                stream_kwargs["suppress_tokens"] = suppress
 
             stream = self.api_client.generate_stream(
                 prompt_text     = api_prompt,
@@ -962,161 +1159,219 @@ class ApiAntiSlopSampler:
                 min_p           = min_p,
                 timeout         = self.timeout,
                 stop_sequences  = self.stop_sequences,
+                **stream_kwargs,
             )
 
-            # NOTE: `self._consecutive_stops` is intentionally NOT reset here.
-            # It accumulates across stream attempts for the lifetime of this
-            # generation run (see generate()).  vLLM ends the SSE stream the
-            # moment an EOS token is emitted, so every premature end-of-turn
-            # marker we strip costs us one stream attempt; the accumulator
-            # therefore bounds the total number of restarts caused by early
-            # end-of-turn emissions (safety valve against infinite loops).
-            #
-            # Remembers that an end-of-turn marker was stripped somewhere in
-            # this stream.  Some backends put the marker in one token chunk but
-            # deliver finish_reason="stop" on a later (empty) control chunk;
-            # latching the flag lets us still treat that as an early-EOS stop.
-            saw_eos_marker = False
+            try:
+                for chunk in stream:
+                    # Scrub control tokens anywhere in the chunk, before
+                    # anything is appended or emitted.
+                    if self._sanitize_chunk_eos(chunk):
+                        saw_eos_marker = True
 
-            for chunk in stream:
-                # Strip any trailing end-of-turn marker token(s) BEFORE
-                # anything is appended or yielded, so they can never leak
-                # into the output (fixes Bug 1).  Runs on every chunk.
-                if self._sanitize_chunk_eos(chunk):
-                    saw_eos_marker = True
+                    if not chunk.token_strings:
+                        # Control-only chunk ([DONE], a final empty chunk, or a
+                        # chunk that held nothing but markers).
+                        if chunk.finish_reason:
+                            last_reason = chunk.finish_reason
+                            break
+                        continue
 
-                if not chunk.token_strings:
-                    # Control-only chunk: [DONE], or a chunk that consisted
-                    # solely of end-of-turn marker token(s).
-                    # finish_reason may ride on the marker chunk itself or on
-                    # this separate empty chunk.
-                    if chunk.finish_reason:
-                        if self._handle_stop(
-                            chunk.finish_reason, had_eos_marker=saw_eos_marker
-                        ):
-                            natural_end = True
-                        saw_eos_marker = False
-                        break
-                    continue
+                    pre_len = state.get_generated_length()
+                    state.append_chunk(chunk)
+                    delta = state.get_generated_length() - pre_len
+                    regex_since += delta
 
-                pre_len = state.get_generated_length()
-                state.append_chunk(chunk)
-                delta = state.get_generated_length() - pre_len
-                regex_since += delta
+                    if delta and self.on_chunk_yielded_callback:
+                        try:
+                            # empty text → caller knows this count is
+                            # "accepted, not yet flushed"
+                            self.on_chunk_yielded_callback("", delta)
+                        except Exception as e_cb:
+                            logger.error(
+                                "Throughput callback failed: %s", e_cb, exc_info=True
+                            )
 
-                if delta and self.on_chunk_yielded_callback:
-                    try:
-                        # empty text → caller knows this count is "accepted, not yet flushed"
-                        self.on_chunk_yielded_callback("", delta)
-                    except Exception as e_cb:
-                        logger.error("Throughput callback failed: %s", e_cb, exc_info=True)
-
-                run_regex = regex_since >= self.regex_interval
-                vio = (
-                    self._run_validators(state)
-                    if run_regex
-                    else self._run_validators_skip_regex(state)
-                )
-
-                # ---------- violation handling ------------------------------
-                if vio:
-                    if vio.validator_type != "regex":
-                        vio_full = self._run_validators(state)  # make sure regex ran
-                        vio = vio_full or vio
-
-                    # Cancel the stream and fully consume/close it before backtracking
-                    self.api_client.cancel_current_stream()
-                    # Drain the remaining stream to ensure HTTP connection is closed
-                    # This is critical for large models where vLLM may still be processing
-                    try:
-                        for _ in stream:
-                            pass  # Consume all remaining chunks
-                    except Exception:
-                        pass  # Ignore any errors during drain
-
-                    # Small delay to ensure connection is fully released before next request
-                    time.sleep(0.1)
-
-                    fixed = self._perform_backtrack(state, vio)
-
-                    logger.info(
-                        f"Backtracking complete (fixed={fixed}), resuming generation. "
-                        f"State: {state.get_generated_length()} tokens, {len(state.get_generated_text())} chars"
+                    run_regex = regex_since >= self.regex_interval
+                    vio = (
+                        self._run_validators(state)
+                        if run_regex
+                        else self._run_validators_skip_regex(state)
                     )
 
-                    # Reset connection pool after backtracking to prevent hanging
-                    # This is especially important for large models like Gemma 4 31B
-                    try:
-                        self.api_client.reset_connection_pool()
-                    except Exception as e:
-                        logger.warning(f"Failed to reset connection pool: {e}")
+                    # ---------- violation handling --------------------------
+                    if vio:
+                        if vio.validator_type != "regex":
+                            vio_full = self._run_validators(state)
+                            vio = vio_full or vio
 
-                    # ---------- NEW: event bookkeeping & callback ----------
-                    event = {
-                        "type":  vio.validator_type,
-                        "index": vio.violation_index,
-                        "details": vio.details,
-                        "original_token_string": vio.original_token_string,
-                        "fixed": fixed,
-                    }
-                    self.events.append(event)
-                    if self.on_ban_event_callback:
+                        # Cancel and drain the stream before backtracking so the
+                        # HTTP connection is fully released.
+                        self.api_client.cancel_current_stream()
                         try:
-                            self.on_ban_event_callback(event)
-                        except Exception as e_cb:
-                            logger.error("Error in on_ban_event_callback: %s", e_cb, exc_info=True)
-                    # --------------------------------------------------------
+                            for _ in stream:
+                                pass
+                        except Exception:
+                            pass
 
-                    if not fixed:
-                        self._suppress_violation(vio)
+                        time.sleep(0.1)
+                        fixed = self._perform_backtrack(state, vio)
 
-                    restart_stream = True
-                    regex_since = 0
+                        logger.info(
+                            "Backtracking complete (fixed=%s), resuming generation. "
+                            "State: %d tokens, %d chars",
+                            fixed, state.get_generated_length(),
+                            len(state.get_generated_text()),
+                        )
+
+                        try:
+                            self.api_client.reset_connection_pool()
+                        except Exception as e:
+                            logger.warning("Failed to reset connection pool: %s", e)
+
+                        event = {
+                            "type":  vio.validator_type,
+                            "index": vio.violation_index,
+                            "details": vio.details,
+                            "original_token_string": vio.original_token_string,
+                            "fixed": fixed,
+                        }
+                        self.events.append(event)
+                        if self.on_ban_event_callback:
+                            try:
+                                self.on_ban_event_callback(event)
+                            except Exception as e_cb:
+                                logger.error(
+                                    "Error in on_ban_event_callback: %s",
+                                    e_cb, exc_info=True,
+                                )
+
+                        if not fixed:
+                            self._suppress_violation(vio)
+
+                        restart_stream = True
+                        regex_since = 0
+                        break
+
+                    # ---------- yield the safe prefix ------------------------
+                    safe_upto = max(
+                        0, state.get_generated_length() - self.tail_keep_tokens
+                    )
+                    if safe_upto > last_yield:
+                        text_out = _tokens_to_text(
+                            state.generated_token_strings[last_yield:safe_upto]
+                        )
+                        last_yield = safe_upto
+                        if text_out:
+                            emitted = release(text_out)
+                            if emitted:
+                                yield self._yield_text_and_callback(emitted)
+
+                    if run_regex:
+                        regex_since = 0
+
+                    # A terminal reason can ride on a chunk that also carries
+                    # text; latch it and stop consuming this attempt.
+                    if chunk.finish_reason:
+                        last_reason = chunk.finish_reason
+                        break
+
+            except Exception as e_stream:
+                # Transport failure mid-stream (timeout, dropped connection,
+                # malformed event).  The partial text is already in `state`, so a
+                # retry resumes from exactly that point instead of throwing the
+                # generation away — this used to truncate the record outright.
+                transport_failed = True
+                logger.warning(
+                    "Stream attempt %d failed after %d new tokens: %s",
+                    attempts, state.get_generated_length() - len_before_attempt, e_stream,
+                )
+                if attempts >= self.api_retry_attempts + self.max_stream_attempts:
+                    raise
+
+            attempt_text = state.get_generated_text()[attempt_text_start:]
+            produced_tokens = state.get_generated_length() > len_before_attempt
+
+            # ---- decide what to do with this attempt --------------------
+            if restart_stream:
+                # Validator fired; backtrack already rewrote the tail.
+                if not produced_tokens:
+                    self._no_progress_attempts += 1
+                else:
+                    self._no_progress_attempts = 0
+                if self._no_progress_attempts >= self.max_stream_attempts:
+                    logger.error(
+                        "Backtracking made no progress after %d attempts; "
+                        "stopping to avoid an infinite loop.",
+                        self._no_progress_attempts,
+                    )
+                    break
+                continue
+
+            if transport_failed:
+                # Never treat a broken connection as a completed generation.
+                if produced_tokens:
+                    self._no_progress_attempts = 0
+                    # Small backoff before resuming; the text so far is kept.
+                    if self.api_retry_delay_sec:
+                        time.sleep(self.api_retry_delay_sec)
+                else:
+                    self._no_progress_attempts += 1
+                    if self.api_retry_delay_sec:
+                        time.sleep(self.api_retry_delay_sec)
+                    if self._no_progress_attempts >= self.max_consecutive_stops:
+                        logger.error(
+                            "Stream failed %d times with no progress; giving up.",
+                            self._no_progress_attempts,
+                        )
+                        self.finish_reason = "error"
+                        break
+                continue
+
+            reason = last_reason
+
+            if reason is None:
+                # The attempt ended without a terminal chunk.  Treat it as a
+                # dropped connection and retry rather than silently truncating.
+                logger.warning(
+                    "Stream attempt %d ended without a finish_reason; retrying.",
+                    attempts,
+                )
+                if produced_tokens:
+                    self._no_progress_attempts = 0
+                else:
+                    self._no_progress_attempts += 1
+                    if self._no_progress_attempts >= self.max_consecutive_stops:
+                        self.finish_reason = "error"
+                        break
+                continue
+
+            if self._handle_stop(
+                reason,
+                had_eos_marker=saw_eos_marker,
+                attempt_text=attempt_text,
+                produced_tokens=produced_tokens,
+            ):
+                natural_end = True
+                break
+
+            # Rejected stop → keep generating, but reset the no-progress counter
+            # when the attempt actually advanced the text.
+            if produced_tokens:
+                self._no_progress_attempts = 0
+            else:
+                self._no_progress_attempts += 1
+                if self._no_progress_attempts >= self.max_stream_attempts:
+                    logger.error(
+                        "No progress after %d stream attempts; ending generation.",
+                        self._no_progress_attempts,
+                    )
                     break
 
-
-                # ---------- yield safe prefix -------------------------------
-                safe_upto = max(0, state.get_generated_length() - self.tail_keep_tokens)
-                if safe_upto > last_yield:
-                    text_out = _tokens_to_text(
-                        state.generated_token_strings[last_yield : safe_upto])
-                    if text_out:
-                        yield self._yield_text_and_callback(text_out)
-                    last_yield = safe_upto
-
-                # ---------- natural termination inside stream --------------
-                # Note: We check finish_reason AFTER appending the chunk and yielding safe prefix.
-                # This ensures all tokens are processed before deciding to stop.
-                if chunk.finish_reason:
-                    if self._handle_stop(
-                        chunk.finish_reason, had_eos_marker=saw_eos_marker
-                    ):
-                        # Genuine termination: a real stop sequence, a stop
-                        # after the safety-valve limit, or another terminal
-                        # reason.  Any trailing end-of-turn marker was already
-                        # stripped, so it is not flushed to the output.
-                        natural_end = True
-                        break
-                    # A premature end-of-turn marker was stripped and the stop
-                    # rejected: keep the outer while-loop going.  NOTE — do NOT
-                    # clear saw_eos_marker here: vLLM typically sends a final
-                    # empty control chunk (finish_reason="stream_end") right
-                    # after the EOS token, and _handle_stop must still see the
-                    # latched marker to treat that closing chunk as a
-                    # side-effect of the early EOS rather than a real terminal
-                    # (fixes Bug 2).  The flag is re-initialised at the top of
-                    # each outer-loop pass.
-
-                if run_regex:
-                    regex_since = 0
-
-            
-            # Final sweep so end-of-stream tail still gets regex-checked
-            if not restart_stream and (natural_end or regex_since > 0):
+            # Final sweep: the tail may still violate a regex.
+            if regex_since > 0:
                 vio = self._run_validators(state)
                 if vio:
-                    # Stream already ended, but add small delay before backtracking
-                    # to ensure connection is released (important for large models)
                     time.sleep(0.1)
                     fixed = self._perform_backtrack(state, vio)
                     event = {
@@ -1131,28 +1386,24 @@ class ApiAntiSlopSampler:
                         try:
                             self.on_ban_event_callback(event)
                         except Exception as e_cb:
-                            logger.error("Error in on_ban_event_callback: %s", e_cb, exc_info=True)
+                            logger.error(
+                                "Error in on_ban_event_callback: %s",
+                                e_cb, exc_info=True,
+                            )
                     if not fixed:
                         self._suppress_violation(vio)
-                    restart_stream = True
-                    natural_end = False
                     regex_since = 0
-
-            if restart_stream:
-                continue
-            if natural_end:
-                break
-
-            # else: ended by length, outer while will loop if we still want more
 
         # ---------------- flush tail --------------------------------------
         if state.get_generated_length() > last_yield:
-            residual = _tokens_to_text(
-                state.generated_token_strings[last_yield:])
+            residual = _tokens_to_text(state.generated_token_strings[last_yield:])
             if residual:
-                yield self._yield_text_and_callback(residual)
-
-
+                emitted = release(residual)
+                if emitted:
+                    yield self._yield_text_and_callback(emitted)
+        tail = release("", final=True)
+        if tail:
+            yield self._yield_text_and_callback(tail)
 
     def _generate_chunkwise(
         self,
@@ -1178,6 +1429,17 @@ class ApiAntiSlopSampler:
         chunk_nr = 0
         state = GenerationState(prompt) # already templated upstream
         last_yield_idx = 0                         # first token not yet sent
+        scrubber = self._new_scrubber()
+        pending_scrub = ""
+
+        def release(text: str, final: bool = False) -> Optional[str]:
+            nonlocal pending_scrub
+            if final:
+                pending_scrub += scrubber.flush()
+                out, pending_scrub = pending_scrub, ""
+            else:
+                out = scrubber.feed(text)
+            return out or None
 
 
 
@@ -1266,13 +1528,38 @@ class ApiAntiSlopSampler:
 
             if not chunk.token_strings:            # end-of-stream (or all-EOS)
                 if chunk.finish_reason:
+                    # `produced_tokens=False`: this chunk carried no text, so a
+                    # mid-sentence stop here is a no-progress stop and must count
+                    # towards the safety valve.  Passing True (as an earlier
+                    # version of this fix did) made the valve unreachable and the
+                    # loop could spin forever against a backend that keeps
+                    # returning empty stop chunks.
                     if self._handle_stop(
-                        chunk.finish_reason, had_eos_marker=had_eos_marker
+                        chunk.finish_reason,
+                        had_eos_marker=had_eos_marker,
+                        attempt_text=state.get_generated_text(),
+                        produced_tokens=False,
                     ):
                         break
                     # premature end-of-turn marker → continue the run
                     continue
-                break
+                # No text and no reason: this used to end the generation
+                # silently, which truncated the record.  Treat it as a failed
+                # request and retry the chunk instead.
+                logger.warning(
+                    "Chunk %d returned no text and no finish_reason; retrying.",
+                    chunk_nr,
+                )
+                self._no_progress_attempts += 1
+                if self._no_progress_attempts >= self.max_consecutive_stops:
+                    logger.error(
+                        "No progress after %d empty chunks; ending generation.",
+                        self._no_progress_attempts,
+                    )
+                    self.finish_reason = "error"
+                    break
+                continue
+            self._no_progress_attempts = 0
 
             # ── append & validate timing ────────────────────────────────────
             pre_len = state.get_generated_length()
@@ -1324,10 +1611,14 @@ class ApiAntiSlopSampler:
             safe_upto = max(0, post_len - self.tail_keep_tokens)
             if safe_upto > last_yield_idx:
                 safe_tokens = state.generated_token_strings[last_yield_idx : safe_upto]
-                text_to_yield = _tokens_to_text(safe_tokens)
-                if text_to_yield:
-                    yield text_to_yield
                 last_yield_idx = safe_upto
+                emitted = release(_tokens_to_text(safe_tokens))
+                if emitted:
+                    # Token accounting for chunk mode happens in the
+                    # on_chunk_yielded_callback("", newly_accepted) call above;
+                    # going through _yield_text_and_callback here would count the
+                    # same tokens twice.
+                    yield emitted
 
             # stop if backend signalled completion.
             # NOTE: finish_reason="stop" can be premature — Gemma emits its
@@ -1338,7 +1629,10 @@ class ApiAntiSlopSampler:
             # instead of being cut off mid-sentence (fixes Bug 2).
             if chunk.finish_reason:
                 if self._handle_stop(
-                    chunk.finish_reason, had_eos_marker=had_eos_marker
+                    chunk.finish_reason,
+                    had_eos_marker=had_eos_marker,
+                    attempt_text=state.get_generated_text(),
+                    produced_tokens=newly_accepted > 0,
                 ):
                     break
                 # rejected early end-of-turn stop → loop back and keep going
@@ -1346,9 +1640,12 @@ class ApiAntiSlopSampler:
         # ── flush residual tail ────────────────────────────────────────────
         if state.get_generated_length() > last_yield_idx:
             residual = state.generated_token_strings[last_yield_idx :]
-            text_to_yield = _tokens_to_text(residual)
-            if text_to_yield:
-                yield text_to_yield
+            emitted = release(_tokens_to_text(residual))
+            if emitted:
+                yield emitted
+        tail = release("", final=True)
+        if tail:
+            yield tail
 
         # ── write timing CSV ───────────────────────────────────────────────
         if False: # for perf profiling

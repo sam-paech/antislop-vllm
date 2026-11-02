@@ -50,7 +50,10 @@ generation_params:
   # the two together. Omit to default to `threads`.
   max_concurrent_requests: 128
 
-  request_mode: chunk      # chunk | stream (stream might be buggy)
+  # chunk | stream.  `stream` is strongly recommended for long generations: it
+  # avoids the per-chunk prefill round-trips and, more importantly, it is the only
+  # mode where a dropped connection can be resumed from the partial text.
+  request_mode: stream
 
   # NOTE: in chunk mode every chunk is a separate upstream call that re-sends
   # the whole prompt, so round-trips ~= max_new_tokens / chunk_size.
@@ -69,18 +72,50 @@ generation_params:
   timeout: 120        # seconds
   stop_sequences: []
   # End-of-turn markers the model may emit prematurely under sampling.
-  # Any such token arriving as the last token(s) of a chunk is stripped
-  # BEFORE it enters the generation state (so it never leaks into the
-  # output), and the accompanying finish_reason="stop" is treated as an
-  # early, non-terminal signal: generation continues instead of being cut
-  # off mid-sentence.  Set to [] to disable this handling entirely.
+  # These are used to SCRUB leaked control tokens from the output.  Any such
+  # token is removed from anywhere in a chunk (not just its tail) and a marker
+  # split across two chunks is still caught, because text is held back until it
+  # can no longer be the start of a marker.  Set to [] to disable.
   end_of_turn_markers:
     - "<end_of_turn>"
     - "<turn|>"
-  # Max consecutive early end-of-turn stops tolerated before we accept the
-  # stop (safety valve against infinite loops).  A "stop" that does NOT come
-  # with a marker token (e.g. a user stop_sequence) is still terminal.
+    - "<start_of_turn>"
+    - "<|im_end|>"
+    - "<|eot_id|>"
+    - "<end_of_text>"
+
+  # Extra regex for control tokens.  Leave unset to use the built-in pattern,
+  # which covers the Gemma / Llama-3 / ChatML / Mistral / Qwen families.
+  # special_token_pattern: '<\|?/?[a-z_]{1,20}\|?>'
+
+  # Whether a backend `stop` that lands on a natural text boundary (sentence
+  # punctuation, a closing bracket, a newline) is accepted as the real end of the
+  # turn.  A stop in the MIDDLE of a sentence is treated as a premature EOS and
+  # generation continues.
+  # Set this to false to never accept a stop unless a stop_sequence matched --
+  # that guarantees no truncation, at the cost of occasionally running past the
+  # end of the turn.
+  stop_on_clean_end: true
+  # clean_end_chars: [".", "!", "?", "…", '"', "'", ")", "]", "}", "\n"]
+
+  # Max CONSECUTIVE early stops that produced no new tokens before we give up
+  # (safety valve against a model that re-emits EOS forever).  An early stop
+  # that came after real progress resets this counter, so a long response with
+  # several stray EOS tokens is no longer truncated.
   max_consecutive_stops: 3
+
+  # Hard cap on upstream stream attempts per generation.
+  max_stream_attempts: 12
+
+  # Ask the backend to suppress the end-of-turn markers on RESTART requests
+  # (`bad_words`).  After a premature EOS the continuation prompt ends where
+  # the model already chose to stop, so without this every restart is wasted.
+  # Backends that reject `bad_words` disable this automatically.
+  restart_suppress_markers: true
+
+  # Probe the backend once for streamed logprobs.  The result is cached per
+  # endpoint; set to false to skip the extra round-trip entirely.
+  probe_stream_logprobs: true
   # If true, the banlist only takes effects on whole words/phrases that
   # are bounded by non-word characters.
   # Examples:
@@ -93,6 +128,11 @@ generation_params:
 # Refusal detection (batch mode only)
 # This avoids adding refused generations to the generated dpo dataset
 enable_refusal_detection: true
+
+# Write unresolvable backtrack positions to ./antislop_backtrack_fails.txt.
+# (This used to be an unconditional write to a hard-coded /workspace path, which
+# crashed the generation on any machine without that directory.)
+debug_fail_dump: false
 
 # Backtracking Configuration
 backtracking:

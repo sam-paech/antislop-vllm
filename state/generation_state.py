@@ -1,5 +1,6 @@
 import logging
-from typing import Dict, List, Optional, Tuple
+import re
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from core.models import ApiChunkResult
 
@@ -70,6 +71,125 @@ def _decode_token(token: str) -> str:
 # Convenience wrapper (still used elsewhere in the project)
 def _tokens_to_text(tokens: List[str]) -> str:
     return "".join(_decode_token(t) for t in tokens)
+
+
+# --------------------------------------------------------------------------- #
+#  Special-token scrubbing                                                    #
+# --------------------------------------------------------------------------- #
+# A chat template's control tokens are *not* ordinary text.  Depending on the
+# backend and on how a token happens to land in a streamed chunk, they can
+# arrive as a `logprobs` token, inside the SSE `text` delta, or split across two
+# chunks.  None of those forms may reach the dataset.
+#
+# The default pattern covers the chat-template families we actually meet
+# (Gemma, Llama-3, ChatML, Mistral, Qwen) rather than trying to match every
+# `<...>` span, which would eat legitimate prose and code.  Extra literal markers
+# from `generation_params.end_of_turn_markers` are always added on top.
+_DEFAULT_SPECIAL_TOKEN_PATTERN = (
+    r"<\|?/?(?:"
+    r"end_of_turn|start_of_turn|turn|end_of_text|eot_id|eom_id|eom|eot"
+    r"|im_start|im_end|im_sep"
+    r"|begin_of_text|end_of_text|start_header_id|end_header_id"
+    r"|file_separator|pad|unk|bos|eos|sep|cls|mask"
+    r")\|?>"
+)
+
+
+class SpecialTokenScrubber:
+    """
+    Removes chat-template control tokens from a growing text stream.
+
+    Two things make this non-trivial:
+
+    1.  A marker can be **split across chunks** (``"<tur"`` then ``"n|>"``).
+        So text is only released once it can no longer be the prefix of a
+        marker: the last ``holdback`` characters are withheld until either more
+        text arrives or :meth:`flush` is called.
+    2.  A marker can be **anywhere** in the chunk, not just at its tail, and may
+        appear more than once.
+
+    ``feed()`` returns only text that is safe to emit; ``flush()`` releases the
+    held-back remainder at end of stream.
+    """
+
+    def __init__(
+        self,
+        markers: Optional[Sequence[str]] = None,
+        pattern: Optional[str] = None,
+    ) -> None:
+        self.markers: List[str] = [
+            str(m).strip() for m in (markers or []) if str(m).strip()
+        ]
+
+        self._literal_re = None
+        if self.markers:
+            # Longest first so "<end_of_turn>" wins over "<turn|>".
+            alts = "|".join(re.escape(m) for m in sorted(self.markers, key=len, reverse=True))
+            self._literal_re = re.compile(alts)
+
+        pat = pattern if pattern is not None else _DEFAULT_SPECIAL_TOKEN_PATTERN
+        self._pattern_re = re.compile(pat) if pat else None
+
+        # How much of the tail must be withheld because it could still turn out to
+        # be the *start* of a marker.  Driven by the longest configured marker;
+        # the generic pattern needs at most 16 characters (its longest alternative
+        # is `<start_of_turn>`, 15 chars, plus one for a not-yet-arrived `>`).
+        # Capped so a lone `<` in ordinary prose never stalls the stream.
+        longest_literal = max((len(m) for m in self.markers), default=0)
+        self.holdback = min(32, max(longest_literal - 1, 16 if self._pattern_re else 0))
+
+        self._pending = ""
+        self.removed_count = 0
+
+    # -- helpers ---------------------------------------------------------- #
+    def _strip(self, text: str) -> str:
+        if not text:
+            return text
+        before = text
+        if self._literal_re is not None:
+            text = self._literal_re.sub("", text)
+        if self._pattern_re is not None:
+            text = self._pattern_re.sub("", text)
+        if text != before:
+            self.removed_count += 1
+        return text
+
+    def is_marker(self, token: str) -> bool:
+        """True when *token* (raw or decoded) is entirely a control token."""
+        if not token:
+            return False
+        stripped = token.strip()
+        if not stripped:
+            return False
+        for candidate in (token, stripped, _decode_token(token).strip()):
+            if candidate in self.markers:
+                return True
+            if self._pattern_re is not None and self._pattern_re.fullmatch(candidate):
+                return True
+        return False
+
+    # -- streaming API ---------------------------------------------------- #
+    def feed(self, text: str) -> str:
+        """Add *text*, return the part that is safe to emit now."""
+        if text:
+            self._pending += text
+        if not self._pending:
+            return ""
+
+        cut = len(self._pending) - self.holdback
+        if cut <= 0:
+            return ""
+        releasable, self._pending = self._pending[:cut], self._pending[cut:]
+        return self._strip(releasable)
+
+    def flush(self) -> str:
+        """Release everything still held back (end of generation)."""
+        pending, self._pending = self._pending, ""
+        return self._strip(pending)
+
+    def scrub(self, text: str) -> str:
+        """One-shot scrub of a complete string (no hold-back)."""
+        return self._strip(text)
 
 
 # --------------------------------------------------------------------------- #
@@ -173,6 +293,16 @@ class GenerationState:
 
     def get_full_text(self) -> str:
         return self.prompt_string + self._decoded_buffer
+
+    def rebuild_decoded_buffer(self) -> None:
+        """
+        Recompute the plain-text buffer from the current token strings.
+
+        Needed after token-level edits that bypass :meth:`replace_token_string`
+        (e.g. removing an embedded control token from the middle of a chunk).
+        """
+        self._decoded_buffer = _tokens_to_text(self.generated_token_strings)
+        self._decoded_lens = [len(_decode_token(t)) for t in self.generated_token_strings]
 
     def get_hypothetical_generated_text(
         self, truncate_index: int, next_token_string: str

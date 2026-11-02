@@ -173,7 +173,10 @@ def add_common_generation_cli_args(parser: argparse.ArgumentParser, base_cfg: Di
 
 
 def merge_configs(base_cfg: Dict[str, Any], cli_args: argparse.Namespace) -> Dict[str, Any]:
-    cfg = base_cfg.copy()
+    # Deep copy: `dict.copy()` is shallow, so `cfg.setdefault("generation_params", {})`
+    # returned the *caller's* nested dict and every merge mutated `base_cfg`.
+    # In batch mode that leaked per-run overrides back into the shared config.
+    cfg = copy.deepcopy(base_cfg)
     args_dict = vars(cli_args)
 
     # Direct overrides for top-level simple settings
@@ -181,7 +184,7 @@ def merge_configs(base_cfg: Dict[str, Any], cli_args: argparse.Namespace) -> Dic
         "prompt", "api_key", "api_base_url", "model_name",
         "slop_phrases_file", "top_n_slop_phrases",
         "regex_blocklist_file", "logging_level",
-        "chat_template_model_id", "request_mode",
+        "chat_template_model_id",
         "chat_template_enable_thinking",
         "force_backtrack", "prompt_template",
         "system_prompt", "enable_refusal_detection",
@@ -203,10 +206,20 @@ def merge_configs(base_cfg: Dict[str, Any], cli_args: argparse.Namespace) -> Dic
 
     # Generation parameters
     gen_params_cfg = cfg.setdefault("generation_params", {})
+    # NOTE: `request_mode` belongs here, not in `scalar_keys`.  The sampler reads
+    # `config["generation_params"]["request_mode"]`, so a top-level
+    # `--request-mode stream` used to be written to a key nobody read and was
+    # silently ignored — the run stayed in chunk mode.
     gen_param_keys = [
         "chunk_size", "top_logprobs_count", "max_new_tokens",
         "temperature", "top_p", "top_k", "min_p", "timeout",
+        "request_mode",
     ]
+    # Older config files put `request_mode` at the top level.  Move it into
+    # `generation_params`, which is the only place the sampler reads it from.
+    if "request_mode" in cfg:
+        gen_params_cfg.setdefault("request_mode", cfg.pop("request_mode"))
+
     for key in gen_param_keys:
         if hasattr(cli_args, key) and getattr(cli_args, key) is not None:
             # Check if the value is different from the argparse default for that key

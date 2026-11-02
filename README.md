@@ -37,7 +37,8 @@ AntiSlop-vLLM can be used for single prompt completions or for generating entire
 *   **FTPO Pair Generation:** Captures (chosen, rejected) token pairs during backtracking, useful for creating datasets for Final Token Preference Optimization.
 *   **Chat Template Formatting:** Can apply Hugging Face chat templates to prompts before sending them to the completions endpoint.
 *   **Refusal Detection:** Optionally detects and flags model refusals in batch mode.
-*   **Early End-of-Turn Recovery:** Detects and strips premature end-of-turn markers (`<end_of_turn>`, `<turn|>`) that Gemma-class models emit mid-response under sampling, so the marker never leaks into your output and the response is not truncated mid-sentence. Configurable via `end_of_turn_markers` and `max_consecutive_stops`.
+*   **Early End-of-Turn Recovery:** Detects and recovers from premature end-of-turn emissions that Gemma-class models produce mid-response under sampling. Detection is based on evidence the backend actually reports (whether the attempt produced text, and whether that text ends on a natural boundary) rather than on seeing the marker token — vLLM strips the stop token before serialising a response, so a marker-based check never fired. Control tokens that do leak are scrubbed from the text, including markers split across two stream chunks. Configurable via `stop_on_clean_end`, `end_of_turn_markers`, `max_consecutive_stops`, `max_stream_attempts` and `restart_suppress_markers`.
+*   **Truncation-resistant Streaming:** A dropped connection, read timeout or malformed SSE event mid-stream is retried from the text produced so far instead of ending the record early, and `finish_reason` is reported truthfully (`stop` / `length` / `error`) so a truncated record is distinguishable from a complete one.
 *   **Tunable Server Concurrency:** `max_concurrent_requests` lifts the silent 40-request ceiling imposed by FastAPI's thread pool, and automatically sizes the upstream HTTP connection pool to match.
 *   **Banlist Builder (`utils/phrase_token_ids.py`):** Converts a plain JSON list of phrases into a token-ID banlist for a given tokenizer, with deduplication and validation.
 *   **Configurable:** Extensive configuration via `config.yaml` and command-line arguments.
@@ -238,20 +239,37 @@ In `request_mode: chunk`, every chunk is a separate upstream call that re-sends 
 
 Some models — notably the Gemma family — emit their end-of-turn token prematurely while sampling at `temperature > 0`, and the backend reports `finish_reason="stop"`. Left unhandled, this both leaks the raw marker into your output and cuts the response off mid-sentence.
 
-AntiSlop-vLLM strips any trailing end-of-turn marker from each chunk **before** it enters the generation state (so it never appears in the output), and treats the accompanying `stop` as an early, non-terminal signal: generation continues instead of ending. A `stop` that arrives *without* a marker — for example one produced by your own `stop_sequences` — is still treated as terminal, so normal stop behaviour is unaffected.
+A backend `stop` is **not** automatically treated as the end of the turn. Gemma-class models emit their end-of-turn token mid-response under sampling, and vLLM reports that as an ordinary `finish_reason="stop"` — the stop token itself never appears in the response, because vLLM detokenises the output and drops it. A check that looked for the marker token therefore never fired, and every such emission truncated the answer.
+
+The decision is now based on evidence that is actually observable:
+
+*   if the attempt produced no text at all, it counts as a *no-progress* stop (the model immediately tried to end);
+*   if a configured `stop_sequence` appears in the text, the stop is terminal;
+*   if the text ends on a natural boundary (sentence punctuation, a closing bracket, a newline), the stop is terminal;
+*   otherwise the stop is a **premature end of turn** and generation continues.
+
+The strike counter only advances on *consecutive no-progress* stops, so a long response with a couple of stray end-of-turn emissions is no longer cut short, while a model that re-emits EOS forever still terminates.
 
 ```yaml
 generation_params:
+  stop_on_clean_end: true
   end_of_turn_markers:
     - "<end_of_turn>"
     - "<turn|>"
   max_consecutive_stops: 3
+  max_stream_attempts: 12
+  restart_suppress_markers: true
 ```
 
-*   `end_of_turn_markers`: the markers to strip. Defaults to `<end_of_turn>` and `<turn|>`. If you use a model with different markers (e.g. ChatML's `<|im_end|>`), list them here.
-*   `max_consecutive_stops`: how many early stops to tolerate back-to-back before accepting the stop anyway. This is a safety valve against runaway restarts; lower it if you see repeated restarts, raise it if responses are still being truncated. Note that both `finish_reason="stop"` and `finish_reason="stream_end"` count towards this limit — vLLM typically reports the latter, because it closes the SSE stream as soon as an EOS token is emitted.
+*   `stop_on_clean_end`: accept a stop that lands on a natural text boundary. Set to `false` to never accept a stop unless a `stop_sequence` matched — that guarantees no truncation at the cost of occasionally running past the end of the turn.
+*   `end_of_turn_markers`: control tokens to **scrub**. Removal happens anywhere in a chunk, and a marker split across two chunks is still caught (text is held back until it can no longer be the start of a marker). List the markers your model uses — Gemma, Llama-3, ChatML, Mistral and Qwen families are covered by the built-in pattern.
+*   `special_token_pattern`: optional regex replacing the built-in control-token pattern.
+*   `max_consecutive_stops`: consecutive **no-progress** early stops tolerated before giving up (safety valve against runaway restarts).
+*   `max_stream_attempts`: hard cap on upstream stream attempts per generation.
+*   `restart_suppress_markers`: send the markers as `bad_words` on *restart* requests. After a premature EOS the continuation prompt ends exactly where the model already chose to stop, so without this each restart is wasted. Backends that reject `bad_words` disable it automatically.
+*   `probe_stream_logprobs`: probe the backend once for streamed logprobs. The result is cached per endpoint; set to `false` to skip the round-trip.
 
-> **Note:** setting `end_of_turn_markers: []` disables the feature entirely. Use this if you are running a model whose end-of-turn markers you do not want stripped, or if you are debugging output length.
+> **Note:** setting `end_of_turn_markers: []` disables scrubbing entirely. Use this if you are running a model whose control tokens you do not want removed, or if you are debugging output length.
 
 ### Building a token-ID banlist (`utils/phrase_token_ids.py`)
 

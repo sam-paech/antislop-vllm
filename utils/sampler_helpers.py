@@ -2,13 +2,18 @@
 import math
 from typing import List, Optional, Tuple
 
-import torch
-
+# NOTE: torch is imported lazily, inside the two helpers that need it.
+# ``apply_sampling_filters`` — the only function the sampler calls — is pure
+# Python, so importing this module must not require a multi-hundred-megabyte
+# dependency.  Importing torch at module scope made the whole package unusable on
+# a machine without it, including for CPU-only batch runs and for the test suite.
 # ── probability helpers ───────────────────────────────────────────────
-def _get_probs(logits: torch.Tensor, temperature: float) -> torch.Tensor:
+def _get_probs(logits, temperature: float):
+    import torch
     return torch.softmax(logits / temperature, dim=-1)
 
-def _apply_min_p_filter(probs: torch.Tensor, min_p: float) -> torch.Tensor:
+def _apply_min_p_filter(probs, min_p: float):
+    import torch
     if min_p is None:
         return probs
     keep = probs >= (probs.max() * min_p)
@@ -58,7 +63,7 @@ def apply_sampling_filters(
 
 # ── tail-selection (lowest-prob among top-k) ──────────────────────────
 def select_tail_tokens(
-    logits: torch.Tensor,
+    logits,
     *,
     temperature: float,
     min_p: float,
