@@ -82,7 +82,10 @@ Cortex-A55, 4 GB–16 GB RAM). Tests have previously hung this board. The harnes
   (`ANTISLOP_REGEX_MAX_WORKERS`); the harness pins it to 1. Never create a process
   pool at import time again — importing `validators` used to fork 16 processes.
 * A suite prints a `WARN` if a thread is still alive when it finishes. Treat a new
-  warning as a leak you introduced.
+  warning as a leak you introduced. `run_suite` first calls
+  `shutdown_regex_pool()`, which closes `RegexValidator`'s lazily created
+  `ProcessPoolExecutor`; without it, any suite that exercises the regex path ends
+  with a spurious `QueueFeederThread` warning.
 
 ### 3.2 Short timers, and a hard kill behind them
 
@@ -170,14 +173,21 @@ Excluded from `run_all.SUITES`; fix these, do not delete them.
   measured before the banned top token is removed, and the per-position budget ends
   an unfixable position.
 
-`tests/test_truncation_and_repetition.py` covers the two ways a record used to be cut
-off or padded. Both were reproduced from a real dataset before being fixed, so keep the
+`tests/test_truncation_and_repetition.py` covers the three ways a record used to be cut
+off or padded. All were reproduced from a real dataset before being fixed, so keep the
 tests narrow: a "repetition" that is really a continuation must survive
-(`test_genuine_continuation_is_still_emitted`), and the attempt budget must still
+(`test_genuine_continuation_is_still_emitted`), the attempt budget must still
 terminate a backend that never stops
-(`test_restart_budget_still_bounds_a_backend_that_never_ends`). Loosening
-`_is_repetition` or the budgets to make one of these pass is a regression in the
-other.
+(`test_restart_budget_still_bounds_a_backend_that_never_ends`), and a *live*
+back-track must still discard the tail it invalidated
+(`test_live_backtrack_still_discards_the_invalidated_tail`). Loosening
+`_is_repetition`, the budgets, or the `truncate` in `_perform_backtrack` to make one
+of these pass is a regression in another.
+
+When a test needs a violation to be caught by the **final sweep**, set
+`regex_max_span_tokens` high as well as `regex_validation_interval`. With the default
+`tail_keep_tokens` of 0 the whole response is emitted before the sweep runs, so a
+sweep repair cannot be observed in the returned text.
 
 ---
 

@@ -908,14 +908,36 @@ class ApiAntiSlopSampler:
         multi_chosen_decoded = [_decode_token(t) for t in tail_toks]
 
         # ── commit replacement ───────────────────────────────────────────
+        #
+        # Mid-generation the tail is *discarded on purpose*: the rewrite invalidates
+        # everything after it, and the caller immediately asks the backend to
+        # regenerate from that point.  Nothing is lost, because it is about to be
+        # written again.
+        #
+        # The post-generation sweep is different: generation has already stopped, so
+        # there is no next request.  Truncating there deleted every token after the
+        # repaired one and nothing ever replaced them -- a complete, clean turn ended
+        # mid-sentence at the last repaired slop word.  Against a 3 500-entry ban list
+        # the sweep repairs something on most slop-heavy turns, which is why the tail
+        # of the record was the part that went missing.
+        #
+        # In the sweep we therefore rewrite the one token and keep the rest.  The
+        # tokens after it were produced under the *old* token, so the join can read
+        # slightly oddly; that is strictly better than losing the remainder of the
+        # turn, and it is what a reader of the dataset would expect.  A rewritten
+        # token can also expose a new violation further along, which the sweep's
+        # next pass handles.
         tried_here.add(choice)
-        state.truncate(idx + 1)
-        state.replace_token_string(idx, choice)
+        if final:
+            state.replace_token_string(idx, choice)
+        else:
+            state.truncate(idx + 1)
+            state.replace_token_string(idx, choice)
 
-        # purge caches beyond idx
-        for k in list(self._tried_alternatives):
-            if k > idx:
-                del self._tried_alternatives[k]
+            # purge caches beyond idx
+            for k in list(self._tried_alternatives):
+                if k > idx:
+                    del self._tried_alternatives[k]
 
         logger.warning(
             f"    ✓ replacement='{choice}' "

@@ -289,6 +289,40 @@ def _live_threads() -> list[str]:
     )
 
 
+def shutdown_regex_pool() -> bool:
+    """Tear down the regex validator's ``ProcessPoolExecutor``, if one exists.
+
+    The pool is created lazily on the first ``RegexValidator.check`` and is kept for
+    the life of the process, which is right for a server and wrong for a suite: the
+    executor's ``QueueFeederThread`` outlives the last test and :func:`run_suite`
+    (correctly) reports it as a leaked thread.  Any suite that exercises the regex
+    path would therefore end with a WARN that is not a bug in the code under test.
+
+    Shutting the pool down here keeps that warning meaningful: after this runs, a
+    live thread really is a leak.  Returns True if a pool was shut down.
+    """
+    try:
+        import validators.regex_validator as regex_module
+    except Exception:  # pragma: no cover - suite does not import validators
+        return False
+
+    pool = getattr(regex_module, "_REGEX_POOL", None)
+    if pool is None:
+        return False
+
+    lock = getattr(regex_module, "_REGEX_POOL_LOCK", None)
+    try:
+        if lock is not None:
+            with lock:
+                regex_module._REGEX_POOL = None
+        else:  # pragma: no cover - defensive
+            regex_module._REGEX_POOL = None
+        pool.shutdown(wait=True)
+    except Exception as exc:  # pragma: no cover - shutdown must never fail a run
+        print(f"WARN  could not shut down the regex process pool: {exc}")
+    return True
+
+
 def run_suite(suite: str, namespace: dict) -> int:
     """Run every ``test_*`` callable in *namespace*; return a process exit code.
 
@@ -347,6 +381,11 @@ def run_suite(suite: str, namespace: dict) -> int:
         return EXIT_ABORTED
 
     print(f"{passed}/{total} passed in {elapsed:.2f}s (single-threaded)")
+
+    # The regex validator's process pool is created on first use and never closed,
+    # so it would otherwise be reported below as a leak.  Closing it here is what
+    # makes the check meaningful (see shutdown_regex_pool).
+    shutdown_regex_pool()
 
     leaked = _live_threads()
     if leaked:

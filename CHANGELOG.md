@@ -9,6 +9,60 @@ so every entry is ordered and unambiguous without a manual version bump.
 
 ---
 
+## [2026.11.02.1930] — the final validation sweep no longer deletes the tail
+
+Reported from a real dataset: the truncation is *less* frequent than before, but a
+turn still ends mid-word (`... Her blue expires`).  This one has a different cause
+from the two below, and it looks different in the logs: generation finished
+normally (`finish_reason='stop'`), the response is complete, and the text simply
+stops early.  No attempt budget is involved.
+
+### Fixed — a post-generation repair discarded every token after the repaired one
+
+`_perform_backtrack` commits a replacement by calling `state.truncate(idx + 1)` and
+then `replace_token_string(idx, choice)`.  Mid-generation that is correct: the
+rewrite invalidates everything after the repaired token, and the caller immediately
+asks the backend to regenerate from that point, so nothing is lost.
+
+The **final validation sweep** (`final=True`) runs after generation has stopped and
+never calls the backend again.  Truncating there deleted the remainder of the turn
+with nothing to replace it, so the record ended at the last repaired word.
+
+This fires constantly against the shipped 3 500-entry ban list.  The sweep exists
+precisely for matches that only become definitive once the text stops growing
+(``detect_disallowed_sequence(..., allow_end_of_text_match=True)``), so the last
+few tokens of a slop-heavy turn are routinely repaired.  The tail that went missing
+is whatever the model wrote after the last banned phrase.
+
+* The sweep now rewrites the single token and **keeps** the rest of the state; only
+  a live back-track truncates.  A rewritten token can expose a new violation
+  further along, which the sweep's next pass already handles.
+* `test_final_sweep_keeps_the_text_after_a_repaired_violation` and
+  `test_final_sweep_keeps_the_tail_when_several_violations_are_repaired` reproduce
+  the truncation (they failed with ``' She felt happy'`` before the fix).
+* `test_live_backtrack_still_discards_the_invalidated_tail` is the counterpart:
+  removing `truncate` outright would also pass the two tests above, but keeps the
+  stale tail *and* appends the regenerated text (``... happy and and cold ...``).
+
+### Note — why the existing sweep coverage did not catch this
+
+`test_truncation_and_repetition` already exercised the sweep, but with
+`regex_max_span_tokens: 0`, i.e. `tail_keep_tokens == 0`.  With nothing held back,
+all text is emitted before the sweep runs, so a sweep repair cannot be observed in
+the returned text at all.  The shipped config uses `regex_max_span_tokens: 999999`
+(`tail_keep_tokens` is every token) and *does* hold the tail, which is exactly the
+configuration in which the bug is visible.  The new tests set it explicitly.
+
+### Changed — the test harness closes the regex process pool
+
+`RegexValidator` keeps a lazily created `ProcessPoolExecutor` for the life of the
+process.  Any suite that exercises the regex path therefore ended with
+``WARN  2 thread(s) still alive at exit: QueueFeederThread, Thread-1``, which is
+not a bug in the code under test.  `tests/_runner.shutdown_regex_pool()` tears the
+pool down before the leak check, so that warning stays meaningful.
+
+---
+
 ## [2026.11.02.1800] — stop truncating long turns, stop emitting repetition loops
 
 Reported from a real dataset: assistant turns ended mid-word

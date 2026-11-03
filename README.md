@@ -247,6 +247,16 @@ A match that already ends in a non-word character needs no lookahead and still f
 
 > **Note:** this affects short entries only. Prefer multi-word phrases where you can — a one- or two-character entry is more likely to collide with ordinary prose.
 
+#### The final sweep rewrites a token, it does not delete the tail
+
+The sweep repairs a violation by rewriting the offending token. Mid-generation the same operation also discards everything after that token, because the rewrite invalidates it and the backend is about to regenerate it. The sweep is different: generation has already stopped, so nothing would replace the discarded text.
+
+Truncating there used to delete the rest of the turn, and the record ended at the last repaired word — a complete response, reported as `finish_reason='stop'`, that simply stopped early. With a large banlist this is common, because the sweep exists for matches that only become definitive once the text stops growing, so the last few tokens of a slop-heavy turn are routinely repaired.
+
+The sweep now keeps the tail. A rewritten token can expose a new violation further along; the sweep's next pass handles it.
+
+> **Note:** if you are testing this path, set `regex_max_span_tokens` high (as the shipped config does). With the default of `0`, `tail_keep_tokens` is `0`, all text is emitted *before* the sweep runs, and a sweep repair is invisible in the returned text.
+
 #### Back-tracking limits
 
 `backtracking.max_retries_per_position` (default `100`) is the number of alternative tokens tried at a single position before the violation is given up on and suppressed. It was previously read from config but never enforced; it now bounds the work done at any one position.

@@ -38,6 +38,7 @@ _stubs.install()
 
 from core.models import ApiChunkResult  # noqa: E402
 from core.sampler import ApiAntiSlopSampler  # noqa: E402
+from validators.regex_validator import RegexValidator  # noqa: E402
 from validators.slop_phrase_validator import SlopPhraseValidator  # noqa: E402
 
 
@@ -110,7 +111,14 @@ def _make_sampler(client, validators=(), **gen_overrides):
         "backtracking": {"force_backtrack": True, "max_retries_per_position": 100},
         "filter_tail_banned_prefix_tokens": False,
         "regex_max_span_tokens": 0,
+        # Suites that need a violation to survive until the post-generation sweep
+        # set this high so the live regex pass never sees it.
+        "regex_validation_interval": 10 ** 9,
     }
+    # These keys live at the top level of the config, not under generation_params.
+    for key in ("regex_validation_interval", "regex_max_span_tokens"):
+        if key in gen_overrides:
+            config[key] = gen_overrides.pop(key)
     return ApiAntiSlopSampler(
         api_client=client,
         validators=list(validators),
@@ -130,6 +138,10 @@ SLOP_WORDS = [
 
 def _slop_validator():
     return SlopPhraseValidator({w: 1.0 for w in SLOP_WORDS}, app_config=None)
+
+
+def _slop_validator_for(words):
+    return SlopPhraseValidator({w: 1.0 for w in words}, app_config=None)
 
 
 # --------------------------------------------------------------------------- #
@@ -329,6 +341,137 @@ def test_tool_call_marker_is_scrubbed_from_the_text():
     assert "<tool_call|>" not in text, text
     assert "<tool_call>" not in text, text
     assert "dyed-" in text and "hair." in text, text
+
+
+# --------------------------------------------------------------------------- #
+#  3. The final sweep must not throw away the tail it was cleaning            #
+# --------------------------------------------------------------------------- #
+def test_final_sweep_keeps_the_text_after_a_repaired_violation():
+    """A violation fixed after generation stops must not delete the rest of the turn.
+
+    This is the third way a record gets cut off, and it looks different from the
+    other two: the generation itself finished normally (``finish_reason='stop'``),
+    the response is complete, and the text simply stops early.
+
+    ``_perform_backtrack`` rewrites a token by calling ``state.truncate(idx + 1)``
+    and then ``replace_token_string(idx, ...)``.  When it runs from the *final*
+    sweep that is correct only if nothing follows ``idx``.  Mid-generation it is
+    fine, because the backend is asked to regenerate everything after the rewrite.
+    In the sweep the backend is never called again, so every token after ``idx`` is
+    dropped from the state with nothing to replace it -- the turn ends at the
+    repaired word.
+
+    Against a 3 506-entry ban list this fires constantly: the sweep exists
+    precisely because a ban at the very end of the text is only definitive once
+    generation has stopped, so the last few tokens of a slop-heavy turn are
+    routinely repaired.  The tail is whatever the model wrote after the last
+    banned phrase.
+    """
+    pieces = [
+        " She", " felt", " pale", " and", " cold", " and", " tired",
+        " and", " alone", ".",
+    ]
+    # The banned span has a viable alternative, so the back-track succeeds.
+    alternatives = {" pale": [(" pale", -0.01), (" happy", -1.0)]}
+    client = FakeStreamClient([_chunks(pieces, "stop", alternatives)])
+    sampler = _make_sampler(
+        client,
+        [RegexValidator([r"pale and"])],
+        # The live pass is skipped so the violation is first seen by the sweep --
+        # which is the normal case, because the sweep exists for matches that only
+        # become definitive once the text stops growing.
+        regex_validation_interval=10 ** 9,
+        # Hold the whole response back until generation ends, exactly as the
+        # shipped config does (``regex_max_span_tokens: 999999`` => tail_keep_tokens
+        # is every token).  With the default of 0 the text is emitted as it is
+        # generated, so a sweep repair can no longer be observed at all -- which is
+        # why this bug survived a suite that already covered the sweep.
+        regex_max_span_tokens=10 ** 6,
+    )
+    text = "".join(sampler.generate("PROMPT"))
+
+    # The repair happened ...
+    assert sampler.events, "the banned phrase was never reported"
+    assert sampler.events[-1]["fixed"] is True, sampler.events
+    # ... and the rest of the sentence survived it.
+    assert "cold and tired and alone." in text, (
+        f"final sweep truncated the turn at the repaired token: {text!r}"
+    )
+    assert "pale and" not in text.lower(), text
+
+
+def test_final_sweep_keeps_the_tail_when_several_violations_are_repaired():
+    """The sweep runs repeatedly; each pass must preserve what follows its repair.
+
+    Fixing one violation can expose another earlier in the rewritten tail, so the
+    sweep loops.  On the old code the *first* pass already destroyed everything
+    after its own repair, which is why a slop-heavy turn lost more text the more
+    violations it had.
+    """
+    pieces = [
+        " She", " felt", " pale", " and", " stale", " and", " tired",
+        " and", " utterly", " alone", ".",
+    ]
+    alternatives = {
+        " pale": [(" pale", -0.01), (" warm", -1.0)],
+        " stale": [(" stale", -0.01), (" quiet", -1.0)],
+    }
+    client = FakeStreamClient([_chunks(pieces, "stop", alternatives)])
+    sampler = _make_sampler(
+        client,
+        [RegexValidator([r"pale and", r"stale and"])],
+        regex_validation_interval=10 ** 9,
+        regex_max_span_tokens=10 ** 6,
+    )
+    text = "".join(sampler.generate("PROMPT"))
+
+    assert len([e for e in sampler.events if e["fixed"]]) >= 1, sampler.events
+    assert "and utterly alone." in text, (
+        f"final sweep truncated the turn at a repaired token: {text!r}"
+    )
+    assert "pale and" not in text.lower(), text
+    assert "stale and" not in text.lower(), text
+
+
+def test_live_backtrack_still_discards_the_invalidated_tail():
+    """The sweep fix must not change what a *live* back-track does.
+
+    Mid-generation the tail after a rewrite is invalidated on purpose: the sampler
+    asks the backend to regenerate it, and the continuation arrives as new text.  If
+    a live back-track stopped truncating, the stale tail would be kept *and* the
+    regenerated text appended, duplicating the passage.
+
+    This is the counterpart to the two sweep tests above.  Making the sweep keep its
+    tail by removing ``truncate`` altogether would pass those two and break this one.
+    """
+    # Attempt 1: a banned span early in the text, then more text, then a mid-sentence
+    # stop so the sampler asks for a continuation.
+    first = _chunks(
+        [" She", " felt", " pale", " and", " cold"],
+        "stop",
+        {" pale": [(" pale", -0.01), (" happy", -1.0)]},
+    )
+    # Attempt 2: the backend regenerates from the rewritten token onwards.
+    second = _chunks([" and cold and tired."], "stop")
+    client = FakeStreamClient([first, second])
+    sampler = _make_sampler(
+        client,
+        [_slop_validator_for(["pale"])],
+        stop_on_clean_end=False,
+        regex_max_span_tokens=10 ** 6,
+    )
+    text = "".join(sampler.generate("PROMPT"))
+
+    # The live back-track happened before the stop was accepted.
+    assert sampler.events and sampler.events[0]["fixed"] is True, sampler.events
+    # The stale " and cold" that followed the rewrite in attempt 1 is gone, so the
+    # passage appears exactly once, from the regenerated continuation.  Assert on the
+    # *whole* result, not just on a substring count: keeping the stale tail and then
+    # appending the regenerated text yields "... happy and and cold ...", which still
+    # contains exactly one "and cold".
+    assert text == " She felt happy and cold and tired.", (
+        f"live back-track kept the invalidated tail and duplicated it: {text!r}"
+    )
 
 
 def main() -> int:
