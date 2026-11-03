@@ -347,76 +347,50 @@ def test_tool_call_marker_is_scrubbed_from_the_text():
 #  3. The final sweep must not throw away the tail it was cleaning            #
 # --------------------------------------------------------------------------- #
 def test_final_sweep_keeps_the_text_after_a_repaired_violation():
-    """A violation fixed after generation stops must not delete the rest of the turn.
+    """A violation found when the model stops is regenerated, not spliced.
 
-    This is the third way a record gets cut off, and it looks different from the
-    other two: the generation itself finished normally (``finish_reason='stop'``),
-    the response is complete, and the text simply stops early.
-
-    ``_perform_backtrack`` rewrites a token by calling ``state.truncate(idx + 1)``
-    and then ``replace_token_string(idx, ...)``.  When it runs from the *final*
-    sweep that is correct only if nothing follows ``idx``.  Mid-generation it is
-    fine, because the backend is asked to regenerate everything after the rewrite.
-    In the sweep the backend is never called again, so every token after ``idx`` is
-    dropped from the state with nothing to replace it -- the turn ends at the
-    repaired word.
-
-    Against a 3 506-entry ban list this fires constantly: the sweep exists
-    precisely because a ban at the very end of the text is only definitive once
-    generation has stopped, so the last few tokens of a slop-heavy turn are
-    routinely repaired.  The tail is whatever the model wrote after the last
-    banned phrase.
+    History: the sweep once truncated the turn at the repaired token (the turn
+    ended mid-sentence), then (2026.11.02.1930) rewrote the one token in place and
+    kept the tail.  That tail was sampled after the *old* token, so the result was
+    a splice of two continuations ("It was. fear, but hunger.").  Now the sampler
+    resolves end-of-text violations before it accepts the stop, while it can
+    still back-track and ask the backend for a fresh continuation.
     """
     pieces = [
         " She", " felt", " pale", " and", " cold", " and", " tired",
         " and", " alone", ".",
     ]
-    # The banned span has a viable alternative, so the back-track succeeds.
     alternatives = {" pale": [(" pale", -0.01), (" happy", -1.0)]}
-    client = FakeStreamClient([_chunks(pieces, "stop", alternatives)])
+    client = FakeStreamClient([
+        _chunks(pieces, "stop", alternatives),
+        # The backend regenerates everything after the rewritten token.
+        _chunks([" and", " calm", ",", " at", " last", "."], "stop"),
+    ])
     sampler = _make_sampler(
         client,
         [RegexValidator([r"pale and"])],
-        # The live pass is skipped so the violation is first seen by the sweep --
-        # which is the normal case, because the sweep exists for matches that only
-        # become definitive once the text stops growing.
         regex_validation_interval=10 ** 9,
-        # Hold the whole response back until generation ends, exactly as the
-        # shipped config does (``regex_max_span_tokens: 999999`` => tail_keep_tokens
-        # is every token).  With the default of 0 the text is emitted as it is
-        # generated, so a sweep repair can no longer be observed at all -- which is
-        # why this bug survived a suite that already covered the sweep.
         regex_max_span_tokens=10 ** 6,
     )
     text = "".join(sampler.generate("PROMPT"))
 
-    # The repair happened ...
-    assert sampler.events, "the banned phrase was never reported"
-    assert sampler.events[-1]["fixed"] is True, sampler.events
-    # ... and the rest of the sentence survived it.
-    assert "cold and tired and alone." in text, (
-        f"final sweep truncated the turn at the repaired token: {text!r}"
-    )
-    assert "pale and" not in text.lower(), text
+    assert sampler.events and sampler.events[0]["fixed"] is True, sampler.events
+    assert text == " She felt happy and calm, at last.", text
+    assert len(client.calls) == 2, client.calls
 
 
 def test_final_sweep_keeps_the_tail_when_several_violations_are_repaired():
-    """The sweep runs repeatedly; each pass must preserve what follows its repair.
-
-    Fixing one violation can expose another earlier in the rewritten tail, so the
-    sweep loops.  On the old code the *first* pass already destroyed everything
-    after its own repair, which is why a slop-heavy turn lost more text the more
-    violations it had.
-    """
+    """Each stop-time repair is followed by regeneration; nothing is spliced."""
     pieces = [
-        " She", " felt", " pale", " and", " stale", " and", " tired",
-        " and", " utterly", " alone", ".",
+        " She", " felt", " pale", " and", " stale", " and", " tired", ".",
     ]
-    alternatives = {
-        " pale": [(" pale", -0.01), (" warm", -1.0)],
-        " stale": [(" stale", -0.01), (" quiet", -1.0)],
-    }
-    client = FakeStreamClient([_chunks(pieces, "stop", alternatives)])
+    alternatives = {" pale": [(" pale", -0.01), (" warm", -1.0)]}
+    client = FakeStreamClient([
+        _chunks(pieces, "stop", alternatives),
+        _chunks([" and", " stale", " and", " sleepy", "."], "stop",
+                {" stale": [(" stale", -0.01), (" quiet", -1.0)]}),
+        _chunks([" and", " still", "."], "stop"),
+    ])
     sampler = _make_sampler(
         client,
         [RegexValidator([r"pale and", r"stale and"])],
@@ -425,12 +399,23 @@ def test_final_sweep_keeps_the_tail_when_several_violations_are_repaired():
     )
     text = "".join(sampler.generate("PROMPT"))
 
-    assert len([e for e in sampler.events if e["fixed"]]) >= 1, sampler.events
-    assert "and utterly alone." in text, (
-        f"final sweep truncated the turn at a repaired token: {text!r}"
+    assert len([e for e in sampler.events if e["fixed"]]) == 2, sampler.events
+    assert text == " She felt warm and quiet and still.", text
+
+
+def test_violation_that_cannot_be_regenerated_is_left_as_written():
+    """Text already sent to the client cannot be regenerated: leave it, never splice."""
+    pieces = [" It", " was", " not", " fear", ",", " but", " hunger", "."]
+    alternatives = {" not": [(" not", -0.05), (".", -2.0)]}
+    client = FakeStreamClient([_chunks(pieces, "stop", alternatives)])
+    sampler = _make_sampler(
+        client,
+        [RegexValidator([r"not fear, but"])],
+        regex_validation_interval=10 ** 9,
+        regex_max_span_tokens=0,          # every token is emitted as it arrives
     )
-    assert "pale and" not in text.lower(), text
-    assert "stale and" not in text.lower(), text
+    text = "".join(sampler.generate("PROMPT"))
+    assert text == "".join(pieces), text
 
 
 def test_live_backtrack_still_discards_the_invalidated_tail():

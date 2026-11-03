@@ -21,12 +21,16 @@ def _ensure_nltk_data():
 
     data_to_check_download = {
         'punkt': 'tokenizers/punkt',
+        'punkt_tab': 'tokenizers/punkt_tab',
         'stopwords': 'corpora/stopwords'
     }
     for name, path_check in data_to_check_download.items():
         try:
             nltk.data.find(path_check)
-        except (nltk.downloader.DownloadError, LookupError):
+        # `nltk.downloader.DownloadError` does not exist in current nltk;
+        # naming it here raised AttributeError while handling the LookupError,
+        # so importing `validators` failed on any machine without the data.
+        except LookupError:
             logger.info(f"NLTK '{name}' resource not found. Attempting download...")
             try:
                 nltk.download(name, quiet=True)
@@ -142,6 +146,10 @@ class NGramValidator(BaseValidator):
         """
         cleaned_words_map = []
         for original_idx, (word_str, _start_char, _end_char) in enumerate(text_tokens_with_spans):
+            # Treebank only splits off a sentence-final period, so a word before
+            # a mid-text period arrives as "eyes." and used to fail isalpha() and
+            # vanish, breaking any n-gram that ended a sentence.
+            word_str = word_str.rstrip(".")
             lower_word = word_str.lower()
 
             # Filter out non-alphabetic tokens (punctuation, numbers, etc.)
@@ -196,7 +204,7 @@ class NGramValidator(BaseValidator):
 
         # 3. Iterate through possible n-gram lengths and check for banned sequences
         # We want the *earliest* violation in the text.
-        earliest_violation: Optional[Tuple[int, Tuple[str, ...], int]] = None # (char_pos, ngram_tuple, raw_token_idx_of_first_word)
+        candidates: List[Tuple[int, int, Tuple[str, ...], int]] = []  # (char_pos, -len, ngram, raw idx of LAST word)
 
         for n in range(self.min_ngram_len, min(self.max_ngram_len, len(cleaned_word_sequence)) + 1):
             if n == 0: continue # Should not happen if min_ngram_len is set correctly
@@ -210,45 +218,40 @@ class NGramValidator(BaseValidator):
                     # The first word of this n-gram is `cleaned_word_sequence[i]`.
                     # Its info (including original index in raw_tokens_with_char_spans) is:
                     _first_cleaned_word, raw_token_list_idx_of_first_word = cleaned_words_and_their_raw_indices[i]
-                    
+                    _last_cleaned_word, raw_idx_of_last_word = cleaned_words_and_their_raw_indices[i + n - 1]
+
                     # Get the character span of this first raw token
                     _raw_token_str, char_start_offset, _char_end_offset = raw_tokens_with_char_spans[raw_token_list_idx_of_first_word]
+                    candidates.append((char_start_offset, -n, current_ngram_tuple, raw_idx_of_last_word))
 
-                    if earliest_violation is None or char_start_offset < earliest_violation[0]:
-                        earliest_violation = (char_start_offset, current_ngram_tuple, raw_token_list_idx_of_first_word)
-                    # If same start, prefer longer n-gram (though less critical here than phrase matching)
-                    elif char_start_offset == earliest_violation[0] and len(current_ngram_tuple) > len(earliest_violation[1]):
-                         earliest_violation = (char_start_offset, current_ngram_tuple, raw_token_list_idx_of_first_word)
-
-
-        if earliest_violation is None:
+        if not candidates:
             return None
 
-        violation_char_pos, matched_ngram_tuple, _ = earliest_violation
+        # Earliest first; at the same start the longer n-gram wins.
+        candidates.sort(key=lambda c: (c[0], c[1]))
+        text_end = len(generated_text)
+        last_raw_idx = len(raw_tokens_with_char_spans) - 1
 
-        # Defer a match that ends inside the not-yet-complete final word.
-        # raw_tokens_with_char_spans is ordered, so its last token ends at (or
-        # near) the end of the text; if the violating n-gram's final word is that
-        # last token, more characters are still to come.
-        if not final and raw_tokens_with_char_spans:
-            _last_tok_str, last_start, last_end = raw_tokens_with_char_spans[-1]
-            if last_end >= len(generated_text.rstrip()) and last_start >= violation_char_pos:
-                # The only word at or after the violation start is the incomplete
-                # tail word -> provisional, wait for more text.
-                return None
-        
-        # Convert character position to API token index
-        tok_idx = self._char_to_token_index(state, violation_char_pos)
-        if tok_idx is None:
-            # This can happen if the character position is somehow outside the tokenized spans
-            # or if the text has changed in a way that invalidates the mapping.
-            logger.error(f"NGramValidator: Could not map char_pos {violation_char_pos} to token_idx for n-gram {' '.join(matched_ngram_tuple)}.")
-            return None
+        for violation_char_pos, _neg_len, matched_ngram_tuple, raw_idx_of_last_word in candidates:
+            # Defer only a match whose LAST word is the still-growing final word
+            # of the text.  The old test (`last_start >= violation_char_pos`) was
+            # true for practically any text, so n-grams never fired while the
+            # stream ran and were only ever caught after generation ended.
+            if not final and raw_idx_of_last_word == last_raw_idx:
+                _s, _start, last_end = raw_tokens_with_char_spans[last_raw_idx]
+                if last_end >= text_end:
+                    continue
 
-        # Check if this specific violation (at this token index, for this n-gram) has been ignored
-        # For n-grams, the "details" string should uniquely identify the n-gram itself.
-        ngram_detail_str = f"{' '.join(matched_ngram_tuple)} (stopwords_removed={self.remove_stopwords_flag})"
-        if self._is_ignored(tok_idx, ngram_detail_str):
+            tok_idx = self._char_to_token_index(state, violation_char_pos)
+            if tok_idx is None:
+                logger.error(f"NGramValidator: Could not map char_pos {violation_char_pos} to token_idx for n-gram {' '.join(matched_ngram_tuple)}.")
+                continue
+
+            # A suppressed match no longer hides the matches after it.
+            ngram_detail_str = f"{' '.join(matched_ngram_tuple)} (stopwords_removed={self.remove_stopwords_flag})"
+            if not self._is_ignored(tok_idx, ngram_detail_str):
+                break
+        else:
             return None
 
         # Create context snippet
@@ -294,4 +297,5 @@ class NGramValidator(BaseValidator):
 
     def _is_ignored(self, idx: int, details_str_representation: str) -> bool:
         # For NGramValidator, details_str_representation is the pre-computed suppression_detail_key
-        return (idx, details_str_representation) in self._ignored
+        return ((idx, details_str_representation) in self._ignored
+                or (None, details_str_representation) in self._ignored)
