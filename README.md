@@ -251,6 +251,8 @@ A match that already ends in a non-word character needs no lookahead and still f
 
 `backtracking.max_retries_per_position` (default `100`) is the number of alternative tokens tried at a single position before the violation is given up on and suppressed. It was previously read from config but never enforced; it now bounds the work done at any one position.
 
+A replacement candidate is always validated **definitively**, even while the stream is still running. The end-of-text deferral described above applies to the live stream — where `" la"` may still grow into `" land"` — but not to a candidate we are about to write in place of a banned token. Checking candidates with the deferral on made every banned single word its own best replacement: with both `gripped` and `gripping` in the banlist, `gripped` was resampled to `gripping`, re-detected at the same index, resampled back to `gripped`, and so on until the attempt budget ran out — and the banned word was emitted anyway. This is the source of the repeated `own own own` / `spark`→`surge`→`spark` output. Candidates are now rejected if they are themselves banned, so a position is fixed once.
+
 If you are building on `ApiClient` directly, note that a stream can be cancelled **individually**: create a handle with `client.new_stream_token()` and pass it as `cancel_token=` to `generate_stream()`, then call `client.cancel_stream(token)`. The older client-wide `cancel_current_stream()` aborts every stream open on that client, which is only safe when the client serves a single request (batch mode).
 
 ### Handling premature end-of-turn markers

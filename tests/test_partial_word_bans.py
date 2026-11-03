@@ -40,6 +40,15 @@ def _phrase_validator():
     return SlopPhraseValidator(dict(BANLIST), app_config=None)
 
 
+def _phrase_validator_two_ban():
+    """Both forms of one verb banned, as in the production list."""
+    return SlopPhraseValidator({"gripped": 1.0, "gripping": 1.0}, app_config=None)
+
+
+def _phrase_validator_spark_surge():
+    return SlopPhraseValidator({"spark": 1.0, "surge": 1.0}, app_config=None)
+
+
 def _state_with(text):
     st = GenerationState("PROMPT", log_init=False)
     st.generated_token_strings = [text]
@@ -271,6 +280,56 @@ def test_backtrack_budget_is_enforced():
     # The run terminated and produced text rather than hanging.
     assert isinstance(text, str)
     # The unfixable position was reported once, not in a loop.
+    assert len([e for e in sampler.events if e["index"] == 1]) == 1, sampler.events
+
+
+def test_backtrack_never_selects_another_banned_word():
+    """A replacement candidate must not itself be a banned word.
+
+    ``gripped`` and ``gripping`` are both banned, and each is the other's
+    best-scoring alternative in the cached logprobs.  The candidate check ran
+    with ``final=False``, so a ban whose match ended at the end of the
+    candidate text was *deferred* as "the word may still grow" — which meant
+    every banned single word was accepted as its own replacement.  The sampler
+    then emitted ``gripping``, re-detected the violation at the same index,
+    picked ``gripped``, and ping-ponged until the attempt budget ran out.
+
+    This is the ``gripped``/``gripping`` and ``surge``/``spark`` pair from the
+    production log.
+    """
+    alts = {
+        " gripped": [(" gripped", -0.05), (" gripping", -0.2), (" held", -1.5)],
+        " gripping": [(" gripping", -0.05), (" gripped", -0.2), (" held", -1.5)],
+    }
+    client = FakeStreamClient([
+        _chunks(["Her hands", " gripped"], finish_reason="stop", alternatives=alts),
+        _chunks([" her", " wrist."], finish_reason="stop"),
+    ])
+    sampler = _make_sampler(client, [_phrase_validator_two_ban()])
+    text = "".join(sampler.generate("PROMPT"))
+
+    for banned in ("gripped", "gripping"):
+        assert banned not in text.lower(), (banned, text)
+    # One violation at the position, fixed once — not a ping-pong.
+    at_pos = [e for e in sampler.events if e["index"] == 1]
+    assert len(at_pos) == 1, sampler.events
+    # And it did not burn through the whole stream-attempt budget.  A ping-pong
+    # exhausts `max_stream_attempts` and reports finish_reason='length'.
+    assert sampler.finish_reason != "length", sampler.finish_reason
+
+
+def test_backtrack_does_not_repeat_the_same_banned_word():
+    """The replacement must not be the word that was just banned."""
+    alts = {" spark": [(" spark", -0.05), (" surge", -0.6), (" rush", -2.0)]}
+    client = FakeStreamClient([
+        _chunks(["She felt", " spark"], finish_reason="stop", alternatives=alts),
+        _chunks([" of it."], finish_reason="stop"),
+    ])
+    sampler = _make_sampler(client, [_phrase_validator_spark_surge()])
+    text = "".join(sampler.generate("PROMPT"))
+
+    assert "spark" not in text.lower(), text
+    assert "surge" not in text.lower(), text
     assert len([e for e in sampler.events if e["index"] == 1]) == 1, sampler.events
 
 

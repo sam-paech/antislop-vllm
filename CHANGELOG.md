@@ -9,6 +9,51 @@ so every entry is ordered and unambiguous without a manual version bump.
 
 ---
 
+## [2026.11.02.1645] — fix back-track ping-pong emitting banned words and repeated text
+
+### Fixed — a banned word was accepted as its own replacement
+
+`_check_hypothetical_state` validated each candidate token with `final=False`.
+The validators defer any match whose right edge is the end of the text while
+generation is still running, because the next token may extend the word
+(`" la"` → `" land"`). A back-track candidate is not that situation: the next
+validation pass sees exactly the same text again, so a candidate that already
+ends on a banned phrase is the same violation one token later, not a fix.
+
+The effect with a custom banlist containing both forms of a word was a
+ping-pong: `gripped` was resampled to `gripping` (also banned), re-detected at
+the same index, resampled back to `gripped`, and so on until
+`max_stream_attempts` was exhausted. The same path produced the
+`spark` → `surge` → `spark` cycle and, once the budget ran out, emitted the
+banned word anyway — the repeated `own own own` text and the duplicated
+`Lorena felt a spark` prefixes in the report.
+
+* Candidates are now checked with `final=True`, so a banned candidate is
+  rejected rather than deferred.
+* A position is therefore fixed in one pass instead of being re-entered until
+  the attempt budget is gone. `finish_reason` is no longer reported as
+  `length` for a run that actually finished.
+* The streaming deferral itself is unchanged: `" la"` still grows into
+  `" land"` without a ban, and the final sweep still catches a banned phrase at
+  the very end of a response.
+* `final` is still accepted by `_check_hypothetical_state` for call-site
+  compatibility, but no longer changes the verdict.
+
+### Added — regression tests
+
+`tests/test_partial_word_bans.py` gained two tests that fail on the old
+behaviour:
+
+* `test_backtrack_never_selects_another_banned_word` — `gripped`/`gripping`
+  both banned and each the other's top alternative; asserts neither appears in
+  the output, one violation event, and no `length` finish.
+* `test_backtrack_does_not_repeat_the_same_banned_word` — the
+  `spark`/`surge` pair from the log.
+
+`README.md` documents that replacement candidates are validated definitively.
+
+---
+
 ## [2026.11.02.1548] — add `ngram_validator.enabled` to switch n-gram banning off
 
 ### Added — `ngram_validator.enabled` config switch

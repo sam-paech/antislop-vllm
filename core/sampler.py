@@ -541,6 +541,10 @@ class ApiAntiSlopSampler:
 
         For N-gram validator we treat the span as
             [violation_index, violation_index + len(ngram_tuple)-1].
+
+        *final* is accepted for call-site compatibility but does not change the
+        verdict: a candidate is always checked definitively.  See the comment
+        below for why the streaming deferral must not apply here.
         """
         if not self.validators:
             return True, None
@@ -554,11 +558,24 @@ class ApiAntiSlopSampler:
         # line for each buried the actual events (20+ lines per back-track).
         hypo_state = GenerationState.hypothetical(state.prompt_string, hypo_tokens)
 
-        # While generation is running the candidate is not the end of the text:
-        # more tokens follow, so a match touching the end is provisional.  In the
-        # final sweep nothing follows, so it is definitive.
+        # The candidate is checked with ``final=True`` even while the stream is
+        # running, and this is deliberate.
+        #
+        # The deferral rule in the validators exists so the *live* stream does not
+        # ban a half-written word: ``" la"`` may still grow into ``" land"``.  A
+        # back-track candidate is a different situation -- we are choosing what to
+        # put there, and the next validation pass will see the same text again.  A
+        # candidate that already ends on a banned phrase is therefore not a fix, it
+        # is the same violation one token later.
+        #
+        # Passing ``final=False`` here made every banned single word its own best
+        # replacement: ``gripped`` was resampled as ``gripping`` (both banned),
+        # then back to ``gripped``, burning the whole attempt budget and finally
+        # emitting the banned word anyway -- the ``surge``/``spark`` and
+        # ``gripped``/``gripping`` ping-pong, and the repeated
+        # ``own own own`` text in the output.
         for v in self.validators:
-            vio = self._check_one(v, hypo_state, final)
+            vio = self._check_one(v, hypo_state, True)
             if not vio:
                 continue
 
