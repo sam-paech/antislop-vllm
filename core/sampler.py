@@ -723,6 +723,7 @@ class ApiAntiSlopSampler:
         state: GenerationState,
         vio: ViolationInfo,
         final: bool = False,
+        emitted_upto: int = 0,
     ) -> bool:
         """Resample the violating token from its cached top-logprob list.
 
@@ -776,34 +777,39 @@ class ApiAntiSlopSampler:
 
         # A phrase the context forces (a character called Mara against the
         # one-word entry "mara", a place name, a word the user just used) cannot
-        # be avoided: each replacement is a junk token, the model tries the word
-        # again one token later, and the reply fills with the junk
-        # ("**\\\n\\\n\\\n..." in a real Gemma 4 run).  The per-position budget
-        # never trips because every retry lands on a new index.  After three bans
-        # of the same rule within 12 tokens, roll back to where the first one
-        # started and allow the phrase for the rest of this request.
-        rule = (
-            (vio.details.get("suppression_detail_key") or vio.details.get("phrase")
-             or vio.details.get("ngram_string") or vio.details.get("pattern"))
-            if isinstance(vio.details, dict) else str(vio.details)
-        )
-        hist = self._ban_history.setdefault((vio.validator_type, str(rule)), [])
-        hist.append(idx)
-        if len(hist) >= 3 and max(hist[-3:]) - min(hist[-3:]) <= 12:
-            first = min(hist[-3:])
-            logger.warning(
-                "Back-track: %r was banned 3 times within %d tokens; the context "
-                "forces it.  Rolling back to token %d and allowing it for the rest "
-                "of this request.", rule, max(hist[-3:]) - first, first,
-            )
-            for v in self.validators:
-                if getattr(v, "validator_type", None) == vio.validator_type:
-                    v._ignored.add((None, str(rule)))
-            state.truncate(first)
-            for k in list(self._tried_alternatives):
-                if k >= first:
-                    del self._tried_alternatives[k]
-            return True
+        # be avoided: each replacement is a junk token and the model writes the
+        # word again straight after it, so the reply fills with junk
+        # ("**\\\n\\\n\\\n..." in a real Gemma 4 run, bans at tokens 22, 23, 25).  The
+        # per-position budget never trips because every retry lands on a new
+        # index.  The signature is three bans of the same phrase at increasing
+        # positions, each at most 2 tokens after the previous one.  A model that
+        # merely likes a word returns to it in a new sentence ("flicker" at 87,
+        # 93, 96), which stays banned.  When it fires, roll back to the first of
+        # the three and allow that phrase for the rest of the request.
+        # Regex rules are excluded: their key is a whole pattern, not a phrase.
+        if vio.validator_type in ("slop_phrase", "ngram") and isinstance(vio.details, dict):
+            rule = str(vio.details.get("suppression_detail_key")
+                       or vio.details.get("phrase") or vio.details.get("ngram_string"))
+            hist = self._ban_history.setdefault((vio.validator_type, rule), [])
+            if not hist or idx > hist[-1]:
+                hist.append(idx)
+            last3 = hist[-3:]
+            if (len(last3) == 3 and last3[1] - last3[0] <= 2 and last3[2] - last3[1] <= 2
+                    and last3[0] >= emitted_upto):
+                first = last3[0]
+                logger.warning(
+                    "Back-track: %r was banned at tokens %s, each straight after the "
+                    "last replacement; the context forces it.  Rolling back to token %d "
+                    "and allowing it for the rest of this request.", rule, last3, first,
+                )
+                for v in self.validators:
+                    if getattr(v, "validator_type", None) == vio.validator_type:
+                        v._ignored.add((None, rule))
+                state.truncate(first)
+                for k in list(self._tried_alternatives):
+                    if k >= first:
+                        del self._tried_alternatives[k]
+                return True
 
         tried_here   = self._tried_alternatives.setdefault(idx, set())
         logger.warning(
@@ -1145,7 +1151,7 @@ class ApiAntiSlopSampler:
             if not vio:
                 return False
             if can_restart and vio.violation_index >= emitted_upto:
-                fixed = self._perform_backtrack(state, vio)
+                fixed = self._perform_backtrack(state, vio, emitted_upto=emitted_upto)
                 self._record_event(vio, fixed)
                 if fixed:
                     return True
@@ -1635,7 +1641,7 @@ class ApiAntiSlopSampler:
                             pass
 
                         time.sleep(0.1)
-                        fixed = self._perform_backtrack(state, vio)
+                        fixed = self._perform_backtrack(state, vio, emitted_upto=last_yield)
 
                         logger.info(
                             "Backtracking complete (fixed=%s), resuming generation. "
@@ -1888,7 +1894,7 @@ class ApiAntiSlopSampler:
                 vio = self._run_validators(state)
                 if vio:
                     time.sleep(0.1)
-                    fixed = self._perform_backtrack(state, vio)
+                    fixed = self._perform_backtrack(state, vio, emitted_upto=last_yield)
                     event = {
                         "type":  vio.validator_type,
                         "index": vio.violation_index,
@@ -2144,7 +2150,7 @@ class ApiAntiSlopSampler:
             vio = self._run_validators(state)
             #print('val 1st run', time.time() - t)
             if vio:
-                fixed = self._perform_backtrack(state, vio)
+                fixed = self._perform_backtrack(state, vio, emitted_upto=last_yield_idx)
 
                 event = {
                     "type":  vio.validator_type,

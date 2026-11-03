@@ -354,6 +354,56 @@ def test_a_phrase_the_context_forces_is_allowed_instead_of_looping():
     assert len(client.calls) <= 5, len(client.calls)
 
 
+def _guard_sampler(validator, **gen):
+    s = _sampler(VllmLikeClient([]), [validator], **gen)
+    return s
+
+
+def _vio(kind, idx, key):
+    from core.models import ViolationInfo
+    details = ({"phrase": key, "suppression_detail_key": key} if kind == "slop_phrase"
+               else {"pattern": key, "suppression_detail_key": key})
+    return ViolationInfo(validator_type=kind, violation_index=idx,
+                         original_token_string=" x", details=details)
+
+
+def _state_with(n):
+    st = GenerationState.hypothetical("P", [" w"] * n)
+    for i in range(n):
+        st.logprobs_cache[i] = [(" w", -0.1), (" y", -1.0), (" z", -2.0)]
+    return st
+
+
+def test_a_phrase_the_model_merely_likes_stays_banned():
+    # Seen live: "flicker" returned in three different sentences (tokens 87, 93,
+    # 96).  That is a habit, not a forced word, and must stay banned.
+    sv = SlopPhraseValidator({"flicker": 1.0}, app_config=None)
+    s = _guard_sampler(sv)
+    st = _state_with(100)
+    for idx in (87, 93, 96):
+        s._perform_backtrack(st, _vio("slop_phrase", idx, "flicker"))
+    assert (None, "flicker") not in sv._ignored
+
+
+def test_the_guard_never_disables_a_regex_rule():
+    rv = RegexValidator([r"not \w+, but"])
+    s = _guard_sampler(rv)
+    st = _state_with(40)
+    for idx in (10, 11, 12):
+        s._perform_backtrack(st, _vio("regex", idx, r"not \w+, but"))
+    assert not any(k[0] is None for k in rv._ignored), rv._ignored
+
+
+def test_the_guard_never_rolls_back_into_text_already_sent():
+    sv = SlopPhraseValidator({"mara": 1.0}, app_config=None)
+    s = _guard_sampler(sv)
+    st = _state_with(40)
+    for idx in (22, 23, 25):
+        s._perform_backtrack(st, _vio("slop_phrase", idx, "mara"), emitted_upto=30)
+    assert (None, "mara") not in sv._ignored
+    assert st.get_generated_length() >= 23
+
+
 def _dying_client(tokens_before_drop):
     class Dying(VllmLikeClient):
         def generate_stream(self, **kw):
