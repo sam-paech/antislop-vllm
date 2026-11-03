@@ -223,14 +223,28 @@ def test_finish_reason_is_exposed():
 
 
 def test_suppress_tokens_sent_on_restart_only():
+    # Opt-in since 2026-11-03: a banned end-of-turn marker forces a model that
+    # had finished to keep writing.
+    client = FakeStreamClient([
+        _chunks(["First bit"], finish_reason="stop"),
+        _chunks([" and the rest."], finish_reason="stop"),
+    ])
+    sampler = _make_sampler(client, restart_suppress_markers=True)
+    _run(sampler)
+    assert "suppress_tokens" not in client.calls[0]
+    assert client.calls[1].get("suppress_tokens"), client.calls[1]
+    # The banned attempt is capped so it cannot run on to max_tokens.
+    assert client.calls[1]["max_tokens"] <= sampler.restart_suppress_window, client.calls[1]
+
+
+def test_suppress_tokens_off_by_default():
     client = FakeStreamClient([
         _chunks(["First bit"], finish_reason="stop"),
         _chunks([" and the rest."], finish_reason="stop"),
     ])
     sampler = _make_sampler(client)
     _run(sampler)
-    assert "suppress_tokens" not in client.calls[0]
-    assert client.calls[1].get("suppress_tokens"), client.calls[1]
+    assert not any(c.get("suppress_tokens") for c in client.calls), client.calls
 
 
 # --------------------------------------------------------------------------- #

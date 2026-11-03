@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import unicodedata
 import time
 import random
 from typing import Dict, Generator, List, Optional, Tuple, Callable, Any
@@ -175,19 +176,24 @@ def _is_repetition(
     generation.  A fragment of fewer than two words is ignored, because a lone word
     ("and") collides by accident far too easily.
     """
+    def _norm(text: str) -> str:
+        # Pad with spaces so `in` compares whole words: without it "he said"
+        # matched inside "she said" and a real continuation was rolled back.
+        return " " + " ".join(text.lower().split()) + " "
+
     added_words = added_text.split()
     if len(added_words) < 2:
         return False
-    needle = " ".join(added_words)
+    needle = _norm(added_text)
 
     existing_words = existing_text.split()
     if len(existing_words) >= len(added_words):
-        if needle in " ".join(existing_words):
+        if needle in _norm(existing_text):
             return True
 
     for earlier in earlier_additions or ():
-        earlier_text = " ".join(earlier.split())
-        if not earlier_text:
+        earlier_text = _norm(earlier)
+        if not earlier_text.strip():
             continue
         # Containment either way covers a verbatim repeat and a repeat of the same
         # stock phrase wrapped in a few extra words.
@@ -319,7 +325,11 @@ class ApiAntiSlopSampler:
         self.stop_on_clean_end = bool(gen.get("stop_on_clean_end", True))
         clean_end = gen.get("clean_end_chars")
         if clean_end is None:
-            clean_end = [".", "!", "?", "…", '"', "'", "\u201d", "\u2019", ")", "]", "}", "\n"]
+            # Roleplay replies routinely end on an *action*, a trailing tilde, a
+            # dash or a colon.  Leaving those out made the sampler refuse a
+            # finished reply's stop and ask the model to keep writing.
+            clean_end = [".", "!", "?", "…", '"', "'", "\u201d", "\u2019", ")", "]", "}", "\n",
+                         "*", "_", "~", "\u2014", "\u2013", ":", ";", "\u00bb", "`"]
         self.clean_end_chars: Tuple[str, ...] = tuple(str(c) for c in clean_end if str(c))
 
         # Hard cap on upstream stream attempts per generation, so a backend that
@@ -346,10 +356,43 @@ class ApiAntiSlopSampler:
         # model already chose to stop, so the same token is again the argmax and
         # the sampler would just burn its restart budget.  Backends that reject
         # `bad_words` disable this automatically (see api_client).
-        self.restart_suppress_markers = bool(gen.get("restart_suppress_markers", True))
+        #
+        # Off by default.  `bad_words` holds for the whole request, so a model
+        # whose stop was refused *cannot* end its turn on that attempt: a reply
+        # that was in fact finished is padded with whatever it writes instead
+        # (stock phrases, stage directions, a new turn).  When enabled, the ban
+        # applies only to the one attempt that follows a refused stop, and that
+        # attempt is capped at `restart_suppress_window` tokens.
+        self.restart_suppress_markers = bool(gen.get("restart_suppress_markers", False))
+        self.restart_suppress_window = max(1, int(gen.get("restart_suppress_window", 32)))
 
         # Text-level scrubber for control tokens that leak into the output.
         self.special_token_pattern = gen.get("special_token_pattern")
+
+        # The model's own control tokens, read from the chat-template tokenizer.
+        # The built-in pattern names a fixed set of families and missed 13 of
+        # Gemma 4's 24 (`<|channel>`, `<channel|>`, `<|think|>`, `<|"|>`, ...),
+        # while deleting harmless prose such as a literal "<mask>".  When the
+        # tokenizer is known its list is used verbatim instead of the pattern.
+        self.control_tokens: List[str] = []
+        tok = getattr(chat_template_formatter, "tokenizer", None)
+        if tok is not None:
+            try:
+                specials = set(getattr(tok, "all_special_tokens", []) or [])
+                for added in (getattr(tok, "added_tokens_decoder", {}) or {}).values():
+                    if getattr(added, "special", False):
+                        specials.add(added.content)
+                self.control_tokens = sorted(
+                    t for t in specials
+                    if isinstance(t, str) and len(t) > 2 and t.startswith("<") and t.endswith(">")
+                )
+            except Exception as e_tok:
+                logger.warning("Could not read special tokens from the tokenizer: %s", e_tok)
+
+        # Extra sampling fields passed through to the backend unchanged
+        # (repetition_penalty, presence_penalty, frequency_penalty).  Set by the
+        # API server from the client's request.
+        self.extra_request_params: Dict[str, Any] = {}
 
         # Real reason the generation ended; surfaced by the API server so a
         # truncated record is distinguishable from a complete one.
@@ -389,6 +432,10 @@ class ApiAntiSlopSampler:
         # generated position so we never pick the same word twice.
         # Key: generated_index (int) → set of raw token strings tried
         self._tried_alternatives = {}
+
+        # Token indices at which each (validator, rule) was banned in this run,
+        # to recognise a phrase the model keeps coming back to.
+        self._ban_history: Dict[Tuple[str, str], List[int]] = {}
 
         self.events: List[Dict[str, object]] = []
 
@@ -676,6 +723,7 @@ class ApiAntiSlopSampler:
         state: GenerationState,
         vio: ViolationInfo,
         final: bool = False,
+        emitted_upto: int = 0,
     ) -> bool:
         """Resample the violating token from its cached top-logprob list.
 
@@ -688,10 +736,31 @@ class ApiAntiSlopSampler:
         idx         = vio.violation_index
         banned_token   = vio.original_token_string
         lp_list     = state.get_logprobs(idx)
-        
+
         def _abort() -> bool:
             self._suppress_violation(vio)   # ← remember: vio is already in scope
             return False                       # [(token, logp)]
+
+        # A rewrite needs the model to regenerate everything after the rewritten
+        # token, because those tokens were sampled given the *old* one.  After
+        # generation has stopped there is no next request, so rewriting one token
+        # in place and keeping the stale tail splices two continuations together:
+        # "It was not fear, but hunger." -> "It was. fear, but hunger.", and every
+        # n-gram fix became "took deep breath".  Deleting the tail instead (the
+        # behaviour before 2026.11.02.1930) truncated the turn.  Neither is
+        # acceptable in a dataset, so a violation that is still present once
+        # generation is over is left as written.  The generation loops resolve
+        # end-of-text matches *before* accepting a stop, while they can still
+        # regenerate (see _resolve_before_stop).
+        if final:
+            logger.warning(
+                "Violation %r at token %d found after generation ended; leaving "
+                "the text as written rather than splicing in a replacement.",
+                vio.details.get("phrase") or vio.details.get("ngram_string")
+                or vio.details.get("pattern") if isinstance(vio.details, dict) else vio.details,
+                idx,
+            )
+            return _abort()
 
         if not lp_list:
             logger.error("Back-track failed — no logprobs available.")
@@ -705,6 +774,42 @@ class ApiAntiSlopSampler:
         ban_s = _scale_ban_strength(max(0.0, min(1.0, ban_s)))
         include_banned_scaled_global = (vio.validator_type in {"slop_phrase", "ngram"} and ban_s < 1.0)
 
+
+        # A phrase the context forces (a character called Mara against the
+        # one-word entry "mara", a place name, a word the user just used) cannot
+        # be avoided: each replacement is a junk token and the model writes the
+        # word again straight after it, so the reply fills with junk
+        # ("**\\\n\\\n\\\n..." in a real Gemma 4 run, bans at tokens 22, 23, 25).  The
+        # per-position budget never trips because every retry lands on a new
+        # index.  The signature is three bans of the same phrase at increasing
+        # positions, each at most 2 tokens after the previous one.  A model that
+        # merely likes a word returns to it in a new sentence ("flicker" at 87,
+        # 93, 96), which stays banned.  When it fires, roll back to the first of
+        # the three and allow that phrase for the rest of the request.
+        # Regex rules are excluded: their key is a whole pattern, not a phrase.
+        if vio.validator_type in ("slop_phrase", "ngram") and isinstance(vio.details, dict):
+            rule = str(vio.details.get("suppression_detail_key")
+                       or vio.details.get("phrase") or vio.details.get("ngram_string"))
+            hist = self._ban_history.setdefault((vio.validator_type, rule), [])
+            if not hist or idx > hist[-1]:
+                hist.append(idx)
+            last3 = hist[-3:]
+            if (len(last3) == 3 and last3[1] - last3[0] <= 2 and last3[2] - last3[1] <= 2
+                    and last3[0] >= emitted_upto):
+                first = last3[0]
+                logger.warning(
+                    "Back-track: %r was banned at tokens %s, each straight after the "
+                    "last replacement; the context forces it.  Rolling back to token %d "
+                    "and allowing it for the rest of this request.", rule, last3, first,
+                )
+                for v in self.validators:
+                    if getattr(v, "validator_type", None) == vio.validator_type:
+                        v._ignored.add((None, rule))
+                state.truncate(first)
+                for k in list(self._tried_alternatives):
+                    if k >= first:
+                        del self._tried_alternatives[k]
+                return True
 
         tried_here   = self._tried_alternatives.setdefault(idx, set())
         logger.warning(
@@ -777,6 +882,12 @@ class ApiAntiSlopSampler:
 
             constrained_pairs = []
             for tok, pt in pairs:
+                # vLLM's logprobs are computed before bad_words and stop handling,
+                # so the alternatives list end-of-turn and other control tokens.
+                # Choosing one puts e.g. `<turn|>` inside the assistant text, which
+                # the next restart sends upstream as a real end of turn.
+                if self._is_end_of_turn_token(tok):
+                    continue
                 if _is_same_banned(tok):
                     if include_banned_scaled_global:
                         pt *= (1.0 - ban_s)   # NEW: soft-ban scaling
@@ -895,6 +1006,8 @@ class ApiAntiSlopSampler:
                     continue
                 if _is_same_banned(tok) or tok in tried_here:   # NEW: consistent skip
                     continue
+                if self._is_end_of_turn_token(tok):
+                    continue
                 if not _is_valid(tok):
                     continue
                 
@@ -928,16 +1041,20 @@ class ApiAntiSlopSampler:
         # token can also expose a new violation further along, which the sweep's
         # next pass handles.
         tried_here.add(choice)
-        if final:
-            state.replace_token_string(idx, choice)
-        else:
-            state.truncate(idx + 1)
-            state.replace_token_string(idx, choice)
+        state.truncate(idx + 1)
+        state.replace_token_string(idx, choice)
 
-            # purge caches beyond idx
-            for k in list(self._tried_alternatives):
-                if k > idx:
-                    del self._tried_alternatives[k]
+        # purge caches beyond idx
+        for k in list(self._tried_alternatives):
+            if k > idx:
+                del self._tried_alternatives[k]
+        # Suppressions past idx refer to text that no longer exists.  Left in
+        # place, a regenerated occurrence of the same phrase that happens to land
+        # on the same token index would be let through silently.
+        for v in self.validators:
+            ignored = getattr(v, "_ignored", None)
+            if ignored:
+                v._ignored = {key for key in ignored if key[0] is None or key[0] <= idx}
 
         logger.warning(
             f"    ✓ replacement='{choice}' "
@@ -999,6 +1116,50 @@ class ApiAntiSlopSampler:
 
 
 
+    def _record_event(self, vio: ViolationInfo, fixed: bool) -> None:
+        event = {
+            "type":  vio.validator_type,
+            "index": vio.violation_index,
+            "details": vio.details,
+            "original_token_string": vio.original_token_string,
+            "fixed": fixed,
+        }
+        self.events.append(event)
+        if self.on_ban_event_callback:
+            try:
+                self.on_ban_event_callback(event)
+            except Exception as e_cb:
+                logger.error("Error in on_ban_event_callback: %s", e_cb, exc_info=True)
+
+    def _resolve_before_stop(self, state: GenerationState, emitted_upto: int,
+                             can_restart: bool) -> bool:
+        """Settle end-of-text violations before a stop is accepted.
+
+        While the text grows, a match that touches its end is provisional (the
+        next token may extend the word), and the n-gram validator defers almost
+        everything.  Once the model stops, those matches are definitive.  This is
+        the last moment a back-track can still be followed by regeneration, so
+        fix them here rather than in a post-generation sweep.
+
+        Returns True when a token was rewritten and the tail truncated: the
+        caller must resume generation from there instead of ending the turn.
+        A violation that cannot be regenerated (already emitted, or no restart
+        budget left) is suppressed and the text is left as written.
+        """
+        for _ in range(64):
+            vio = self._run_validators(state, final=True)
+            if not vio:
+                return False
+            if can_restart and vio.violation_index >= emitted_upto:
+                fixed = self._perform_backtrack(state, vio, emitted_upto=emitted_upto)
+                self._record_event(vio, fixed)
+                if fixed:
+                    return True
+                continue          # _perform_backtrack suppressed it
+            self._suppress_violation(vio)
+            self._record_event(vio, False)
+        return False
+
     def _suppress_violation(self, vio: ViolationInfo) -> None:
         for v in self.validators:
             if getattr(v, "validator_type", None) == vio.validator_type:
@@ -1029,9 +1190,12 @@ class ApiAntiSlopSampler:
     # ------------------------------------------------------------------ #
     def _new_scrubber(self) -> SpecialTokenScrubber:
         """Fresh text-level scrubber for one generation run."""
+        pattern = self.special_token_pattern
+        if pattern is None and self.control_tokens:
+            pattern = ""          # exact list from the tokenizer instead
         return SpecialTokenScrubber(
-            markers=self.end_of_turn_markers,
-            pattern=self.special_token_pattern,
+            markers=list(self.end_of_turn_markers) + self.control_tokens,
+            pattern=pattern,
         )
 
     def _is_end_of_turn_token(self, token: str) -> bool:
@@ -1096,7 +1260,13 @@ class ApiAntiSlopSampler:
             return text.endswith("\n")
         if not self.stop_on_clean_end:
             return False
-        return stripped.endswith(self.clean_end_chars)
+        if stripped.endswith(self.clean_end_chars):
+            return True
+        # An emoji or other symbol (\u2665, \U0001F60F) is a deliberate ending.
+        last = stripped[-1]
+        if last in "\ufe0f\u200d" and len(stripped) > 1:
+            last = stripped[-2]
+        return unicodedata.category(last) in ("So", "Sk", "Sm")
 
     def _hit_stop_sequence(self, text: str) -> bool:
         if not self.stop_sequences or not text:
@@ -1221,6 +1391,15 @@ class ApiAntiSlopSampler:
         effective_top_p = self.top_p if top_p is None else top_p
         effective_top_k = self.top_k if top_k is None else top_k
 
+        # Back-tracking resamples from cached logprobs with self.temperature /
+        # min_p / top_p / top_k.  Those held the config-file values, so with a
+        # client that sends its own settings (SDG does) a replacement token was
+        # drawn under different sampling than the rest of the reply.
+        self.temperature = max(effective_temperature, 1e-3)
+        self.min_p = effective_min_p
+        self.top_p = effective_top_p
+        self.top_k = effective_top_k
+
         # fresh early-stop safety-valve budget for this generation run
         self._consecutive_stops = 0
         self._no_progress_attempts = 0
@@ -1308,20 +1487,29 @@ class ApiAntiSlopSampler:
         # Set when a stop is refused: the *next* attempt is a continuation and its
         # text must be held back until its own stop is seen.
         next_is_continuation = False
+        # Set only when the backend *stopped* and the sampler refused the stop.
+        # A `length` finish (the per-request budget, including the capped
+        # suppressed attempt itself) also leads to a continuation, but the model
+        # did not try to end its turn there, so it must not ban the marker.
+        suppress_next = False
+        transport_failed = False
 
         while state.get_generated_length() < max_new_tokens:
             # Each iteration starts as a fresh attempt.  The stop handler sets the
             # continuation flag for the attempt it asks for.
             continuation_attempt = next_is_continuation
             next_is_continuation = False
+            suppress_this = suppress_next
+            suppress_next = False
             attempts += 1
             if attempts > self.max_stream_attempts:
                 logger.error(
                     "Reached max_stream_attempts=%d; ending generation with "
-                    "%d tokens (finish_reason will be reported as 'length').",
-                    self.max_stream_attempts, state.get_generated_length(),
+                    "%d tokens.", self.max_stream_attempts, state.get_generated_length(),
                 )
-                self.finish_reason = "length"
+                # Out of attempts because the backend kept failing is an error,
+                # not a length cap: the client must not store the text as a reply.
+                self.finish_reason = "error" if transport_failed else "length"
                 break
             if backtrack_restarts > self.max_backtrack_restarts:
                 logger.error(
@@ -1351,12 +1539,19 @@ class ApiAntiSlopSampler:
             # a premature EOS the continuation prompt ends exactly where the
             # model already chose to stop, so without this the same token wins
             # the argmax again and every restart is wasted.
+            # Only the attempt that directly follows a refused stop is affected.
+            # This used to test `attempts > 1`, which stays true for the rest of
+            # the generation after one refused stop (or one dropped connection),
+            # so the model could never end its turn again and wrote until
+            # max_tokens: the repetition loops and long tails in the dataset.
             suppress = None
-            if self.restart_suppress_markers and self.end_of_turn_markers and attempts > 1:
+            if (self.restart_suppress_markers and self.end_of_turn_markers
+                    and suppress_this):
                 if not getattr(self.api_client, "suppress_tokens_unsupported", False):
                     suppress = self.end_of_turn_markers
+                    remaining = min(remaining, self.restart_suppress_window)
 
-            stream_kwargs = {}
+            stream_kwargs = dict(self.extra_request_params)
             if suppress:
                 stream_kwargs["suppress_tokens"] = suppress
 
@@ -1446,7 +1641,7 @@ class ApiAntiSlopSampler:
                             pass
 
                         time.sleep(0.1)
-                        fixed = self._perform_backtrack(state, vio)
+                        fixed = self._perform_backtrack(state, vio, emitted_upto=last_yield)
 
                         logger.info(
                             "Backtracking complete (fixed=%s), resuming generation. "
@@ -1597,12 +1792,26 @@ class ApiAntiSlopSampler:
                         break
                 continue
 
+            # The clean-end test looks at the whole reply, as chunk mode does.
+            # Judging only this attempt's text made an immediate stop on a retry
+            # (empty attempt) look like a mid-sentence stop, so a finished reply's
+            # stop was refused again.
             if self._handle_stop(
                 reason,
                 had_eos_marker=saw_eos_marker,
-                attempt_text=attempt_text,
+                attempt_text=state.get_generated_text(),
                 produced_tokens=produced_tokens,
             ):
+                if self._resolve_before_stop(
+                    state, last_yield,
+                    backtrack_restarts < self.max_backtrack_restarts
+                    and state.get_generated_length() < max_new_tokens,
+                ):
+                    backtrack_restarts += 1
+                    attempts -= 1
+                    regex_since = 0
+                    accepted_text = state.get_generated_text()
+                    continue
                 # The stop is genuine, so anything held back during this attempt
                 # was real continuation text after all.  Flush it now.
                 if continuation_attempt:
@@ -1678,13 +1887,14 @@ class ApiAntiSlopSampler:
             # The stop was refused, so the next attempt is a continuation and its
             # text must be held back until its own stop is seen.
             next_is_continuation = True
+            suppress_next = reason in ("stop", "stream_end")
 
             # Final sweep: the tail may still violate a regex.
             if regex_since > 0:
                 vio = self._run_validators(state)
                 if vio:
                     time.sleep(0.1)
-                    fixed = self._perform_backtrack(state, vio)
+                    fixed = self._perform_backtrack(state, vio, emitted_upto=last_yield)
                     event = {
                         "type":  vio.validator_type,
                         "index": vio.violation_index,
@@ -1706,6 +1916,10 @@ class ApiAntiSlopSampler:
                     if last_yield > state.get_generated_length():
                         last_yield = state.get_generated_length()
                     regex_since = 0
+                    # The back-track deleted part of the accepted text.  Judging
+                    # the regenerated tail against the old text would roll back
+                    # a rewrite of the same sentence as a "repetition".
+                    accepted_text = state.get_generated_text()
 
         # ---------------- final validation sweep --------------------------
         # Validators defer a match that touches the end of the text while the
@@ -1790,6 +2004,7 @@ class ApiAntiSlopSampler:
         refused_fragments: List[str] = []
         continuation_chunk = False
         next_is_continuation = False
+        chunk_restarts = 0
 
         def release(text: str, final: bool = False) -> Optional[str]:
             nonlocal pending_scrub
@@ -1838,6 +2053,7 @@ class ApiAntiSlopSampler:
                         min_p           = min_p,
                         timeout         = self.timeout,
                         stop_sequences  = self.stop_sequences,
+                        **self.extra_request_params,
                     )
                     api_sec = time.perf_counter() - t0
                     break  # success
@@ -1934,7 +2150,7 @@ class ApiAntiSlopSampler:
             vio = self._run_validators(state)
             #print('val 1st run', time.time() - t)
             if vio:
-                fixed = self._perform_backtrack(state, vio)
+                fixed = self._perform_backtrack(state, vio, emitted_upto=last_yield_idx)
 
                 event = {
                     "type":  vio.validator_type,
@@ -2002,6 +2218,16 @@ class ApiAntiSlopSampler:
                     attempt_text=state.get_generated_text(),
                     produced_tokens=newly_accepted > 0,
                 ):
+                    if self._resolve_before_stop(
+                        state, last_yield_idx,
+                        chunk_restarts < self.max_backtrack_restarts
+                        and (max_new_tokens is None
+                             or state.get_generated_length() < max_new_tokens),
+                    ):
+                        chunk_restarts += 1
+                        accepted_text = state.get_generated_text()
+                        continuation_chunk = next_is_continuation = False
+                        continue
                     # The stop is genuine; flush whatever the continuation chunk
                     # was holding back.
                     if continuation_chunk:

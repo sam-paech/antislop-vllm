@@ -79,15 +79,26 @@ def _regex_search_worker(args: Tuple[str, int, str]) -> Optional[Tuple[str, int,
     if compiled is None:
         compiled = re.compile(pattern_str, flags)
         _worker_cache[key] = compiled
-    m = compiled.search(text)
-    if not m:
-        return None
-    return (m.lastgroup, m.start(), m.group(0))
+    # Return several matches, earliest first, so the caller can pass over one it
+    # has suppressed.  Returning only the first meant a suppressed match hid
+    # every later violation for the rest of the request.
+    out = []
+    for m in compiled.finditer(text):
+        out.append((m.lastgroup, m.start(), m.group(0)))
+        if len(out) >= 32:
+            break
+    return out or None
 
 
 # --------------------------------------------------------------------------- #
 #  Validator                                                                  #
 # --------------------------------------------------------------------------- #
+_APOSTROPHES = str.maketrans({"\u2019": "'", "\u2018": "'", "\u02bc": "'"})
+
+
+_APOSTROPHES = str.maketrans({"\u2019": "'", "\u2018": "'", "\u02bc": "'"})
+
+
 class RegexValidator(BaseValidator):
     """
     Hard-ban validator driven by an arbitrary list of regular-expression
@@ -146,7 +157,9 @@ class RegexValidator(BaseValidator):
         if self._big_re is None or state.get_generated_length() == 0:
             return None
 
-        text = state.get_generated_text()
+        # Fold typographic apostrophes so `it'?s` also matches "it’s".  The fold
+        # is one character for one, so offsets still index the original text.
+        text = state.get_generated_text().translate(_APOSTROPHES)
 
         # ── timing probe ---------------------------------------------------
         t0 = time.perf_counter()
@@ -168,20 +181,20 @@ class RegexValidator(BaseValidator):
         if result is None:
             return None
 
-        gname, violation_char_pos, matched_text_segment = result
-        violated_raw_pattern = self._group2raw.get(gname, "?")
-
-        tok_idx = self._char_to_token_index(state, violation_char_pos)
-        if tok_idx is None:
-            logger.warning(
-                "RegexValidator: Could not map char_pos %d to token index for "
-                "pattern '%s'.",
-                violation_char_pos,
-                violated_raw_pattern,
-            )
-            return None
-
-        if self._is_ignored(tok_idx, violated_raw_pattern):
+        for gname, violation_char_pos, matched_text_segment in result:
+            violated_raw_pattern = self._group2raw.get(gname, "?")
+            tok_idx = self._char_to_token_index(state, violation_char_pos)
+            if tok_idx is None:
+                logger.warning(
+                    "RegexValidator: Could not map char_pos %d to token index for "
+                    "pattern '%s'.",
+                    violation_char_pos,
+                    violated_raw_pattern,
+                )
+                continue
+            if not self._is_ignored(tok_idx, violated_raw_pattern):
+                break
+        else:
             return None
 
         logger.warning(

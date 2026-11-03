@@ -49,6 +49,7 @@ SUITES = (
     "test_ngram_toggle",
     "test_sampler_filters",
     "test_truncation_and_repetition",
+    "test_audit_fixes",
 )
 
 # Grace period between SIGTERM and SIGKILL when a suite overruns.

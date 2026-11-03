@@ -91,6 +91,10 @@ _DEFAULT_SPECIAL_TOKEN_PATTERN = (
     r"|im_start|im_end|im_sep"
     r"|begin_of_text|end_of_text|start_header_id|end_header_id"
     r"|tool_call|tool_response|tool_result|function_call"
+    # Gemma 4: <|channel>, <channel|>, <|think|>, <|tool>, <|"|>, media markers.
+    # Used only when no tokenizer is loaded; with one, its own special-token
+    # list replaces this pattern (see ApiAntiSlopSampler.control_tokens).
+    r"|channel|think|tool|image|audio|video|\""
     r"|file_separator|pad|unk|bos|eos|sep|cls|mask"
     r")\|?>"
 )

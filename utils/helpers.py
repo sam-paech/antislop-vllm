@@ -189,7 +189,7 @@ def merge_configs(base_cfg: Dict[str, Any], cli_args: argparse.Namespace) -> Dic
         "regex_blocklist_file", "logging_level",
         "chat_template_model_id",
         "chat_template_enable_thinking",
-        "force_backtrack", "prompt_template",
+        "prompt_template",
         "system_prompt", "enable_refusal_detection",
         "refusals_file", "ban_strength",
     ]
@@ -197,6 +197,11 @@ def merge_configs(base_cfg: Dict[str, Any], cli_args: argparse.Namespace) -> Dic
     for key in scalar_keys:
         if args_dict.get(key) is not None:
             cfg[key] = args_dict[key]
+
+    # The sampler reads backtracking.force_backtrack.  The flag used to be
+    # written to a top-level key nobody read, so --force-backtrack did nothing.
+    if args_dict.get("force_backtrack") is not None:
+        cfg.setdefault("backtracking", {})["force_backtrack"] = args_dict["force_backtrack"]
     
     # Batch mode specific args (these don't typically exist in base_cfg but are used by the script)
     batch_keys = [

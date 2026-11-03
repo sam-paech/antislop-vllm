@@ -76,11 +76,14 @@ def setup_shared_resources(
     # NOTE: these keys live under `generation_params` in the YAML, so read that
     # first and only fall back to the top level for pre-flattened dicts.
     gen_params = config.get("generation_params", {}) or {}
+    # generation_params.threads comes before the top-level `threads`: the CLI
+    # always writes a top-level threads (its default is 1), which used to win
+    # and cap the server at one concurrent generation.
     max_concurrent = (
         config.get("max_concurrent_requests")
         or gen_params.get("max_concurrent_requests")
-        or config.get("threads")
         or gen_params.get("threads")
+        or config.get("threads")
         or 1
     )
     max_concurrent = max(1, int(max_concurrent))
@@ -123,29 +126,53 @@ def _run_generation_for_request(
 
     prompt_text = ""
     if chat_formatter and hasattr(chat_formatter, 'tokenizer'):
-        # Use the tokenizer's chat template application for robust formatting
+        # Use the tokenizer's chat template application for robust formatting.
+        # Per-request template switches (enable_thinking, ...) are honoured the
+        # way vLLM's own chat endpoint honours them; they used to be dropped.
+        template_kwargs = request_data.get("chat_template_kwargs") or {}
+        if not isinstance(template_kwargs, dict):
+            template_kwargs = {}
         try:
-            prompt_text = chat_formatter.build_base_prompt_from_messages(messages)
+            prompt_text = chat_formatter.build_base_prompt_from_messages(
+                messages, **template_kwargs
+            )
         except Exception as e:
             logger.error(f"Error applying chat template: {e}", exc_info=True)
             return {"error": f"Failed to apply chat template: {e}"}
     else:
-        # Fallback: simple concatenation if no chat template is configured.
-        # We'll just take the last user message as the prompt.
-        last_user_message = next((m['content'] for m in reversed(messages) if m.get('role') == 'user'), None)
-        if not last_user_message:
-             return {"error": "No user message found in 'messages'"}
-        prompt_text = last_user_message
+        # This used to fall back to the last user message alone, silently
+        # dropping the system prompt and the whole conversation history.
+        return {
+            "error": "no chat template configured",
+            "http_status": 500,
+            "error_body": json.dumps({"error": (
+                "antislop server has no chat template (set chat_template_model_id); "
+                "refusing to drop the system prompt and conversation history"
+            )}),
+            "content_type": "application/json",
+        }
 
     # --- 2. Instantiate Sampler ---
     # Sampler is created per-request to ensure thread safety of its internal state
-    sampler = ApiAntiSlopSampler(
-        api_client=api_client,
-        validators=validators,
-        config=config,
-        tiktoken_model_name_for_counting=tiktoken_model_name,
-        chat_template_formatter=chat_formatter
-    )
+    try:
+        sampler = ApiAntiSlopSampler(
+            api_client=api_client,
+            validators=validators,
+            config=config,
+            tiktoken_model_name_for_counting=tiktoken_model_name,
+            chat_template_formatter=chat_formatter
+        )
+    except Exception as e:
+        # The stream-logprobs probe runs here.  Raised outside a handler it
+        # surfaced as an unhandled ASGI exception instead of an error body the
+        # client can read and retry on.
+        logger.error(f"Could not start a generation: {e}")
+        return {
+            "error": f"Could not start a generation: {e}",
+            "http_status": 502,
+            "error_body": json.dumps({"error": str(e)}),
+            "content_type": "application/json",
+        }
 
     # --- 3. Extract per-request generation parameters ---
     max_tokens_req = request_data.get("max_tokens")
@@ -164,6 +191,15 @@ def _run_generation_for_request(
         sampler.stop_sequences = configured + [
             str(s) for s in stop_req if str(s)
         ] or None
+
+    # Sampling fields the sampler does not implement itself are forwarded to the
+    # backend.  They used to be dropped, so a client's repetition_penalty never
+    # reached vLLM through this proxy (while it did when the client called vLLM
+    # directly).  `seed` is deliberately not forwarded: every restart re-sends
+    # the request, and a fixed seed would replay the same continuation.
+    for key in ("repetition_penalty", "presence_penalty", "frequency_penalty"):
+        if request_data.get(key) is not None:
+            sampler.extra_request_params[key] = request_data[key]
 
     # Override ban_strength if provided in request
     ban_strength_req = request_data.get("ban_strength")
@@ -223,10 +259,31 @@ def _run_generation_for_request(
         }
 
 
+    # A generation that ended because the backend failed is not an answer.
+    # Returning it with HTTP 200 (finish_reason "error") let a client that does
+    # not read finish_reason store an empty or cut-off turn as a real one.
+    if sampler.finish_reason == "error":
+        return {
+            "error": "backend failed during generation",
+            "http_status": 502,
+            "error_body": json.dumps({"error": "backend failed during generation",
+                                      "partial_text_chars": len(full_response)}),
+            "content_type": "application/json",
+        }
+
     # --- 5. Token Counting for Usage ---
     prompt_tokens = 0
     completion_tokens = 0
-    if sampler.tiktoken_encoding:
+    model_tok = getattr(chat_formatter, "tokenizer", None)
+    if model_tok is not None and callable(model_tok):
+        # Count with the model's tokenizer; tiktoken's cl100k is a different
+        # vocabulary and misstates usage for any non-OpenAI model.
+        try:
+            prompt_tokens = len(model_tok(prompt_text, add_special_tokens=False)["input_ids"])
+            completion_tokens = len(model_tok(full_response, add_special_tokens=False)["input_ids"])
+        except Exception as e:
+            logger.warning(f"Could not count tokens for usage stats: {e}")
+    elif sampler.tiktoken_encoding:
         try:
             prompt_tokens = len(sampler.tiktoken_encoding.encode(prompt_text))
             completion_tokens = len(sampler.tiktoken_encoding.encode(full_response))

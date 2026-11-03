@@ -102,7 +102,7 @@ class ChatTemplateFormatter:
                                                 add_generation_prompt=True)
             return templated_prompt
 
-    def build_base_prompt_from_messages(self, messages) -> str:
+    def build_base_prompt_from_messages(self, messages, **template_kwargs) -> str:
         # Make a copy to avoid modifying the original
         messages_copy = messages.copy()
         
@@ -113,5 +113,6 @@ class ChatTemplateFormatter:
         with self._lock:
             templated_prompt = self._apply_chat_template(messages_copy,
                                                 tokenize=False,
-                                                add_generation_prompt=True)
+                                                add_generation_prompt=True,
+                                                **template_kwargs)
             return templated_prompt

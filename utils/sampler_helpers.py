@@ -56,7 +56,9 @@ def apply_sampling_filters(
                 break
         pairs = nucleus
 
-    if top_k is not None and len(pairs) > top_k:
+    # vLLM uses top_k = -1 (and 0) for "disabled"; slicing with it dropped the
+    # least likely candidate or returned nothing.
+    if top_k is not None and top_k > 0 and len(pairs) > top_k:
         pairs = sorted(pairs, key=lambda pair: pair[1], reverse=True)[:top_k]
 
     return pairs

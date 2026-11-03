@@ -102,7 +102,10 @@ generation_params:
   # that guarantees no truncation, at the cost of occasionally running past the
   # end of the turn.
   stop_on_clean_end: true
-  # clean_end_chars: [".", "!", "?", "…", '"', "'", ")", "]", "}", "\n"]
+  # Default also counts roleplay endings (`*`, `_`, `~`, dashes, `:`, `;`, `»`,
+  # a backtick) and a trailing emoji or other symbol as clean:
+  # clean_end_chars: [".", "!", "?", "…", '"', "'", "”", "’", ")", "]", "}", "\n",
+  #                   "*", "_", "~", "—", "–", ":", ";", "»", "`"]
 
   # Max CONSECUTIVE early stops that produced no new tokens before we give up
   # (safety valve against a model that re-emits EOS forever).  An early stop
@@ -127,11 +130,17 @@ generation_params:
   # response that back-tracks forever.
   max_backtrack_restarts: 200
 
-  # Ask the backend to suppress the end-of-turn markers on RESTART requests
-  # (`bad_words`).  After a premature EOS the continuation prompt ends where
-  # the model already chose to stop, so without this every restart is wasted.
+  # Ask the backend to suppress the end-of-turn markers (`bad_words`) on the one
+  # attempt that follows a refused stop.  `bad_words` holds for the whole
+  # request, so on that attempt the model cannot end its turn at all: when the
+  # reply was in fact finished, it pads it with whatever it writes instead
+  # (stock phrases, stage directions, a new turn).  Off by default; when on, the
+  # attempt is capped at `restart_suppress_window` tokens.  Without it, a model
+  # that really meant to stop re-emits its end-of-turn marker, which counts as a
+  # no-progress stop and ends the turn after `max_consecutive_stops`.
   # Backends that reject `bad_words` disable this automatically.
-  restart_suppress_markers: true
+  restart_suppress_markers: false
+  restart_suppress_window: 32
 
   # Probe the backend once for streamed logprobs.  The result is cached per
   # endpoint; set to false to skip the extra round-trip entirely.
