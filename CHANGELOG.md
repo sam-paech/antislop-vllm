@@ -9,6 +9,301 @@ so every entry is ordered and unambiguous without a manual version bump.
 
 ---
 
+## [2026.11.03.0025] — remove the duplicated `skip` block and `_APOSTROPHES` table
+
+Follow-up to `2026.11.02.2357`.  The audit's patch script was re-run after partial
+failures, and its re-run guard could not see that two replacements had already been
+applied — each replacement's new text contains the text it replaced, so the guard
+always matched.  Both duplications were redundant rather than wrong, and neither
+changed behaviour: the suite is green with and without this commit (24/24 in
+`tests/test_audit_fixes.py`).
+
+### Fixed — duplicated code left behind by the audit patch
+
+* `utils/slop_helpers.py`: the `skip` check in `detect_disallowed_sequence()` was
+  pasted **three** times.  Two copies are removed; the one that remains is in the
+  position the check needs to be, before the word-boundary tests and the early
+  `return`.
+* `validators/regex_validator.py`: the module-level `_APOSTROPHES` translation table
+  was defined **twice**, back to back.  One definition remains.
+
+### Note — what the duplication did and did not cost
+
+No behaviour, configuration or API change: no match was missed, no match fired twice
+at the boundary tests, and nothing in this entry affects how a response is generated or
+validated.
+
+It was not entirely free, though.  Because each copy ran before the boundary tests and
+the early `return`, the callback was invoked once per copy on every candidate that
+reached that point.  Measured directly against the same input (`"the pilgrim walked
+on"`, phrase `grim`, a `skip` that suppresses nothing): `12648ff` called `skip()`
+**3 times**, this commit calls it **once**.  `SlopPhraseValidator` passes a lambda that
+resolves a character offset to a token index and consults `_ignored`, so the cost was
+paid on the scanning hot path for every candidate phrase in the window.
+
+This is worth recording anyway, because a duplicated `skip` check is the kind of thing
+that reads as intentional and survives review — and because the patch-script re-run is
+the mechanism that produced it.
+
+---
+
+## [2026.11.02.2357] — stop policy, back-track splicing and control-token leaks (audit of `aba6cfb`)
+
+An A/B report against `dev @ aba6cfb` (287 conversations) found degenerate repetition
+loops, `word.word`-style joins, longer tails than the same client produced against
+vLLM directly, and `of course` leaking into user turns.  Every item below was
+reproduced from that report before being fixed.  The new suite is
+`tests/test_audit_fixes.py` (24 tests): 22 of them fail on `aba6cfb`, and the suite
+passes 24/24 on this commit.  The two that already passed there are the negative
+cases — `test_a_phrase_the_model_merely_likes_stays_banned` and
+`test_the_guard_never_disables_a_regex_rule` — which assert that the forced-phrase
+guard does *not* fire, and so hold trivially when the guard does not exist yet.
+
+### Fixed — one refused stop disabled the end-of-turn marker for the whole run
+
+`_generate_streamwise` decided whether to send the markers as `bad_words` with
+`attempts > 1`.  That stays true for the rest of the generation after a single
+refused stop **or a single dropped connection**, so from then on the model could
+not end its turn at all and wrote until `max_tokens`.  This is the repetition loop
+and the long tail in the dataset: the reply was finished, the stop was refused once,
+and everything after that was padding.
+
+* The ban now applies only to the one attempt that directly follows a refused stop
+  (`suppress_next`, set from the stop reason), and that attempt is capped at the new
+  `restart_suppress_window` (default 32 tokens).
+* `restart_suppress_markers` now defaults to **`false`**.  `bad_words` holds for the
+  whole request, so on the banned attempt the model cannot end its turn even when it
+  meant to; a model that really wants to stop simply re-emits its marker, which
+  counts as a no-progress stop and ends the turn after `max_consecutive_stops`.
+* A `length` finish (including the capped attempt itself) also leads to a
+  continuation, but the model did not try to end there, so it no longer sets the ban.
+
+### Fixed — roleplay endings were refused as mid-sentence stops
+
+The default `clean_end_chars` only listed prose punctuation, so a reply that ended on
+an `*action*`, a trailing `~`, a dash, a colon or an emoji was judged unfinished, its
+stop was refused, and the model was asked to keep writing.
+
+* The default now also accepts `*`, `_`, `~`, `—`, `–`, `:`, `;`, `»`, a backtick,
+  the typographic quotes `”`/`’`, and a trailing character in Unicode category `So`,
+  `Sk` or `Sm` (an emoji or other symbol), skipping a variation selector or ZWJ first.
+* In stream mode the clean-end test now looks at the **whole reply**
+  (`state.get_generated_text()`) instead of only the current attempt.  Judging the
+  attempt alone made an immediate stop on a retry — an empty attempt — look
+  mid-sentence, so a finished reply's stop was refused again.
+
+### Fixed — a post-generation back-track spliced two continuations together
+
+`2026.11.02.1930` made the final sweep rewrite a token in place instead of deleting
+the tail, which fixed truncation but produced `It was not fear` → `It was. fear` and
+turned every n-gram fix into `took deep breath`.  Neither the splice nor the
+truncation is acceptable in a dataset.
+
+* End-of-text violations are now resolved **before a stop is accepted**, by the new
+  `_resolve_before_stop()`, while a back-track can still be followed by a
+  regeneration.  Both generation loops call it and, when it rewrote a token, resume
+  generation from there instead of ending the turn.
+* `_perform_backtrack(final=True)` no longer rewrites anything.  A violation that is
+  still present once generation is over is logged and left as written, because no
+  replacement exists that is consistent with the text around it.
+* A back-track now takes `emitted_upto`, the last token already sent to the client.
+  Text that has been yielded cannot be taken back, so it is never rolled back into.
+* This supersedes the "the sweep keeps the tail" behaviour described under
+  `2026.11.02.1930`: the sweep still does not truncate, but it is no longer the
+  mechanism that repairs a turn — the pre-stop resolution is.
+
+### Fixed — a back-track could pick the end-of-turn token as the replacement
+
+vLLM computes logprobs **before** applying `bad_words` and stop handling, so the
+candidate list includes `<turn|>` and other control tokens.  Choosing one put
+`<turn|>` inside the assistant text, and the next restart sent it upstream as a real
+end of turn — the record then continued as a new turn.
+
+* `_is_end_of_turn_token()` candidates are skipped in both the constrained and the
+  unconstrained replacement pass.
+* `_new_scrubber()` scrubs the model's own control tokens.  The list is read from the
+  chat-template tokenizer (`all_special_tokens` plus every `added_tokens_decoder`
+  entry with `special=True`); the built-in pattern named a fixed set of families and
+  missed 13 of Gemma 4's 24 (`<|channel>`, `<channel|>`, `<|think|>`, `<|"|>`, …)
+  while deleting harmless prose such as a literal `<mask>`.  When a tokenizer is
+  known its list replaces the pattern entirely.
+* The fallback pattern in `state/generation_state.py` gained the Gemma 4 family
+  (`channel`, `think`, `tool`, `image`, `audio`, `video`, `"`) for the no-tokenizer
+  case.
+
+### Fixed — a phrase the context forces caused a junk loop
+
+A character called Mara against the one-word entry `mara`, a place name, or a word the
+user just used cannot be avoided: each replacement is a junk token and the model
+writes the word again straight after it.  A real Gemma 4 run filled the reply with
+`**` followed by a run of `\n` junk tokens (bans at tokens 22, 23, 25).  The
+per-position budget never trips because every retry lands on a new index.
+
+* `_ban_history` records the token index of every ban per `(validator, rule)`.  Three
+  bans of the same phrase at increasing positions, each at most 2 tokens after the
+  previous one, is the junk-loop signature: the back-track rolls back to the first of
+  the three and allows that phrase for the rest of the request.
+* The guard is deliberately narrow.  A model that merely *likes* a word returns to it
+  in a new sentence (`flicker` at 87, 93, 96) and stays banned, and regex rules are
+  excluded because their key is a whole pattern rather than a phrase.
+* It never rolls back into text already sent to the client (`emitted_upto`).
+* Whole-request suppression is the `(None, key)` form in `BaseValidator._is_ignored`,
+  which all three validators now honour.
+
+### Fixed — back-tracking resampled under different sampling parameters
+
+`_perform_backtrack` draws from cached logprobs using `self.temperature`, `min_p`,
+`top_p` and `top_k`, and those kept the **config-file** values.  A client that sends
+its own settings (SDG does) therefore got replacement tokens drawn under different
+sampling than the rest of the reply — the "B != A with the same client settings"
+report.
+
+* The four attributes are updated from the effective per-request values at the top of
+  each generation.
+
+### Fixed — suppressions outlived the text they referred to
+
+* `_perform_backtrack` now drops `_ignored` entries for token indices past the
+  rewritten one.  Left in place, a regenerated occurrence of the same phrase landing
+  on the same index was let through silently.
+
+### Fixed — a suppressed match hid every later one
+
+All three validators returned the **earliest** match unconditionally, so once one
+match at that position was suppressed, later violations in the same window were never
+reported.
+
+* `detect_disallowed_sequence()` takes a `skip` callback and keeps scanning past a
+  match it has already suppressed.
+* `SlopPhraseValidator` passes `skip=`, `RegexValidator`'s worker returns up to 32
+  matches (`finditer`) instead of the first, and `NGramValidator` builds a candidate
+  list, sorts it (earliest first, longer n-gram on a tie) and takes the first
+  non-suppressed entry.
+
+### Fixed — `_is_repetition` compared characters, not words
+
+`needle in " ".join(existing_words)` matched `he said` inside `she said`, so a genuine
+continuation was rolled back as a repetition.
+
+* Both sides are normalised to `" " + " ".join(text.lower().split()) + " "` before the
+  containment test.
+
+### Fixed — the n-gram validator never fired while streaming
+
+The deferral test was `last_end >= len(text.rstrip()) and last_start >= violation_char_pos`,
+which is true for practically any text, so every n-gram was deferred and only ever
+caught after generation ended.
+
+* The deferral now applies only when the violating n-gram's **last** word is the
+  still-growing final word of the text (`raw_idx_of_last_word == last_raw_idx` and
+  `last_end >= text_end`).
+* `word_str.rstrip(".")` is applied before the `isalpha()` filter.  Treebank only
+  splits off a sentence-final period, so a word before a mid-text period arrived as
+  `eyes.`, failed `isalpha()`, and vanished — breaking any n-gram that ended a sentence.
+* `_ensure_nltk_data()` catches `LookupError` only.  `nltk.downloader.DownloadError`
+  does not exist in current nltk, so naming it raised `AttributeError` **while
+  handling** the `LookupError` and importing `validators` failed on any machine
+  without the data.  `punkt_tab` is fetched alongside `punkt`.
+
+### Fixed — the slop scan window started mid-word
+
+A window that began mid-word treated its first character as a boundary, so single-word
+entries fired inside longer words as the window slid (`grim` in `pilgrim`, `aria` in
+`Maria`) and each false hit discarded ~50 good tokens.
+
+* The window start is walked back to a word boundary before scanning.
+
+### Fixed — typographic apostrophes never matched
+
+The ban lists are written with ASCII `'`, so `couldn’t help but` (U+2019) never
+matched `couldn't help but`.
+
+* `utils/slop_helpers.fold_for_matching()` folds `’`, `‘`, `ʼ`, `“`, `”` to ASCII and
+  lower-cases **without changing the length** (`str.lower()` can lengthen a string —
+  `İ` becomes two characters — which shifted every later offset and blamed the wrong
+  token).  `SlopPhraseValidator` folds its keys the same way at construction.
+* `RegexValidator` folds the apostrophes in the text it matches, one character for one
+  character, so `it'?s` also matches `it’s`.
+
+### Fixed — configuration keys read from the wrong level
+
+* `--force-backtrack` was written to a top-level key nobody read, so the flag did
+  nothing.  `merge_configs()` now writes `backtracking.force_backtrack`.
+* `match_requires_word_boundaries` is documented under `generation_params` but was
+  read only at the top level.  It is now read from there first, with the top level as
+  a fallback.
+* `top_k: -1` and `top_k: 0` mean *disabled* in vLLM.  `apply_sampling_filters()`
+  sliced with them, dropping the least likely candidate or returning nothing; the
+  slice now applies only when `top_k > 0`.
+
+### Fixed — the API server
+
+* **The chat template is required.** Without one the server used to fall back to the
+  last user message alone, silently dropping the system prompt and the whole
+  conversation history.  It now refuses the request with HTTP 500 and an explanatory
+  body.
+* **A backend failure is a 502.**  A generation that ended with `finish_reason='error'`
+  was returned with HTTP 200, so a client that does not read `finish_reason` stored an
+  empty or cut-off turn as a real one.  It now returns 502 with
+  `partial_text_chars`.
+* **Sampler construction is wrapped.**  The stream-logprobs probe runs in the
+  constructor; raised outside a handler it surfaced as an unhandled ASGI exception
+  instead of an error body the client can read and retry on.  It is now a 502.
+* **`chat_template_kwargs`** from the request are passed through to
+  `build_base_prompt_from_messages(..., **template_kwargs)`, so per-request template
+  switches (`enable_thinking`, …) are honoured the way vLLM's own chat endpoint
+  honours them.  They used to be dropped.
+* **`repetition_penalty`, `presence_penalty` and `frequency_penalty`** are forwarded to
+  the backend via `sampler.extra_request_params`, which is merged into every stream
+  and chunk request.  A client's `repetition_penalty` never reached vLLM through this
+  proxy, while it did when the client called vLLM directly.  `seed` is deliberately
+  **not** forwarded: every restart re-sends the request, and a fixed seed would replay
+  the same continuation.
+* **Usage is counted with the model's tokenizer.**  tiktoken's `cl100k` is a different
+  vocabulary and misstates usage for any non-OpenAI model; it remains the fallback.
+* `generation_params.threads` is now read **before** the top-level `threads`.  The CLI
+  always writes a top-level `threads` (default `1`), which used to win and cap the
+  server at one concurrent generation.
+* `finish_reason` is reported as `error` rather than `length` when the attempt budget
+  ran out because the backend kept failing.
+
+### Added
+
+* `_resolve_before_stop()` and `_record_event()` in `core/sampler.py`.
+* `self.control_tokens` and `self.extra_request_params` on `ApiAntiSlopSampler`.
+* `fold_for_matching()` and the `skip` parameter of `detect_disallowed_sequence()` in
+  `utils/slop_helpers.py`.
+* `chat_template_kwargs` and the three penalty fields as accepted API-server request
+  fields.
+* New configuration keys, documented in `config-example.yaml`:
+  `generation_params.restart_suppress_window` (default 32), and the expanded
+  `generation_params.clean_end_chars` default.
+* `tests/test_audit_fixes.py` (24 tests), registered in `tests/run_all.SUITES`.
+* `tests/.runlock` is now ignored by git — the run lock is created in the checkout and
+  was easy to commit by accident.
+
+### Changed — behaviour
+
+* `restart_suppress_markers` defaults to **`false`** (was `true`).  See above: banning
+  the marker for the whole request is what padded finished replies.
+* The default `clean_end_chars` accepts roleplay endings and trailing emoji.
+* A violation found after generation has ended is **left as written** and logged,
+  rather than spliced or truncated.
+* A phrase the context forces is allowed for the rest of the request instead of being
+  retried into a junk loop.
+* `generation_params.threads` now takes precedence over the top-level `threads` in the
+  API server.
+
+### Known remaining issues
+
+* `_generate_chunkwise` accepts `emitted_upto` and calls `_resolve_before_stop()`, but
+  chunk mode was not exercised by the A/B report; treat stream mode as the tested path.
+* `tests/test_audit_fixes.py` imports `api_server.server` in three tests, which needs
+  `fastapi` installed.  Without it those three fail on `ModuleNotFoundError`, not on
+  an assertion.
+
+---
+
 ## [2026.11.02.1930] — the final validation sweep no longer deletes the tail
 
 Reported from a real dataset: the truncation is *less* frequent than before, but a
