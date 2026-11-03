@@ -96,9 +96,6 @@ def _regex_search_worker(args: Tuple[str, int, str]) -> Optional[Tuple[str, int,
 _APOSTROPHES = str.maketrans({"\u2019": "'", "\u2018": "'", "\u02bc": "'"})
 
 
-_APOSTROPHES = str.maketrans({"\u2019": "'", "\u2018": "'", "\u02bc": "'"})
-
-
 class RegexValidator(BaseValidator):
     """
     Hard-ban validator driven by an arbitrary list of regular-expression

@@ -163,20 +163,6 @@ def detect_disallowed_sequence(
             if skip is not None and skip(cand, global_pos):
                 continue
 
-            # *skip* lets the caller pass over a match it has already
-            # suppressed and keep looking.  Returning the earliest match
-            # unconditionally meant one suppressed phrase hid every later
-            # violation in the window.
-            if skip is not None and skip(cand, global_pos):
-                continue
-
-            # *skip* lets the caller pass over a match it has already
-            # suppressed and keep looking.  Returning the earliest match
-            # unconditionally meant one suppressed phrase hid every later
-            # violation in the window.
-            if skip is not None and skip(cand, global_pos):
-                continue
-
             if not require_word_boundaries:
                 # No boundary checks — accept any substring
                 return cand, global_pos
