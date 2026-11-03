@@ -278,14 +278,16 @@ generation_params:
     - "<turn|>"
   max_consecutive_stops: 3
   max_stream_attempts: 12
+  max_backtrack_restarts: 200
   restart_suppress_markers: true
 ```
 
 *   `stop_on_clean_end`: accept a stop that lands on a natural text boundary. Set to `false` to never accept a stop unless a `stop_sequence` matched — that guarantees no truncation at the cost of occasionally running past the end of the turn.
 *   `end_of_turn_markers`: control tokens to **scrub**. Removal happens anywhere in a chunk, and a marker split across two chunks is still caught (text is held back until it can no longer be the start of a marker). List the markers your model uses — Gemma, Llama-3, ChatML, Mistral and Qwen families are covered by the built-in pattern.
 *   `special_token_pattern`: optional regex replacing the built-in control-token pattern.
-*   `max_consecutive_stops`: consecutive **no-progress** early stops tolerated before giving up (safety valve against runaway restarts).
-*   `max_stream_attempts`: hard cap on upstream stream attempts per generation.
+*   `max_consecutive_stops`: consecutive **no-progress** early stops tolerated before giving up (safety valve against runaway restarts). A refused stop whose continuation only repeats text that is already there counts as no progress, so this valve also ends a repetition loop such as `of course. of course. of course. ...`.
+*   `max_stream_attempts`: hard cap on upstream stream attempts per generation, covering plain retries only — a rejected stop, a dropped connection, an empty chunk. A restart entered to resume after a back-track is *progress* and is charged to `max_backtrack_restarts` instead; sharing one counter cut slop-heavy responses off mid-sentence with `finish_reason='length'`.
+*   `max_backtrack_restarts`: hard cap on restarts entered to resume after a back-track (default 200). Bounds a response that back-tracks forever without truncating one that merely needs a lot of fixes.
 *   `restart_suppress_markers`: send the markers as `bad_words` on *restart* requests. After a premature EOS the continuation prompt ends exactly where the model already chose to stop, so without this each restart is wasted. Backends that reject `bad_words` disable it automatically.
 *   `probe_stream_logprobs`: probe the backend once for streamed logprobs. The result is cached per endpoint; set to `false` to skip the round-trip.
 

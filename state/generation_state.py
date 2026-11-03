@@ -90,6 +90,7 @@ _DEFAULT_SPECIAL_TOKEN_PATTERN = (
     r"end_of_turn|start_of_turn|turn|end_of_text|eot_id|eom_id|eom|eot"
     r"|im_start|im_end|im_sep"
     r"|begin_of_text|end_of_text|start_header_id|end_header_id"
+    r"|tool_call|tool_response|tool_result|function_call"
     r"|file_separator|pad|unk|bos|eos|sep|cls|mask"
     r")\|?>"
 )

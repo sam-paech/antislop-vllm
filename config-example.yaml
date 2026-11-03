@@ -108,10 +108,24 @@ generation_params:
   # (safety valve against a model that re-emits EOS forever).  An early stop
   # that came after real progress resets this counter, so a long response with
   # several stray EOS tokens is no longer truncated.
+  #
+  # A refused stop whose continuation only repeats text that is already there
+  # counts as *no progress* and is rolled back, so this valve also ends the
+  # `of course. of course. of course. ...` repetition loop.
   max_consecutive_stops: 3
 
-  # Hard cap on upstream stream attempts per generation.
+  # Hard cap on upstream stream attempts per generation.  This bounds ordinary
+  # retries only: a backend stop that had to be retried, a dropped connection, an
+  # empty chunk.  It does NOT count restarts entered to resume after a back-track
+  # (see max_backtrack_restarts) -- charging both to one counter cut slop-heavy
+  # responses off mid-sentence with finish_reason='length'.
   max_stream_attempts: 12
+
+  # Hard cap on restarts entered to resume after a back-track.  A back-track
+  # rewrote a token and resumed generation, so it is progress by definition and
+  # must not consume max_stream_attempts.  This bounds the pathological case of a
+  # response that back-tracks forever.
+  max_backtrack_restarts: 200
 
   # Ask the backend to suppress the end-of-turn markers on RESTART requests
   # (`bad_words`).  After a premature EOS the continuation prompt ends where

@@ -170,13 +170,22 @@ Excluded from `run_all.SUITES`; fix these, do not delete them.
   measured before the banned top token is removed, and the per-position budget ends
   an unfixable position.
 
+`tests/test_truncation_and_repetition.py` covers the two ways a record used to be cut
+off or padded. Both were reproduced from a real dataset before being fixed, so keep the
+tests narrow: a "repetition" that is really a continuation must survive
+(`test_genuine_continuation_is_still_emitted`), and the attempt budget must still
+terminate a backend that never stops
+(`test_restart_budget_still_bounds_a_backend_that_never_ends`). Loosening
+`_is_repetition` or the budgets to make one of these pass is a regression in the
+other.
+
 ---
 
 ## 7. Layout
 
 | Path | Purpose |
 |---|---|
-| `core/sampler.py` | `ApiAntiSlopSampler`: generation, validation, back-tracking |
+| `core/sampler.py` | `ApiAntiSlopSampler`: generation, validation, back-tracking; `_is_repetition` guards against a refused stop whose continuation only repeats text |
 | `core/models.py` | API result and violation dataclasses |
 | `state/generation_state.py` | The text being generated; `hypothetical()` builds candidate states |
 | `validators/` | `SlopPhraseValidator`, `RegexValidator`, `NGramValidator` (the last is switchable with `ngram_validator.enabled: false`) |

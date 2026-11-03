@@ -9,6 +9,93 @@ so every entry is ordered and unambiguous without a manual version bump.
 
 ---
 
+## [2026.11.02.1800] — stop truncating long turns, stop emitting repetition loops
+
+Reported from a real dataset: assistant turns ended mid-word
+(`...the terror`, `...she whim`), and one turn contained `of course.` 327 times.
+
+### Fixed — a back-track consumed the retry budget and truncated the turn
+
+`_generate_streamwise` used one counter, `max_stream_attempts`, for two unrelated
+things: a plain retry (rejected stop, dropped connection, empty chunk) and a restart
+entered to resume after a back-track.
+
+A back-track is progress by definition: a token was rewritten and generation
+resumed. Against the shipped slop list a response routinely needs more than a dozen of
+them, so the twelfth one tripped the budget, generation ended, and `finish_reason`
+was reported as `length` — even though the backend had more to say. Every truncated
+record in the report carries `finish_reason='length'`.
+
+* Restarts after a back-track are now charged to a separate budget,
+  `max_backtrack_restarts` (default 200), and refund the retry counter.
+* `max_stream_attempts` keeps its original meaning and still bounds a backend that
+  never terminates.
+* `test_restart_budget_still_bounds_a_backend_that_never_ends` pins that down.
+
+### Fixed — a refused stop that only repeats itself was emitted
+
+After a backend `stop` the sampler rejects the stop (it may be premature) and asks for
+a continuation. When the model has nothing left to say it answers with a stock phrase,
+and because the rejected stop was reported as `produced_tokens=True` the no-progress
+counter was reset on every attempt. The loop therefore ran until the attempt budget was
+gone and emitted `of course.` 327 times.
+
+The same reset meant the `max_consecutive_stops` safety valve documented in
+`README.md` could never fire against a backend that always emits *something*.
+
+* A continuation that adds nothing new is now recognised by `_is_repetition`: the
+  added words either already appear verbatim in the accepted text, or they repeat a
+  fragment produced by an earlier refused stop.
+* Such a continuation is rolled back and counted as a no-progress attempt, so the
+  valve fires after `max_consecutive_stops` repetitions and the turn ends with the
+  backend's own `finish_reason`.
+* Continuation attempts hold their text back until their stop is seen, because text
+  already yielded cannot be taken back. A genuine continuation is flushed when its
+  stop is accepted; `test_genuine_continuation_is_still_emitted` guards that path.
+* Applied to **both** `_generate_streamwise` and `_generate_chunkwise`. Chunk mode
+  re-sends the prompt per chunk, so the loop there is more expensive, not less.
+* `_generate_chunkwise` also reset the no-progress counter on every non-empty chunk,
+  which made the guard unreachable in that mode; the reset now happens only for a
+  chunk that is not a repetition.
+
+### Fixed — a leaked `<tool_call|>` reached the dataset
+
+One turn ends `...She has a distinctive dyed-<tool_call|>`. The default scrubber
+pattern in `state/generation_state.py` covered the Gemma / Llama-3 / ChatML / Mistral /
+Qwen control tokens but not the tool-call family, so the marker was emitted as prose.
+`tool_call`, `tool_response`, `tool_result` and `function_call` are now in the default
+pattern.
+
+### Added — `tests/test_truncation_and_repetition.py`
+
+Eight tests, each failing on the old behaviour:
+
+* `test_backtracks_do_not_exhaust_the_restart_budget` — 30 back-tracks, every
+  attempt making progress; asserts the turn is not ended as `length` and that the last
+  thing the backend said reaches the output.
+* `test_restart_budget_still_bounds_a_backend_that_never_ends` — the relaxation
+  does not remove the termination guarantee.
+* `test_stop_on_clean_end_is_not_a_progress_stop` and
+  `test_rejected_stop_that_only_repeats_itself_ends_the_turn` — the `of course.`
+  loop, bounded to one emitted repeat.
+* `test_repeated_continuation_is_dropped_from_the_output` — a verbatim repeat of an
+  existing sentence is dropped entirely.
+* `test_chunk_mode_repeated_continuation_ends_the_turn` — the same guard in chunk
+  mode.
+* `test_genuine_continuation_is_still_emitted` — a real continuation survives.
+* `test_tool_call_marker_is_scrubbed_from_the_text` — the leaked marker.
+
+Registered in `run_all.SUITES`.
+
+### Changed — configuration
+
+* `generation_params.max_backtrack_restarts` (default 200) is new; documented in
+  `config-example.yaml` and `README.md`.
+* `max_stream_attempts` is documented as bounding retries only.
+* `max_consecutive_stops` is documented as also ending a repetition loop.
+
+---
+
 ## [2026.11.02.1645] — fix back-track ping-pong emitting banned words and repeated text
 
 ### Fixed — a banned word was accepted as its own replacement

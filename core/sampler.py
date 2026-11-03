@@ -149,6 +149,54 @@ def _build_banned_prefix_set(chat_tpl, validators) -> frozenset[str]:
     )
     return frozenset(out)
 
+def _is_repetition(
+    existing_text: str,
+    added_text: str,
+    earlier_additions: Optional[List[str]] = None,
+) -> bool:
+    """True when *added_text* is the model repeating itself rather than continuing.
+
+    Used to reject a "continuation" that is really a loop: after a backend stop is
+    refused, the model is asked to keep writing, and a model that has already
+    finished answers with a stock phrase.  Left unchecked those answers are appended
+    until the attempt budget runs out -- the turn in the dataset that contains
+    ``of course.`` 327 times.
+
+    Two shapes of loop are recognised.  Both compare **word sequences**, not
+    characters, so a sentence that merely reuses a common word is not caught:
+
+    * the added words already appear in *existing_text* as one contiguous run, i.e.
+      a verbatim restatement of something already said;
+    * the added words repeat a fragment produced by an *earlier refused stop*.  This
+      is the stock-phrase loop: each ``of course.`` is new text on its own, and only
+      the fact that it has been said before makes it a loop.
+
+    *earlier_additions* holds the fragments added by previous refused stops in this
+    generation.  A fragment of fewer than two words is ignored, because a lone word
+    ("and") collides by accident far too easily.
+    """
+    added_words = added_text.split()
+    if len(added_words) < 2:
+        return False
+    needle = " ".join(added_words)
+
+    existing_words = existing_text.split()
+    if len(existing_words) >= len(added_words):
+        if needle in " ".join(existing_words):
+            return True
+
+    for earlier in earlier_additions or ():
+        earlier_text = " ".join(earlier.split())
+        if not earlier_text:
+            continue
+        # Containment either way covers a verbatim repeat and a repeat of the same
+        # stock phrase wrapped in a few extra words.
+        if needle in earlier_text or earlier_text in needle:
+            return True
+
+    return False
+
+
 def _scale_ban_strength(x: float) -> float:
     # Deciles map to decades: 0.1→0.9, 0.2→0.99, …, 0.9→0.999999999
     x = max(0.0, min(1.0, float(x)))
@@ -276,8 +324,21 @@ class ApiAntiSlopSampler:
 
         # Hard cap on upstream stream attempts per generation, so a backend that
         # closes the socket without [DONE] cannot spin forever.
+        #
+        # This budget covers *ordinary* attempts only: a backend stop that had to be
+        # retried, a dropped connection, an empty chunk.  A restart entered to
+        # resume after a back-track is progress by definition -- the token was
+        # rewritten and generation moved on -- so it is counted against
+        # `max_backtrack_restarts` instead.
+        #
+        # Sharing one counter between the two made a slop-heavy response end with
+        # finish_reason='length' after a dozen back-tracks, mid-sentence, with text
+        # still to come: the `...she whim` / `...the terror` truncations.
         self.max_stream_attempts = max(
             2, int(gen.get("max_stream_attempts", self.max_consecutive_stops * 4))
+        )
+        self.max_backtrack_restarts = max(
+            2, int(gen.get("max_backtrack_restarts", 200))
         )
 
         # Ask the backend to suppress end-of-turn markers on *restart* requests.
@@ -1205,8 +1266,32 @@ class ApiAntiSlopSampler:
                 return None
             return out
 
+        # Two independent budgets.  `attempts` bounds plain retries (a rejected
+        # stop, a dropped connection); `backtrack_restarts` bounds restarts entered
+        # to resume after a back-track, which always made progress.  Charging both
+        # to one counter truncated healthy generations -- see the note in __init__.
         attempts = 0
+        backtrack_restarts = 0
+        # Length of the generated text at the last *accepted* attempt, used to
+        # recognise a continuation that only repeats what is already there.
+        accepted_text = ""
+        # Fragments added by continuations whose stop was refused.  A model that has
+        # already finished answers every request with the same stock phrase; keeping
+        # them is what lets the second and later repetitions be recognised.
+        refused_fragments: List[str] = []
+        # True while the attempt in flight was entered to continue past a stop the
+        # sampler refused.  Its text is held back until the stop is seen, so a
+        # repetition can still be rolled back.
+        continuation_attempt = False
+        # Set when a stop is refused: the *next* attempt is a continuation and its
+        # text must be held back until its own stop is seen.
+        next_is_continuation = False
+
         while state.get_generated_length() < max_new_tokens:
+            # Each iteration starts as a fresh attempt.  The stop handler sets the
+            # continuation flag for the attempt it asks for.
+            continuation_attempt = next_is_continuation
+            next_is_continuation = False
             attempts += 1
             if attempts > self.max_stream_attempts:
                 logger.error(
@@ -1216,18 +1301,29 @@ class ApiAntiSlopSampler:
                 )
                 self.finish_reason = "length"
                 break
+            if backtrack_restarts > self.max_backtrack_restarts:
+                logger.error(
+                    "Reached max_backtrack_restarts=%d; ending generation with "
+                    "%d tokens (finish_reason will be reported as 'length').",
+                    self.max_backtrack_restarts, state.get_generated_length(),
+                )
+                self.finish_reason = "length"
+                break
 
             restart_stream = False
             natural_end = False
             transport_failed = False
             last_reason: Optional[str] = None
-
             remaining = max_new_tokens - state.get_generated_length()
             api_prompt = state.prompt_string + state.get_generated_text()
 
             len_before_attempt = state.get_generated_length()
             attempt_text_start = len(state.get_generated_text())
             saw_eos_marker = False
+            # Tokens this attempt added before any back-track rewrote them.  Used
+            # to tell "the model continued the response" from "the model repeated
+            # what it had already said" when a backend stop is rejected.
+            new_token_strings: List[str] = []
 
             # Ask the backend not to re-emit the marker we just stripped.  After
             # a premature EOS the continuation prompt ends exactly where the
@@ -1284,6 +1380,11 @@ class ApiAntiSlopSampler:
                     state.append_chunk(chunk)
                     delta = state.get_generated_length() - pre_len
                     regex_since += delta
+
+                    if delta:
+                        new_token_strings.extend(
+                            state.generated_token_strings[pre_len:]
+                        )
 
                     if delta and self.on_chunk_yielded_callback:
                         try:
@@ -1369,18 +1470,25 @@ class ApiAntiSlopSampler:
                         break
 
                     # ---------- yield the safe prefix ------------------------
-                    safe_upto = max(
-                        0, state.get_generated_length() - self.tail_keep_tokens
-                    )
-                    if safe_upto > last_yield:
-                        text_out = _tokens_to_text(
-                            state.generated_token_strings[last_yield:safe_upto]
+                    # A *continuation* attempt (one entered because a previous
+                    # backend stop was refused) is held back until its stop is
+                    # seen, because it may turn out to be the model repeating
+                    # itself.  Text released here could not be taken back, and
+                    # the loop that produced `of course.` 327 times was emitted
+                    # exactly this way.  Everything else streams normally.
+                    if not continuation_attempt:
+                        safe_upto = max(
+                            0, state.get_generated_length() - self.tail_keep_tokens
                         )
-                        last_yield = safe_upto
-                        if text_out:
-                            emitted = release(text_out)
-                            if emitted:
-                                yield self._yield_text_and_callback(emitted)
+                        if safe_upto > last_yield:
+                            text_out = _tokens_to_text(
+                                state.generated_token_strings[last_yield:safe_upto]
+                            )
+                            last_yield = safe_upto
+                            if text_out:
+                                emitted = release(text_out)
+                                if emitted:
+                                    yield self._yield_text_and_callback(emitted)
 
                     if run_regex:
                         regex_since = 0
@@ -1409,7 +1517,13 @@ class ApiAntiSlopSampler:
 
             # ---- decide what to do with this attempt --------------------
             if restart_stream:
-                # Validator fired; backtrack already rewrote the tail.
+                # Validator fired; backtrack already rewrote the tail.  This is a
+                # restart after *progress* (a token was rewritten), so it is
+                # charged to the back-track budget rather than the retry budget,
+                # and the retry counter is refunded so a long series of fixes
+                # cannot exhaust it.
+                backtrack_restarts += 1
+                attempts -= 1
                 if not produced_tokens:
                     self._no_progress_attempts += 1
                 else:
@@ -1467,13 +1581,69 @@ class ApiAntiSlopSampler:
                 attempt_text=attempt_text,
                 produced_tokens=produced_tokens,
             ):
+                # The stop is genuine, so anything held back during this attempt
+                # was real continuation text after all.  Flush it now.
+                if continuation_attempt:
+                    safe_upto = max(
+                        0, state.get_generated_length() - self.tail_keep_tokens
+                    )
+                    if safe_upto > last_yield:
+                        text_out = _tokens_to_text(
+                            state.generated_token_strings[last_yield:safe_upto]
+                        )
+                        last_yield = safe_upto
+                        if text_out:
+                            emitted = release(text_out)
+                            if emitted:
+                                yield self._yield_text_and_callback(emitted)
                 natural_end = True
                 break
 
-            # Rejected stop → keep generating, but reset the no-progress counter
-            # when the attempt actually advanced the text.
+            # Rejected stop.  Before resuming, decide whether this attempt was
+            # actually a *continuation*.
+            #
+            # A rejected stop is normally the model stopping early, so the next
+            # attempt writes the rest of the sentence.  But when the model simply
+            # had nothing left to say, asking again produces the same stock
+            # phrase over and over -- the `of course.` x327 turn in the dataset.
+            # That text is emitted verbatim today, because a rejected stop is
+            # reported as `produced_tokens=True` and therefore resets the strike
+            # counter on every attempt.
+            #
+            # A continuation that adds no new words is a no-progress attempt: it
+            # is rolled back and counted, so the `max_consecutive_stops` valve
+            # documented in README can actually fire.
+            added_text = _tokens_to_text(new_token_strings)
+            if produced_tokens and _is_repetition(
+                accepted_text, added_text, refused_fragments
+            ):
+                logger.warning(
+                    "Attempt %d only repeated the text already generated; "
+                    "rolling it back (%d/%d no-progress attempts).",
+                    attempts, self._no_progress_attempts + 1,
+                    self.max_consecutive_stops,
+                )
+                state.truncate(len_before_attempt)
+                if last_yield > state.get_generated_length():
+                    last_yield = state.get_generated_length()
+                self._no_progress_attempts += 1
+                if self._no_progress_attempts >= self.max_consecutive_stops:
+                    logger.warning(
+                        "Ending turn: the model repeats itself instead of "
+                        "continuing (finish_reason=%r).", reason,
+                    )
+                    self.finish_reason = reason
+                    break
+                # The retry is still a continuation, so its text must be held back
+                # as well; otherwise it is emitted before it can be judged.
+                next_is_continuation = True
+                continue
+
             if produced_tokens:
                 self._no_progress_attempts = 0
+                accepted_text = state.get_generated_text()
+                if continuation_attempt and added_text.strip():
+                    refused_fragments.append(added_text)
             else:
                 self._no_progress_attempts += 1
                 if self._no_progress_attempts >= self.max_stream_attempts:
@@ -1482,6 +1652,10 @@ class ApiAntiSlopSampler:
                         self._no_progress_attempts,
                     )
                     break
+
+            # The stop was refused, so the next attempt is a continuation and its
+            # text must be held back until its own stop is seen.
+            next_is_continuation = True
 
             # Final sweep: the tail may still violate a regex.
             if regex_since > 0:
@@ -1586,6 +1760,14 @@ class ApiAntiSlopSampler:
         last_yield_idx = 0                         # first token not yet sent
         scrubber = self._new_scrubber()
         pending_scrub = ""
+        # Text at the last accepted chunk, plus the fragments added by continuations
+        # whose stop was refused.  Chunk mode has the same repetition loop as stream
+        # mode: a backend stop is refused, the model is asked for more, and it
+        # answers with a stock phrase.  See _is_repetition.
+        accepted_text = ""
+        refused_fragments: List[str] = []
+        continuation_chunk = False
+        next_is_continuation = False
 
         def release(text: str, final: bool = False) -> Optional[str]:
             nonlocal pending_scrub
@@ -1599,6 +1781,11 @@ class ApiAntiSlopSampler:
 
 
         while True:
+            # Each iteration starts as a fresh chunk.  The stop handler sets the
+            # continuation flag for the chunk it asks for.
+            continuation_chunk = next_is_continuation
+            next_is_continuation = False
+
             # hard token limit
             if (
                 max_new_tokens is not None
@@ -1714,11 +1901,11 @@ class ApiAntiSlopSampler:
                     self.finish_reason = "error"
                     break
                 continue
-            self._no_progress_attempts = 0
 
             # ── append & validate timing ────────────────────────────────────
             pre_len = state.get_generated_length()
             state.append_chunk(chunk)
+            added_text = _tokens_to_text(state.generated_token_strings[pre_len:])
 
             t1 = time.perf_counter()
             #t = time.time()
@@ -1763,17 +1950,21 @@ class ApiAntiSlopSampler:
                     logger.error("Throughput callback failed: %s", e_cb, exc_info=True)
 
             # ── safe-to-stream part ────────────────────────────────────────
-            safe_upto = max(0, post_len - self.tail_keep_tokens)
-            if safe_upto > last_yield_idx:
-                safe_tokens = state.generated_token_strings[last_yield_idx : safe_upto]
-                last_yield_idx = safe_upto
-                emitted = release(_tokens_to_text(safe_tokens))
-                if emitted:
-                    # Token accounting for chunk mode happens in the
-                    # on_chunk_yielded_callback("", newly_accepted) call above;
-                    # going through _yield_text_and_callback here would count the
-                    # same tokens twice.
-                    yield emitted
+            # A *continuation* chunk (one entered because the previous stop was
+            # refused) is held back until its own stop is seen: it may be the model
+            # repeating itself, and text already yielded cannot be taken back.
+            if not continuation_chunk:
+                safe_upto = max(0, post_len - self.tail_keep_tokens)
+                if safe_upto > last_yield_idx:
+                    safe_tokens = state.generated_token_strings[last_yield_idx : safe_upto]
+                    last_yield_idx = safe_upto
+                    emitted = release(_tokens_to_text(safe_tokens))
+                    if emitted:
+                        # Token accounting for chunk mode happens in the
+                        # on_chunk_yielded_callback("", newly_accepted) call above;
+                        # going through _yield_text_and_callback here would count the
+                        # same tokens twice.
+                        yield emitted
 
             # stop if backend signalled completion.
             # NOTE: finish_reason="stop" can be premature — Gemma emits its
@@ -1789,8 +1980,54 @@ class ApiAntiSlopSampler:
                     attempt_text=state.get_generated_text(),
                     produced_tokens=newly_accepted > 0,
                 ):
+                    # The stop is genuine; flush whatever the continuation chunk
+                    # was holding back.
+                    if continuation_chunk:
+                        safe_upto = max(0, post_len - self.tail_keep_tokens)
+                        if safe_upto > last_yield_idx:
+                            safe_tokens = state.generated_token_strings[last_yield_idx : safe_upto]
+                            last_yield_idx = safe_upto
+                            emitted = release(_tokens_to_text(safe_tokens))
+                            if emitted:
+                                yield emitted
                     break
+
+                # Rejected stop: a continuation that only repeats what is already
+                # there is a no-progress attempt, not a continuation.  Roll it
+                # back so it never reaches the output.
+                if newly_accepted > 0 and _is_repetition(
+                    accepted_text, added_text, refused_fragments
+                ):
+                    logger.warning(
+                        "Chunk %d only repeated the text already generated; "
+                        "rolling it back (%d/%d no-progress attempts).",
+                        chunk_nr, self._no_progress_attempts + 1,
+                        self.max_consecutive_stops,
+                    )
+                    state.truncate(pre_len)
+                    if last_yield_idx > state.get_generated_length():
+                        last_yield_idx = state.get_generated_length()
+                    self._no_progress_attempts += 1
+                    if self._no_progress_attempts >= self.max_consecutive_stops:
+                        logger.warning(
+                            "Ending turn: the model repeats itself instead of "
+                            "continuing (finish_reason=%r).",
+                            chunk.finish_reason,
+                        )
+                        self.finish_reason = chunk.finish_reason
+                        break
+                    next_is_continuation = True
+                    continue
+
+                self._no_progress_attempts = 0
+                accepted_text = state.get_generated_text()
+                if continuation_chunk and added_text.strip():
+                    refused_fragments.append(added_text)
                 # rejected early end-of-turn stop → loop back and keep going
+                next_is_continuation = True
+
+            continuation_chunk = next_is_continuation
+            next_is_continuation = False
 
         # ── final validation sweep ─────────────────────────────────────────
         # Same reasoning as in stream mode: a match touching the end of the text
