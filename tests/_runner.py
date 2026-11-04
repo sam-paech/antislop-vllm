@@ -44,6 +44,7 @@ Environment overrides::
 from __future__ import annotations
 
 import contextlib
+import importlib
 import math
 import os
 import signal
@@ -114,6 +115,43 @@ EXIT_OK = 0
 EXIT_FAILURES = 1
 EXIT_BUSY = 2
 EXIT_ABORTED = 130
+
+# An optional dependency is missing, so some tests could not run.  Distinct from
+# EXIT_FAILURES on purpose: a skip is not a regression, and a suite that reports
+# one as a failure teaches people to ignore red output.
+EXIT_SKIPPED = 3
+
+
+class SkipTest(Exception):
+    """Raised inside a test that cannot run on this machine.
+
+    Used for a missing *optional* dependency (``fastapi`` for the API-server
+    tests, ``pyyaml`` for the config tests).  The test is reported as ``SKIP``
+    with the reason, and the suite exits :data:`EXIT_SKIPPED` rather than
+    ``EXIT_FAILURES`` so a partial environment does not look like a broken
+    branch.  ``run_all.py`` shows it as ``SKIP`` and only fails the run when
+    ``--strict-skips`` is passed.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def require_module(name: str, *, why: str = "") -> object:
+    """Import *name*, or raise :class:`SkipTest` explaining what to install.
+
+    Call this at the top of a test rather than importing the module at module
+    scope: an import error at module scope aborts the whole suite before a single
+    test runs, which is what made three ``test_audit_fixes`` tests fail on
+    ``ModuleNotFoundError: fastapi`` instead of reporting themselves as skipped.
+    """
+    try:
+        return importlib.import_module(name)
+    except ImportError as exc:
+        detail = f" ({exc})" if str(exc) else ""
+        hint = f" {why}" if why else ""
+        raise SkipTest(f"{name} is not installed{detail}.{hint}".strip()) from exc
 
 
 class TestTimeout(Exception):
@@ -330,6 +368,10 @@ def run_suite(suite: str, namespace: dict) -> int:
     :data:`TEST_TIMEOUT_SEC` seconds and each preceded by an abort check, so a
     regression that makes the sampler loop forever is reported as a failure instead
     of wedging the runner.
+
+    A test that raises :class:`SkipTest` is reported as ``SKIP`` and does not fail
+    the suite; the suite then exits :data:`EXIT_SKIPPED` so the caller can tell
+    "everything passed" from "everything that could run passed".
     """
     import traceback
 
@@ -337,7 +379,7 @@ def run_suite(suite: str, namespace: dict) -> int:
 
     tests = _collect_tests(namespace)
     total = len(tests)
-    passed = failed = aborted = 0
+    passed = failed = aborted = skipped = 0
     started = time.monotonic()
 
     print(
@@ -347,15 +389,19 @@ def run_suite(suite: str, namespace: dict) -> int:
 
     for name, fn in tests:
         if abort_requested():
-            aborted = total - passed - failed
+            aborted = total - passed - failed - skipped
             break
         try:
             with _time_limit(TEST_TIMEOUT_SEC):
                 fn()
         except AbortRequested:
-            aborted = total - passed - failed
+            aborted = total - passed - failed - skipped
             print(f"ABORT {name}")
             break
+        except SkipTest as exc:
+            skipped += 1
+            print(f"SKIP  {name}")
+            print(f"      {exc.reason}")
         except TestTimeout as exc:
             failed += 1
             print(f"FAIL  {name}")
@@ -374,13 +420,18 @@ def run_suite(suite: str, namespace: dict) -> int:
     if aborted:
         print(
             f"ABORTED {suite}: {passed} passed, {failed} failed, "
-            f"{aborted} not run ({elapsed:.2f}s)"
+            f"{skipped} skipped, {aborted} not run ({elapsed:.2f}s)"
         )
         print(f"        reason: {abort_reason()}")
         print(f"        clear it with: rm -f {abort_file()}")
         return EXIT_ABORTED
 
-    print(f"{passed}/{total} passed in {elapsed:.2f}s (single-threaded)")
+    summary = f"{passed}/{total} passed"
+    if skipped:
+        summary += f", {skipped} skipped"
+    if failed:
+        summary += f", {failed} FAILED"
+    print(f"{summary} in {elapsed:.2f}s (single-threaded)")
 
     # The regex validator's process pool is created on first use and never closed,
     # so it would otherwise be reported below as a leak.  Closing it here is what
@@ -393,7 +444,11 @@ def run_suite(suite: str, namespace: dict) -> int:
             f"WARN  {len(leaked)} thread(s) still alive at exit: {', '.join(leaked)}"
         )
 
-    return EXIT_FAILURES if failed else EXIT_OK
+    if failed:
+        return EXIT_FAILURES
+    if skipped:
+        return EXIT_SKIPPED
+    return EXIT_OK
 
 
 if __name__ == "__main__":  # convenience: `python -m tests._runner`

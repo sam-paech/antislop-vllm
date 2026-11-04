@@ -37,7 +37,17 @@ import sys
 import time
 from typing import IO, Optional
 
-from tests import _runner
+# Make the checkout importable when this file is run by path rather than with -m.
+#
+# `python tests/run_all.py` puts `tests/` on sys.path, not the repo root, so the
+# `from tests import _runner` below fails with ModuleNotFoundError and the run never
+# starts.  `python -m tests.run_all` works, but the by-path form is what people (and
+# agents) type first, so support it explicitly.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from tests import _runner  # noqa: E402
 
 # Suites in the order they run.  Kept explicit rather than discovered so the run is
 # reproducible and a half-written file cannot join the run by accident.
@@ -175,6 +185,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--list", action="store_true", help="list suites and exit")
     parser.add_argument(
+        "--strict-skips",
+        action="store_true",
+        help=(
+            "treat a suite with skipped tests (a missing optional dependency) as a "
+            "failure. Off by default: a partial environment should not look like a "
+            "broken branch. Use this in CI, where the dependencies are pinned."
+        ),
+    )
+    parser.add_argument(
         "--keep-abort-file",
         action="store_true",
         help="do not delete a stale abort file before starting",
@@ -242,6 +261,8 @@ def _run(args: argparse.Namespace, selected: list[str]) -> int:
     for name, code, timed_out in results:
         if code == _runner.EXIT_OK:
             status = "PASS"
+        elif code == _runner.EXIT_SKIPPED:
+            status = "SKIP (missing optional dep)"
         elif timed_out:
             status = "FAIL (killed: hard budget exceeded)"
         elif code == _runner.EXIT_ABORTED:
@@ -262,10 +283,31 @@ def _run(args: argparse.Namespace, selected: list[str]) -> int:
         print(f"Clear it with: rm -f {_runner.abort_file()}")
         return _runner.EXIT_ABORTED
 
-    failures = [name for name, code, _ in results if code != _runner.EXIT_OK]
+    skipped_suites = [name for name, code, _ in results if code == _runner.EXIT_SKIPPED]
+    if skipped_suites:
+        print(
+            f"SKIPPED (missing optional dependency): {', '.join(skipped_suites)}"
+        )
+        print(
+            "        Install the dependency to run them, or pass --strict-skips to "
+            "fail on this."
+        )
+
+    failures = [
+        name for name, code, _ in results
+        if code not in (_runner.EXIT_OK, _runner.EXIT_SKIPPED)
+    ]
     if failures:
         print(f"FAILED: {', '.join(failures)}")
         return _runner.EXIT_FAILURES
+
+    if skipped_suites and args.strict_skips:
+        print(f"FAILED (--strict-skips): {', '.join(skipped_suites)}")
+        return _runner.EXIT_FAILURES
+
+    if skipped_suites:
+        print("All runnable suites passed.")
+        return _runner.EXIT_OK
 
     print("All suites passed.")
     return _runner.EXIT_OK

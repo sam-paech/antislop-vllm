@@ -11,12 +11,32 @@ import copy
 import sys
 import traceback
 
+# Allow `python tests/test_config_and_sse.py` as well as `python -m tests.test_config_and_sse`: run by path,
+# `tests/` is on sys.path but the repo root is not, so `from tests import ...`
+# below would fail with ModuleNotFoundError before a single test ran.
+import os as _os
+import sys as _sys
+
+_REPO_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+if _REPO_ROOT not in _sys.path:
+    _sys.path.insert(0, _REPO_ROOT)
+
 from tests import _runner, _stubs
 
 _stubs.install()
 
 from api_client.api_client import ApiClient  # noqa: E402
-from utils.helpers import load_config, merge_configs  # noqa: E402
+
+
+def _helpers():
+    """Import ``utils.helpers``, or skip if ``pyyaml`` is missing.
+
+    ``utils/helpers.py`` imports ``yaml`` at module scope, so a module-level
+    import here aborted the entire suite -- including the four SSE tests, which do
+    not need it at all -- on a machine without pyyaml.
+    """
+    _runner.require_module("yaml", why="Install it with: pip install pyyaml")
+    return _runner.require_module("utils.helpers")
 
 
 # --------------------------------------------------------------------------- #
@@ -31,24 +51,29 @@ def _cli(*argv):
 def test_request_mode_cli_override_reaches_generation_params():
     """`--request-mode stream` used to be written to a top-level key that the
     sampler never read, so the run silently stayed in chunk mode."""
-    cfg = merge_configs(load_config("config-example.yaml"), _cli("--request-mode", "stream"))
+    helpers = _helpers()
+    cfg = helpers.merge_configs(
+        helpers.load_config("config-example.yaml"), _cli("--request-mode", "stream")
+    )
     assert cfg["generation_params"]["request_mode"] == "stream", cfg["generation_params"]
 
 
 def test_request_mode_legacy_top_level_is_migrated():
-    base = load_config("config-example.yaml")
+    helpers = _helpers()
+    base = helpers.load_config("config-example.yaml")
     base.pop("generation_params", None)
     base["request_mode"] = "stream"
-    cfg = merge_configs(base, _cli())
+    cfg = helpers.merge_configs(base, _cli())
     assert cfg["generation_params"]["request_mode"] == "stream"
     assert "request_mode" not in cfg, "stray top-level key left behind"
 
 
 def test_merge_does_not_mutate_the_caller_config():
-    base = load_config("config-example.yaml")
+    helpers = _helpers()
+    base = helpers.load_config("config-example.yaml")
     base["generation_params"]["request_mode"] = "chunk"
     snapshot = copy.deepcopy(base)
-    merge_configs(base, _cli("--request-mode", "stream"))
+    helpers.merge_configs(base, _cli("--request-mode", "stream"))
     assert base == snapshot, "merge_configs mutated its input"
 
 

@@ -32,6 +32,16 @@ from __future__ import annotations
 import sys
 import traceback
 
+# Allow `python tests/test_truncation_and_repetition.py` as well as `python -m tests.test_truncation_and_repetition`: run by path,
+# `tests/` is on sys.path but the repo root is not, so `from tests import ...`
+# below would fail with ModuleNotFoundError before a single test ran.
+import os as _os
+import sys as _sys
+
+_REPO_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+if _REPO_ROOT not in _sys.path:
+    _sys.path.insert(0, _REPO_ROOT)
+
 from tests import _runner, _stubs
 
 _stubs.install()

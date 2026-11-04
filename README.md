@@ -461,14 +461,19 @@ backend is a scripted fake and the heavy optional imports are stubbed.
 
 ```bash
 python -m tests.run_all                 # every suite, one at a time (recommended)
+python tests/run_all.py                 # same thing, by path
 python -m tests.run_all early_eos        # a subset, by name
 python -m tests.run_all --list          # what would run
 ```
+
+Both forms work: `run_all.py` and every suite insert the repo root on `sys.path`
+before importing, so `PYTHONPATH=.` is not needed either way.
 
 Individual suites also run standalone, which is handy while iterating:
 
 ```bash
 python -m tests.test_early_eos           # truncation / early end-of-turn
+python tests/test_early_eos.py          # same, by path
 python -m tests.test_partial_word_bans   # back-tracking storms, cancellation
 python -m tests.test_config_and_sse      # config merge and SSE parsing
 python -m tests.test_sampler_filters    # min-p floor vs. the rejected top token
@@ -476,9 +481,22 @@ python -m tests.test_audit_fixes        # the 2026-11-03 audit (needs fastapi)
 python -m tests.test_harness            # the harness itself
 ```
 
-`test_audit_fixes` imports `api_server.server` for three of its tests, so it needs
-`fastapi` installed (it is in `requirements.txt`). Without it those three fail on
-`ModuleNotFoundError`, not on an assertion; the other 21 still run.
+### Optional dependencies and `SKIP`
+
+Two suites need a dependency that is not required to run AntiSlop itself:
+`test_audit_fixes` imports `api_server.server` (needs `fastapi`) and
+`test_config_and_sse` imports `utils.helpers` (needs `pyyaml`). When the dependency
+is missing those individual tests are reported as **`SKIP`** with the install hint,
+and the rest of the suite still runs — a missing optional dependency no longer aborts
+a suite before a single test has executed.
+
+A run that skipped something exits **0** and prints `All runnable suites passed.`
+Pass `--strict-skips` to make a skip a failure instead, which is what you want in
+CI where the dependencies are pinned:
+
+```bash
+python -m tests.run_all --strict-skips   # a SKIP fails the run
+```
 
 Prefer `run_all` over a shell loop: it is the only entry point that enforces the
 hard kill and the run lock described below.

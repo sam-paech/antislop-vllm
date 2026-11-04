@@ -53,6 +53,7 @@ and unexplained is worse than no test: it trains everyone to ignore the suite.
 python -m tests.run_all                  # every suite, one at a time (use this)
 python -m tests.run_all test_early_eos     # a subset, by name
 python -m tests.run_all --list             # what would run
+python -m tests.run_all --strict-skips     # a SKIP is a failure (use in CI)
 python -m tests.test_early_eos             # one suite, while iterating
 ```
 
@@ -172,6 +173,22 @@ Excluded from `run_all.SUITES`; fix these, do not delete them.
   the real constructor and is in the suite, with two tests: the min-p floor is
   measured before the banned top token is removed, and the per-position budget ends
   an unfixable position.
+
+### Tests that need an optional dependency
+
+Not broken, and not excluded — they report `SKIP` with the install hint and the rest
+of the suite still runs. Use `_runner.require_module()` inside the test rather than
+importing the dependency at module scope; a module-scope import aborts the whole
+suite before a single test runs, which is exactly what used to happen to
+`test_audit_fixes` on a machine without `fastapi`.
+
+| Test(s) | Needs |
+|---|---|
+| three API-server tests in `test_audit_fixes` | `fastapi` |
+| three config-merge tests in `test_config_and_sse` | `pyyaml` |
+
+A run that skipped something exits **0**. `python -m tests.run_all --strict-skips`
+turns a skip into a failure — use that in CI, where the dependencies are pinned.
 
 `tests/test_truncation_and_repetition.py` covers the three ways a record used to be cut
 off or padded. All were reproduced from a real dataset before being fixed, so keep the

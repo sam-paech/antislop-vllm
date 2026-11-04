@@ -18,6 +18,16 @@ import threading
 import time
 from pathlib import Path
 
+# Allow `python tests/test_harness.py` as well as `python -m tests.test_harness`: run by path,
+# `tests/` is on sys.path but the repo root is not, so `from tests import ...`
+# below would fail with ModuleNotFoundError before a single test ran.
+import os as _os
+import sys as _sys
+
+_REPO_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+if _REPO_ROOT not in _sys.path:
+    _sys.path.insert(0, _REPO_ROOT)
+
 from tests import _runner
 
 
@@ -139,6 +149,64 @@ def test_budgets_are_short_by_default():
     # A hung test must not be allowed to sit on a core for minutes.
     assert _runner.TEST_TIMEOUT_SEC <= 30
     assert _runner.SUITE_TIMEOUT_SEC <= 300
+
+
+# --------------------------------------------------------------------------- #
+#  Missing optional dependencies must SKIP, not fail the suite                  #
+# --------------------------------------------------------------------------- #
+def test_require_module_raises_skip_for_a_missing_module():
+    """A missing optional dep is a skip, not a failure.
+
+    `test_audit_fixes` used to `from api_server import server` at module scope, so
+    on a box without `fastapi` the whole suite died with ModuleNotFoundError and
+    reported 3 failures out of 24 -- the other 21 never ran.
+    """
+    try:
+        _runner.require_module("definitely_not_a_real_module_xyz")
+    except _runner.SkipTest as exc:
+        assert "definitely_not_a_real_module_xyz" in exc.reason, exc.reason
+        assert "install" in exc.reason.lower(), exc.reason
+    else:
+        raise AssertionError("require_module did not raise SkipTest")
+
+
+def test_require_module_returns_an_installed_module():
+    assert _runner.require_module("sys") is sys
+
+
+def test_a_skip_does_not_fail_the_suite():
+    """Run a throw-away suite: one pass, one skip; expect EXIT_SKIPPED (3).
+
+    Executes `run_suite` in a subprocess so its output and exit code are observed
+    exactly as `run_all` sees them, rather than trusting the branch.
+    """
+    import subprocess
+    import textwrap
+
+    script = textwrap.dedent(
+        """
+        import sys
+        sys.path.insert(0, {root!r})
+        from tests import _runner
+
+        def test_passes():
+            pass
+
+        def test_skips():
+            _runner.require_module("definitely_not_a_real_module_xyz")
+
+        sys.exit(_runner.run_suite("throwaway", globals()))
+        """
+    ).format(root=str(_runner.Path(__file__).resolve().parents[1]))
+
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert "PASS  test_passes" in proc.stdout, proc.stdout
+    assert "SKIP  test_skips" in proc.stdout, proc.stdout
+    assert "FAIL" not in proc.stdout, proc.stdout
+    assert proc.returncode == _runner.EXIT_SKIPPED, (proc.returncode, proc.stdout)
 
 
 # --------------------------------------------------------------------------- #

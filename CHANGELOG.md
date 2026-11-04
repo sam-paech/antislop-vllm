@@ -299,8 +299,63 @@ matched `couldn't help but`.
 * `_generate_chunkwise` accepts `emitted_upto` and calls `_resolve_before_stop()`, but
   chunk mode was not exercised by the A/B report; treat stream mode as the tested path.
 * `tests/test_audit_fixes.py` imports `api_server.server` in three tests, which needs
-  `fastapi` installed.  Without it those three fail on `ModuleNotFoundError`, not on
-  an assertion.
+  `fastapi` installed.  *(Fixed in `2026.11.04.0746`: those three now report `SKIP`
+  with an install hint instead of failing on `ModuleNotFoundError`, and the rest of
+  the suite still runs.  See below.)*
+
+---
+
+## [2026.11.04.0746] — the test suite no longer aborts on a missing optional dependency
+
+Found while running the suite on a clean box to verify this branch.  Three separate
+defects in the harness, all of which made a *partial* environment look like a broken
+branch.
+
+### Fixed — a module-scope import aborted a suite before any test ran
+
+`tests/test_audit_fixes.py` did `from api_server import server` at module scope, so on
+a machine without `fastapi` the suite died with `ModuleNotFoundError` and reported
+**3 failures out of 24** — the other 21 never executed.  `test_config_and_sse.py`
+had the same problem with `from utils.helpers import ...`, which imports `yaml` at
+module scope: that aborted all six tests, including the four SSE tests that do not
+need `pyyaml` at all.
+
+* New `_runner.require_module()` imports a module *inside* the test and raises
+  `SkipTest` with an actionable message (`fastapi is not installed ... Install it
+  with: pip install fastapi`).
+* New `SkipTest` exception and `EXIT_SKIPPED` (3) exit code.  A skipped test is
+  reported as `SKIP` with its reason and does not fail the suite; the suite exits 3
+  so the caller can distinguish "everything passed" from "everything that could run
+  passed".
+* The four SSE tests in `test_config_and_sse` no longer depend on `pyyaml` at all, so
+  they run in every environment.
+
+### Fixed — `python tests/run_all.py` did not work
+
+The documented invocation was `python -m tests.run_all`, but the by-path form — which
+is what people and agents type first — failed immediately with
+`ModuleNotFoundError: No module named 'tests'`, because running a file by path puts
+`tests/` on `sys.path` rather than the repo root.  Every suite had the same problem.
+
+* `run_all.py` and all eight suites now insert the repo root on `sys.path` before
+  importing, so `python tests/run_all.py`, `python tests/test_early_eos.py` and the
+  `-m` forms all work without `PYTHONPATH=.`.
+
+### Added — `--strict-skips`
+
+A run that skipped something exits **0** and prints `All runnable suites passed.`
+`--strict-skips` turns a skip into a failure, which is what CI should use where the
+dependencies are pinned; without it a partial environment fails the build for a reason
+that has nothing to do with the change under test.
+
+### Verified
+
+| Invocation | Environment | Result |
+|---|---|---|
+| `python tests/run_all.py` | no `fastapi`/`pyyaml` | 21/24 in `test_audit_fixes`, 3 `SKIP`; exit **0** |
+| `python tests/run_all.py --strict-skips` | no `fastapi`/`pyyaml` | same, exit **1** |
+| `python tests/run_all.py` | full deps | 8/8 suites, 91/91 tests, exit **0** |
+| `python -m tests.run_all` | full deps | identical |
 
 ---
 

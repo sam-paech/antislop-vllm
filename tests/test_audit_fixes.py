@@ -19,6 +19,16 @@ import argparse
 import logging
 import sys
 
+# Allow `python tests/test_audit_fixes.py` as well as `python -m tests.test_audit_fixes`: run by path,
+# `tests/` is on sys.path but the repo root is not, so `from tests import ...`
+# below would fail with ModuleNotFoundError before a single test ran.
+import os as _os
+import sys as _sys
+
+_REPO_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+if _REPO_ROOT not in _sys.path:
+    _sys.path.insert(0, _REPO_ROOT)
+
 from tests import _runner, _stubs
 
 _stubs.install()
@@ -292,7 +302,12 @@ def test_word_boundary_switch_under_generation_params():
 
 
 def _server_with(client, formatter):
-    from api_server import server
+    # `fastapi` is only needed for the API-server tests; importing it at module
+    # scope used to abort this whole suite before a single test ran.
+    server = _runner.require_module(
+        "api_server.server",
+        why="The API-server tests need `fastapi` (pip install fastapi).",
+    )
     server.setup_shared_resources(
         {"generation_params": {"request_mode": "stream", "probe_stream_logprobs": False,
                                "threads": 40},
