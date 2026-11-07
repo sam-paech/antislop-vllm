@@ -9,6 +9,61 @@ so every entry is ordered and unambiguous without a manual version bump.
 
 ---
 
+## [2026.11.07.1845] — `GET /metrics`: proxy the upstream body and expose the proxy's own counters
+
+### Added — `GET /metrics` on the OpenAI-compatible server
+
+* **The upstream vLLM's `/metrics` body is proxied verbatim.** The URL is derived from
+  `api_base_url` by discarding its path (`http://host:8000/v1` → `http://host:8000/metrics`), the
+  same rule the dataset generator's `vllm_metrics.metrics_url_for_api_url()` applies. Nothing is
+  re-parsed and re-emitted, so a metric from a newer vLLM that this code has never heard of still
+  reaches the client, and every existing `vllm:`-based consumer keeps working **unchanged**.
+* **The proxy's own `antislop:` metrics are appended to the same body**, so one GET answers both
+  questions. New: `requests_total` (by endpoint and status), `requests_in_flight`,
+  `request_duration_seconds`, `streaming_requests_total`, `generations_total` (by `finish_reason`),
+  `prompt_tokens_total`, `generation_tokens_total`, `ban_events_total` (by validator and whether the
+  back-track fixed it), `backtracks_total`, `upstream_errors_total`,
+  `upstream_metrics_scrape_total` and `upstream_metrics_last_scrape_timestamp_seconds`.
+* **New `api_server/metrics.py`**: a ~150-line thread-safe Prometheus text-exposition registry
+  (counter, gauge, summary) plus the upstream scrape. Deliberately **no new dependency** —
+  `prometheus_client` is not in `requirements.txt` and this project targets a small board.
+
+### Why
+
+The dataset generator's 📊 Metrics tab polls `<host>:<port>/metrics` for every configured API slot and
+treats a non-200 as *unreachable*. This server exposed only `POST /v1/chat/completions`, so every slot
+pointed at the proxy showed **no figures at all** — even though the proxy forwards to a vLLM that serves
+`/metrics` correctly (confirmed against a plain vLLM instance). The proxy was the only thing in the
+chain that could not be measured.
+
+### Behaviour notes
+
+* **A dead or absent backend still returns HTTP 200.** The `antislop:` figures are served with
+  `antislop:upstream_metrics_scrape_total{result="error"}` and no `vllm:` samples. That is the
+difference between "the proxy is unreachable" and "the proxy is up but its vLLM is not"; a 5xx would
+  erase it. The scrape timeout is 2 s, under the generator's 3 s poll timeout.
+* **`requests_in_flight` is decremented in a `finally:`.** `_run_generation_for_request()` returns
+  plain dicts on every error path rather than raising, so a leaked in-flight count would make the tab
+  report a permanently busy proxy. The wrapper is `_run_generation_for_request()` and the original body
+  is now `_run_generation_for_request_impl()`.
+* **No request body, status code, header or response shape of `/v1/chat/completions` changed.** The
+  instrumentation only reads values the server already computed.
+* **Importing `api_server.metrics` issues no request.** The scrape happens only inside the route.
+
+### Tests
+
+* **New `tests/test_api_server_metrics.py`** (19 tests, in `run_all.SUITES`): the exposition format
+  (HELP/TYPE, one sample per label set, label escaping, gauge up/down, summary sum+count, `reset()`
+  clearing series but keeping definitions, an empty registry rendering nothing); the upstream URL
+  derivation; the route passing the upstream body through verbatim and appending the `antislop:` metrics;
+  a dead upstream and a non-200 upstream both still serving 200 with `result="error"`; a successful
+  scrape being recorded and timestamped; the route being a `GET`; a generation recording requests,
+  tokens, `finish_reason` and a zero in-flight gauge; a backend failure counting as an upstream error;
+  ban events counted by validator and outcome; and importing the module not touching the network.
+* Full suite: **9/9 suites pass** in 8.2 s, no thread `WARN`.
+
+---
+
 ## [2026.11.03.0025] — remove the duplicated `skip` block and `_APOSTROPHES` table
 
 Follow-up to `2026.11.02.2357`.  The audit's patch script was re-run after partial

@@ -16,6 +16,21 @@ from core.sampler import ApiAntiSlopSampler
 from validators.base_validator import BaseValidator
 from utils.chat_template_helper import ChatTemplateFormatter
 
+# The proxy's own Prometheus metrics, plus the upstream /metrics passthrough.  Importing this
+# module must never issue a request, so the scrape only happens inside the GET /metrics route.
+from api_server.metrics import (
+    BAN_EVENTS_TOTAL,
+    GENERATIONS_TOTAL,
+    GENERATION_TOKENS_TOTAL,
+    PROMPT_TOKENS_TOTAL,
+    REQUESTS_IN_FLIGHT,
+    REQUESTS_TOTAL,
+    REQUEST_DURATION,
+    STREAMING_TOTAL,
+    UPSTREAM_ERRORS_TOTAL,
+    render_metrics_body,
+)
+
 # --- Globals for shared resources ---
 # These will be populated by main.py at startup.
 SHARED_RESOURCES: Dict[str, Any] = {}
@@ -95,6 +110,30 @@ def setup_shared_resources(
 
 
 def _run_generation_for_request(
+    request_data: Dict[str, Any],
+    on_text: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Run one generation and account for it in the proxy's metrics.
+
+    A thin wrapper around :func:`_run_generation_for_request_impl` so the in-flight gauge and the
+    request timer are recorded on **every** exit path.  The impl returns plain dicts rather than
+    raising (an error body, an upstream passthrough), so a ``try/finally`` around the call is the
+    only way to guarantee the gauge comes back down: a leaked in-flight count would make the
+    generator's 📊 Metrics tab report a permanently busy proxy.
+    """
+    REQUESTS_IN_FLIGHT.inc()
+    started_at = time.time()
+    try:
+        result = _run_generation_for_request_impl(request_data, on_text=on_text)
+        if isinstance(result, dict) and "error" in result:
+            UPSTREAM_ERRORS_TOTAL.inc()
+        return result
+    finally:
+        REQUEST_DURATION.observe(time.time() - started_at)
+        REQUESTS_IN_FLIGHT.dec()
+
+
+def _run_generation_for_request_impl(
     request_data: Dict[str, Any],
     on_text: Optional[Any] = None,
 ) -> Dict[str, Any]:
@@ -300,6 +339,24 @@ def _run_generation_for_request(
     # was indistinguishable from a complete one for any client building a dataset.
     finish_reason = sampler.finish_reason or "stop"
 
+    # --- 6b. Account for the generation in the proxy's metrics ---
+    # The proxy's whole purpose is the ban/back-track loop, so the loop is what the
+    # metrics expose: how many violations fired, per validator, and whether the
+    # back-track actually fixed them.  `sampler.events` is the sampler's own record
+    # (see `_record_event`), so nothing is counted twice or invented here.
+    GENERATIONS_TOTAL.inc({"finish_reason": finish_reason})
+    PROMPT_TOKENS_TOTAL.inc(amount=prompt_tokens)
+    GENERATION_TOKENS_TOTAL.inc(amount=completion_tokens)
+    for event in getattr(sampler, "events", None) or []:
+        try:
+            BAN_EVENTS_TOTAL.inc({
+                "validator": str(event.get("type") or "unknown"),
+                "fixed": "true" if event.get("fixed") else "false",
+            })
+        except Exception as e_metric:
+            # Metrics must never fail a request that already succeeded.
+            logger.warning(f"Could not record a ban event in the metrics: {e_metric}")
+
     response_payload = {
         "id": response_id,
         "object": "chat.completion",
@@ -407,6 +464,36 @@ async def _stream_generation(request_data: Dict[str, Any]):
             return
 
 
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics for this proxy, plus the upstream vLLM's own ``/metrics``.
+
+    The dataset generator's 📊 Metrics tab polls ``<host>:<port>/metrics`` for every API slot and
+    treats a non-200 as "this endpoint is unreachable".  This route did not exist, so every slot
+    pointed at this proxy showed no figures at all even though the proxy forwards to a vLLM that
+    serves them.
+
+    The upstream body is passed through **verbatim** (so the generator's existing ``vllm:`` parsing
+    keeps working unchanged, and a metric from a newer vLLM this code has never heard of still
+    arrives), and this server's own ``antislop:`` metrics are appended to it.
+
+    A dead or absent upstream still returns **200** with the ``antislop:`` figures and
+    ``antislop:upstream_metrics_scrape_total{result="error"}``: the difference between "the proxy is
+    unreachable" and "the proxy is up but its backend is not" is exactly what the tab needs, and a
+    5xx here would erase that distinction.
+
+    The scrape is blocking, so it runs in the threadpool rather than on the event loop.
+    """
+    config = SHARED_RESOURCES.get("config") or {}
+    api_base_url = config.get("api_base_url")
+    body = await run_in_threadpool(render_metrics_body, api_base_url)
+    return Response(
+        content=body,
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @app.post("/v1/chat/completions")
 async def create_chat_completion(request: Request):
     """
@@ -418,14 +505,20 @@ async def create_chat_completion(request: Request):
     try:
         request_data = await request.json()
     except Exception:
+        REQUESTS_TOTAL.inc({"endpoint": "/v1/chat/completions", "status": "400"})
         return Response(
             content=json.dumps({"error": "Invalid JSON in request body"}),
             status_code=status.HTTP_400_BAD_REQUEST,
             media_type="application/json"
         )
 
+    STREAMING_TOTAL.inc({"stream": "true" if request_data.get("stream") else "false"})
+
     if request_data.get("stream"):
         from fastapi.responses import StreamingResponse
+        # The status is known as soon as the stream is handed back; a failure *inside* the
+        # stream surfaces as an SSE error event, which the generator already handles.
+        REQUESTS_TOTAL.inc({"endpoint": "/v1/chat/completions", "status": "200"})
         return StreamingResponse(
             _stream_generation(request_data),
             media_type="text/event-stream",
@@ -438,17 +531,22 @@ async def create_chat_completion(request: Request):
     if "error" in result:
         # If upstream status/body were provided, pass them through verbatim
         if "http_status" in result and "error_body" in result:
+            code = int(result.get("http_status", 500))
+            REQUESTS_TOTAL.inc({"endpoint": "/v1/chat/completions", "status": str(code)})
             return Response(
                 content=result["error_body"],
-                status_code=int(result.get("http_status", 500)),
+                status_code=code,
                 media_type=result.get("content_type", "application/json"),
             )
         # Fallback: generic 500 with our error envelope
+        REQUESTS_TOTAL.inc({"endpoint": "/v1/chat/completions", "status": "500"})
         return Response(
             content=json.dumps(result),
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             media_type="application/json",
         )
+
+    REQUESTS_TOTAL.inc({"endpoint": "/v1/chat/completions", "status": "200"})
 
 
     return Response(content=json.dumps(result), media_type="application/json")

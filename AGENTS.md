@@ -219,6 +219,7 @@ sweep repair cannot be observed in the returned text.
 | `utils/` | Config, string, chat-template, refusal, slop helpers |
 | `api_client/` | `ApiClient` for OpenAI-compatible endpoints; SSE parsing |
 | `api_server/` | FastAPI wrapper |
+| `api_server/metrics.py` | Prometheus text-exposition registry (no third-party dependency) + the upstream `/metrics` passthrough; `GET /metrics` concatenates the two |
 | `tests/_runner.py` | Single-thread setup, per-test timer, abort check |
 | `tests/run_all.py` | Sequential runner, run lock, hard-kill watchdog |
 | `tests/_stubs.py` | Import-time stubs for torch/transformers/tiktoken/nltk |

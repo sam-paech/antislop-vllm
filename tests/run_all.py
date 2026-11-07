@@ -60,6 +60,7 @@ SUITES = (
     "test_sampler_filters",
     "test_truncation_and_repetition",
     "test_audit_fixes",
+    "test_api_server_metrics",
 )
 
 # Grace period between SIGTERM and SIGKILL when a suite overruns.

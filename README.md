@@ -228,6 +228,51 @@ A generation that ended because the backend failed returns **HTTP 502**, not HTT
 
 See `example_api_server.ipynb` for a complete example.
 
+#### Prometheus metrics (`GET /metrics`)
+
+The server exposes Prometheus metrics on `GET /metrics`, on the **same port** as the OpenAI API.
+This matters for clients that scrape it: the dataset generator's 📊 Metrics tab polls
+`<host>:<port>/metrics` for every configured API slot and treats a non-200 as *unreachable*, so
+before this endpoint existed every slot pointed at the proxy showed no figures at all — even though
+the proxy forwards to a vLLM that serves them.
+
+The body is **two things concatenated**:
+
+1. **The upstream vLLM's own `/metrics` body, passed through verbatim.** The URL is derived from
+   `api_base_url` by discarding its path (`http://host:8000/v1` → `http://host:8000/metrics`), the
+   same rule the generator applies. Nothing is re-parsed, so a metric from a newer vLLM that this
+   code has never heard of still reaches the client, and existing `vllm:`-based tooling keeps working
+   unchanged.
+2. **This proxy's own `antislop:` metrics**, appended after it:
+
+| Metric | Type | Labels |
+|---|---|---|
+| `antislop:requests_total` | counter | `endpoint`, `status` |
+| `antislop:requests_in_flight` | gauge | — |
+| `antislop:request_duration_seconds` | summary | — |
+| `antislop:streaming_requests_total` | counter | `stream` |
+| `antislop:generations_total` | counter | `finish_reason` |
+| `antislop:prompt_tokens_total` | counter | — |
+| `antislop:generation_tokens_total` | counter | — |
+| `antislop:ban_events_total` | counter | `validator`, `fixed` |
+| `antislop:backtracks_total` | counter | — |
+| `antislop:upstream_errors_total` | counter | — |
+| `antislop:upstream_metrics_scrape_total` | counter | `result` (`ok`/`error`/`unconfigured`) |
+| `antislop:upstream_metrics_last_scrape_timestamp_seconds` | gauge | — |
+
+`antislop:ban_events_total` is the one to watch when tuning ban lists: it splits violations by
+validator type and by whether the back-track actually fixed them, so a phrase list that fires
+constantly and never fixes anything shows up as a large `fixed="false"` series.
+
+**A dead or absent backend still returns HTTP 200.** The `antislop:` figures are served with
+`antislop:upstream_metrics_scrape_total{result="error"}` and no `vllm:` samples, which is the
+difference between "the proxy is unreachable" and "the proxy is up but its vLLM is not" — a 5xx would
+erase that distinction. The scrape timeout is 2 s, under the generator's own 3 s poll timeout, so a
+hung backend cannot stall the poll.
+
+No third-party dependency is involved: the exposition format is written out in
+`api_server/metrics.py`, because `prometheus_client` is not in `requirements.txt`.
+
 #### Tuning server concurrency
 
 FastAPI's `run_in_threadpool()` is backed by anyio's default thread limiter, which is hard-capped at **40** worker threads regardless of how many requests arrive. Past that, requests queue silently — no error, no `503` — so latency climbs while throughput stays flat. AntiSlop-vLLM raises this ceiling from config:
