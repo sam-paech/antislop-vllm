@@ -47,7 +47,10 @@ class BaseValidator(ABC):
         Checks if a violation at a given token index with specific details has been ignored.
         `details_str_representation` should be the same key used in `ignore_violation`.
         """
-        return (idx, details_str_representation) in self._ignored
+        # (None, key) suppresses the key for the whole request: the sampler gives
+        # up on a phrase the model keeps returning to (see _perform_backtrack).
+        return ((idx, details_str_representation) in self._ignored
+                or (None, details_str_representation) in self._ignored)
 
     # Common helper method
     def _char_to_token_index(

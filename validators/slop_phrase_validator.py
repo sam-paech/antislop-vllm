@@ -5,7 +5,7 @@ from typing import Dict, Optional, Set, Any # Added Any
 from .base_validator import BaseValidator
 from state.generation_state import GenerationState
 from core.models import ViolationInfo
-from utils.slop_helpers import detect_disallowed_sequence
+from utils.slop_helpers import detect_disallowed_sequence, fold_for_matching
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +19,7 @@ class SlopPhraseValidator(BaseValidator):
     def __init__(self, slop_phrases_dict: Dict[str, float], app_config: Optional[Dict[str, Any]] = None) -> None:
         super().__init__()
 
-        self.slop_phrases_keys: Set[str] = set(slop_phrases_dict.keys())
+        self.slop_phrases_keys: Set[str] = {fold_for_matching(k) for k in slop_phrases_dict.keys()}
         self.max_phrase_len = max((len(p) for p in self.slop_phrases_keys), default=0)
         self.min_phrase_len = min((len(p) for p in self.slop_phrases_keys), default=0)
 
@@ -27,7 +27,14 @@ class SlopPhraseValidator(BaseValidator):
         self.match_requires_word_boundaries: bool = True
         if app_config is not None:
             try:
-                self.match_requires_word_boundaries = bool(app_config.get("match_requires_word_boundaries", True))
+                # config-example.yaml documents this key under generation_params;
+                # it used to be read only at the top level, so setting it there
+                # had no effect.
+                value = app_config.get("match_requires_word_boundaries")
+                if value is None:
+                    value = (app_config.get("generation_params") or {}).get(
+                        "match_requires_word_boundaries", True)
+                self.match_requires_word_boundaries = bool(value)
             except Exception:
                 self.match_requires_word_boundaries = True
         
@@ -51,7 +58,18 @@ class SlopPhraseValidator(BaseValidator):
         )
 
 
-    def check(self, state: GenerationState) -> Optional[ViolationInfo]:
+    def check(
+        self, state: GenerationState, *, final: bool = False
+    ) -> Optional[ViolationInfo]:
+        """Return the earliest banned phrase, or None.
+
+        *final* is False while the text is still growing.  In that case a match
+        whose right edge is the end of the text is **provisional** and is not
+        reported: the next token may extend the word (``"la"`` → ``"land"``), so
+        banning it immediately caused the back-tracker to rewrite a token the
+        model was about to disambiguate itself, looping at the same index.
+        The final sweep after generation stops passes ``final=True``.
+        """
         if not self.slop_phrases_keys or state.get_generated_length() == 0 or self.min_phrase_len == 0:
             return None
 
@@ -61,6 +79,15 @@ class SlopPhraseValidator(BaseValidator):
         scan_window_size = self.max_phrase_len + self.scan_window_base_size
         
         start_scan_char_offset = max(0, len(generated_text) - scan_window_size)
+        # Start the window on a word boundary.  A window that began mid-word
+        # treated its first character as a boundary, so the single-word entries
+        # fired inside longer words as the window slid ("grim" in "pilgrim",
+        # "aria" in "Maria") and each false hit discarded ~50 good tokens.
+        while start_scan_char_offset > 0 and (
+            generated_text[start_scan_char_offset - 1].isalnum()
+            or generated_text[start_scan_char_offset - 1] == "_"
+        ):
+            start_scan_char_offset -= 1
         text_to_scan = generated_text[start_scan_char_offset:]
 
         if not text_to_scan.strip(): # Avoid processing if the window is just whitespace
@@ -73,6 +100,12 @@ class SlopPhraseValidator(BaseValidator):
             min_phrase_len=self.min_phrase_len,
             check_n_chars_back=len(text_to_scan),
             require_word_boundaries=self.match_requires_word_boundaries,
+            # A match touching the end of the text is only definitive once
+            # generation has stopped.  While it is still running the next token
+            # may extend the word and dissolve the boundary.
+            allow_end_of_text_match=final,
+            skip=lambda cand, pos: self._is_ignored(
+                self._char_to_token_index(state, start_scan_char_offset + pos), cand),
         )
 
         if not phrase:

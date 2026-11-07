@@ -41,7 +41,26 @@ system_prompt: ""        # optional; left empty → no system prompt
 # Generation Parameters
 generation_params:
   threads: 40
-  request_mode: chunk      # chunk | stream (stream might be buggy)
+
+  # Maximum number of generations the API server will run at once.
+  # FastAPI's run_in_threadpool() is backed by anyio's default thread limiter,
+  # which is hard-capped at 40 regardless of load. Anything beyond that queues
+  # silently (no error, no 503), inflating latency with no throughput gain.
+  # This value also sizes the upstream HTTP connection pool (value + 8), so raise
+  # the two together. Omit to default to `threads`.
+  max_concurrent_requests: 128
+
+  # chunk | stream.  `stream` is strongly recommended for long generations: it
+  # avoids the per-chunk prefill round-trips and, more importantly, it is the only
+  # mode where a dropped connection can be resumed from the partial text.
+  request_mode: stream
+
+  # NOTE: in chunk mode every chunk is a separate upstream call that re-sends
+  # the whole prompt, so round-trips ~= max_new_tokens / chunk_size.
+  # chunk_size: 20 with max_new_tokens: 600 means ~30 sequential prefill
+  # round-trips per request, which caps throughput far below the concurrency
+  # limit. Prefer a larger chunk_size (or request_mode: stream) when serving
+  # many concurrent clients.
   chunk_size: 20  # if using chunk request_mode
   top_logprobs_count: 20
   max_new_tokens: 600
@@ -52,6 +71,80 @@ generation_params:
   
   timeout: 120        # seconds
   stop_sequences: []
+  # End-of-turn markers the model may emit prematurely under sampling.
+  # These are used to SCRUB leaked control tokens from the output.  Any such
+  # token is removed from anywhere in a chunk (not just its tail) and a marker
+  # split across two chunks is still caught, because text is held back until it
+  # can no longer be the start of a marker.  Set to [] to disable.
+  end_of_turn_markers:
+    - "<end_of_turn>"
+    - "<turn|>"
+    - "<start_of_turn>"
+    - "<|im_end|>"
+    - "<|eot_id|>"
+    - "<end_of_text>"
+
+  # Extra regex for control tokens.  Leave unset to use the built-in pattern,
+  # which covers the Gemma / Llama-3 / ChatML / Mistral / Qwen families.
+  # special_token_pattern: '<\|?/?[a-z_]{1,20}\|?>'
+
+  # NOTE: short banlist entries (a prefix of a longer word, e.g. "la") are safe
+  # in stream mode.  A match that ends at the end of the text produced so far is
+  # treated as provisional while generation runs, and re-checked by a final sweep
+  # once it stops, so the back-tracker no longer rewrites a token the next chunk
+  # was about to disambiguate.
+
+  # Whether a backend `stop` that lands on a natural text boundary (sentence
+  # punctuation, a closing bracket, a newline) is accepted as the real end of the
+  # turn.  A stop in the MIDDLE of a sentence is treated as a premature EOS and
+  # generation continues.
+  # Set this to false to never accept a stop unless a stop_sequence matched --
+  # that guarantees no truncation, at the cost of occasionally running past the
+  # end of the turn.
+  stop_on_clean_end: true
+  # Default also counts roleplay endings (`*`, `_`, `~`, dashes, `:`, `;`, `»`,
+  # a backtick) and a trailing emoji or other symbol as clean:
+  # clean_end_chars: [".", "!", "?", "…", '"', "'", "”", "’", ")", "]", "}", "\n",
+  #                   "*", "_", "~", "—", "–", ":", ";", "»", "`"]
+
+  # Max CONSECUTIVE early stops that produced no new tokens before we give up
+  # (safety valve against a model that re-emits EOS forever).  An early stop
+  # that came after real progress resets this counter, so a long response with
+  # several stray EOS tokens is no longer truncated.
+  #
+  # A refused stop whose continuation only repeats text that is already there
+  # counts as *no progress* and is rolled back, so this valve also ends the
+  # `of course. of course. of course. ...` repetition loop.
+  max_consecutive_stops: 3
+
+  # Hard cap on upstream stream attempts per generation.  This bounds ordinary
+  # retries only: a backend stop that had to be retried, a dropped connection, an
+  # empty chunk.  It does NOT count restarts entered to resume after a back-track
+  # (see max_backtrack_restarts) -- charging both to one counter cut slop-heavy
+  # responses off mid-sentence with finish_reason='length'.
+  max_stream_attempts: 12
+
+  # Hard cap on restarts entered to resume after a back-track.  A back-track
+  # rewrote a token and resumed generation, so it is progress by definition and
+  # must not consume max_stream_attempts.  This bounds the pathological case of a
+  # response that back-tracks forever.
+  max_backtrack_restarts: 200
+
+  # Ask the backend to suppress the end-of-turn markers (`bad_words`) on the one
+  # attempt that follows a refused stop.  `bad_words` holds for the whole
+  # request, so on that attempt the model cannot end its turn at all: when the
+  # reply was in fact finished, it pads it with whatever it writes instead
+  # (stock phrases, stage directions, a new turn).  Off by default; when on, the
+  # attempt is capped at `restart_suppress_window` tokens.  Without it, a model
+  # that really meant to stop re-emits its end-of-turn marker, which counts as a
+  # no-progress stop and ends the turn after `max_consecutive_stops`.
+  # Backends that reject `bad_words` disable this automatically.
+  restart_suppress_markers: false
+  restart_suppress_window: 32
+
+  # Probe the backend once for streamed logprobs.  The result is cached per
+  # endpoint; set to false to skip the extra round-trip entirely.
+  probe_stream_logprobs: true
   # If true, the banlist only takes effects on whole words/phrases that
   # are bounded by non-word characters.
   # Examples:
@@ -65,16 +158,33 @@ generation_params:
 # This avoids adding refused generations to the generated dpo dataset
 enable_refusal_detection: true
 
+# Write unresolvable backtrack positions to ./antislop_backtrack_fails.txt.
+# (This used to be an unconditional write to a hard-coded /workspace path, which
+# crashed the generation on any machine without that directory.)
+debug_fail_dump: false
+
 # Backtracking Configuration
 backtracking:
   # If set to true:
   #   when resampling after backtracking, if we don't find a valid replacement token
   #   we progressively disable sampling options (temp, then min_p, then top_p, then top_k)
   #   until we find a non-banned replacement or run out of candidates.
-  force_backtrack: true 
+  force_backtrack: true
+
+  # Number of alternative tokens to try at a single position before giving up on
+  # the violation and suppressing it.  This bounds the work done at one position;
+  # without it a position whose whole candidate list was banned could be
+  # re-entered indefinitely.  Raise it if valid responses are being left with a
+  # banned phrase in them, lower it to bound latency.
+  max_retries_per_position: 100
 
 # N-Gram Validator Configuration (Optional)
 ngram_validator:
+  # Master switch.  Set to false to skip n-gram validation entirely, even though
+  # a banned_file / banned_list is configured below.  Default: true.
+  # (Emptying the ban list is not the same thing: the file is re-read on every run.)
+  enabled: true
+
   # Option 1: Specify a file containing a JSON list of banned n-grams
   # Each item in the JSON list can be a string (e.g., "this is an n gram")
   # or a list of strings (e.g., ["this", "is", "an", "n", "gram"])

@@ -37,12 +37,16 @@ AntiSlop-vLLM can be used for single prompt completions or for generating entire
 *   **FTPO Pair Generation:** Captures (chosen, rejected) token pairs during backtracking, useful for creating datasets for Final Token Preference Optimization.
 *   **Chat Template Formatting:** Can apply Hugging Face chat templates to prompts before sending them to the completions endpoint.
 *   **Refusal Detection:** Optionally detects and flags model refusals in batch mode.
+*   **Early End-of-Turn Recovery:** Detects and recovers from premature end-of-turn emissions that Gemma-class models produce mid-response under sampling. Detection is based on evidence the backend actually reports (whether the attempt produced text, and whether that text ends on a natural boundary) rather than on seeing the marker token — vLLM strips the stop token before serialising a response, so a marker-based check never fired. Control tokens that do leak are scrubbed from the text, including markers split across two stream chunks; when a chat template is configured the scrub list is the model's **own** tokenizer special tokens, not a fixed pattern. Configurable via `stop_on_clean_end`, `clean_end_chars`, `end_of_turn_markers`, `max_consecutive_stops`, `max_stream_attempts`, `restart_suppress_markers` and `restart_suppress_window`.
+*   **Truncation-resistant Streaming:** A dropped connection, read timeout or malformed SSE event mid-stream is retried from the text produced so far instead of ending the record early, and `finish_reason` is reported truthfully (`stop` / `length` / `error`) so a truncated record is distinguishable from a complete one.
+*   **Tunable Server Concurrency:** `max_concurrent_requests` lifts the silent 40-request ceiling imposed by FastAPI's thread pool, and automatically sizes the upstream HTTP connection pool to match.
+*   **Banlist Builder (`utils/phrase_token_ids.py`):** Converts a plain JSON list of phrases into a token-ID banlist for a given tokenizer, with deduplication and validation.
 *   **Configurable:** Extensive configuration via `config.yaml` and command-line arguments.
 
 ## How it Works
 
 1.  **API Interaction:** The system sends requests to the `/v1/completions` endpoint of your specified API. It's crucial that the API can return `logprobs` for the generated tokens.
-2.  **Generation:** Text is generated either in discrete chunks (`request_mode: chunk`) or token-by-token via a stream (`request_mode: stream`).
+2.  **Generation:** Text is generated either in discrete chunks (`request_mode: chunk`) or token-by-token via a stream (`request_mode: stream`). `chunk` is the default; `stream` avoids the repeated prefill cost of chunk mode — see [Chunk mode and throughput](#chunk-mode-and-throughput).
 3.  **Validation:** After each new piece of text is generated, it's passed through a series of active validators:
     *   `SlopPhraseValidator`: Checks against a list of exact phrases.
     *   `RegexValidator`: Matches text against a list of regex patterns.
@@ -52,7 +56,7 @@ AntiSlop-vLLM can be used for single prompt completions or for generating entire
     *   It attempts to select a different token that doesn't lead to a violation.
     *   Sampling parameters (temperature, min_p, top_p, top_k) are applied during this local resampling.
     *   The process can be forced to try harder by progressively relaxing sampling constraints (`force_backtrack: true`).
-5.  **Suppression:** If, after a set number of retries, no valid alternative token can be found for a specific violation at a specific position, that particular violation instance is "ignored" or "suppressed" for that position. This allows generation to continue rather than getting stuck.
+5.  **Suppression:** If, after a set number of retries, no valid alternative token can be found for a specific violation at a specific position, that particular violation instance is "ignored" or "suppressed" for that position. This allows generation to continue rather than getting stuck. Suppression can also apply to the **whole request** for one phrase, which is what happens when the context makes that phrase unavoidable (a character's name against a one-word entry) — see [A phrase the context forces is allowed instead of looped](#a-phrase-the-context-forces-is-allowed-instead-of-looped).
 6.  **Output:** Compliant text segments are yielded. In batch mode, full generations are saved to a JSONL file.
 
 ## Requirements
@@ -70,6 +74,10 @@ AntiSlop-vLLM can be used for single prompt completions or for generating entire
     *   `tqdm`
     *   `transformers>=4.40.0` (for chat templates, refusal detector, and `auto_unslop.py`)
     *   `regex`
+    *   `fastapi` and `uvicorn[standard]` (only needed for API server mode, Example 3)
+    *   `tokenizers` (only needed for `utils/phrase_token_ids.py`; install with `pip install tokenizers`)
+
+> **Note:** `fastapi` and `uvicorn[standard]` are already included in `requirements.txt`. `tokenizers` is **not** — install it separately (`pip install tokenizers`) if you intend to use the banlist builder described below.
 
 ## Installation & Setup
 
@@ -107,8 +115,14 @@ Modify `config.yaml` for persistent settings. Key options include:
 *   `api_base_url`, `api_key`, `model_name`
 *   `slop_phrases_file`, `top_n_slop_phrases`
 *   `regex_blocklist_file`
-*   `ngram_validator` (including `banned_file`, `remove_stopwords`, `language`)
+*   `ngram_validator` (including `enabled`, `banned_file`, `banned_list`, `remove_stopwords`, `language`).
+    Set `ngram_validator.enabled: false` to turn n-gram banning off entirely without
+    having to clear the ban list; the default is `true`.
 *   `generation_params` (like `max_new_tokens`, `temperature`, `top_p`, `top_k`, `min_p`, `chunk_size`, `request_mode`)
+*   `generation_params.end_of_turn_markers`, `generation_params.max_consecutive_stops`, `generation_params.clean_end_chars`, `generation_params.restart_suppress_markers`, `generation_params.restart_suppress_window` (early end-of-turn recovery, see below)
+*   `generation_params.max_concurrent_requests` (API server concurrency, see below)
+*   `generation_params.match_requires_word_boundaries` (read from here first; the top-level key is a fallback)
+*   `backtracking.force_backtrack`, `backtracking.max_retries_per_position`
 *   `prompt_template`, `system_prompt` (for dataset generation)
 *   `logging_level`
 
@@ -204,9 +218,238 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
-**Supported request parameters:** `max_tokens`, `temperature`, `min_p`, `top_p`, `top_k`, `ban_strength`.
+**Supported request parameters:** `max_tokens`, `temperature`, `min_p`, `top_p`, `top_k`, `ban_strength`, `stop`, `chat_template_kwargs`, and the forwarded penalties `repetition_penalty`, `presence_penalty`, `frequency_penalty`.
+
+`repetition_penalty`, `presence_penalty` and `frequency_penalty` are passed straight through to the backend on every upstream request, so a client's settings produce the same sampling it would get from vLLM directly. `seed` is deliberately **not** forwarded: every restart re-sends the request, and a fixed seed would replay the same continuation instead of continuing past the back-track.
+
+A server that has no chat template configured **refuses the request** (HTTP 500) rather than falling back to the last user message alone — that fallback silently dropped the system prompt and the whole conversation history. Set `chat_template_model_id` to use this mode.
+
+A generation that ended because the backend failed returns **HTTP 502**, not HTTP 200 with `finish_reason: "error"` and partial text, so a client that does not inspect `finish_reason` cannot store an empty or cut-off turn as a real one. The error body carries `partial_text_chars`.
 
 See `example_api_server.ipynb` for a complete example.
+
+#### Prometheus metrics (`GET /metrics`)
+
+The server exposes Prometheus metrics on `GET /metrics`, on the **same port** as the OpenAI API.
+This matters for clients that scrape it: the dataset generator's 📊 Metrics tab polls
+`<host>:<port>/metrics` for every configured API slot and treats a non-200 as *unreachable*, so
+before this endpoint existed every slot pointed at the proxy showed no figures at all — even though
+the proxy forwards to a vLLM that serves them.
+
+The body is **two things concatenated**:
+
+1. **The upstream vLLM's own `/metrics` body, passed through verbatim.** The URL is derived from
+   `api_base_url` by discarding its path (`http://host:8000/v1` → `http://host:8000/metrics`), the
+   same rule the generator applies. Nothing is re-parsed, so a metric from a newer vLLM that this
+   code has never heard of still reaches the client, and existing `vllm:`-based tooling keeps working
+   unchanged.
+2. **This proxy's own `antislop:` metrics**, appended after it:
+
+| Metric | Type | Labels |
+|---|---|---|
+| `antislop:requests_total` | counter | `endpoint`, `status` |
+| `antislop:requests_in_flight` | gauge | — |
+| `antislop:request_duration_seconds` | summary | — |
+| `antislop:streaming_requests_total` | counter | `stream` |
+| `antislop:generations_total` | counter | `finish_reason` |
+| `antislop:prompt_tokens_total` | counter | — |
+| `antislop:generation_tokens_total` | counter | — |
+| `antislop:ban_events_total` | counter | `validator`, `fixed` |
+| `antislop:backtracks_total` | counter | — |
+| `antislop:upstream_errors_total` | counter | — |
+| `antislop:upstream_metrics_scrape_total` | counter | `result` (`ok`/`error`/`unconfigured`) |
+| `antislop:upstream_metrics_last_scrape_timestamp_seconds` | gauge | — |
+
+`antislop:ban_events_total` is the one to watch when tuning ban lists: it splits violations by
+validator type and by whether the back-track actually fixed them, so a phrase list that fires
+constantly and never fixes anything shows up as a large `fixed="false"` series.
+
+**A dead or absent backend still returns HTTP 200.** The `antislop:` figures are served with
+`antislop:upstream_metrics_scrape_total{result="error"}` and no `vllm:` samples, which is the
+difference between "the proxy is unreachable" and "the proxy is up but its vLLM is not" — a 5xx would
+erase that distinction. The scrape timeout is 2 s, under the generator's own 3 s poll timeout, so a
+hung backend cannot stall the poll.
+
+No third-party dependency is involved: the exposition format is written out in
+`api_server/metrics.py`, because `prometheus_client` is not in `requirements.txt`.
+
+#### Tuning server concurrency
+
+FastAPI's `run_in_threadpool()` is backed by anyio's default thread limiter, which is hard-capped at **40** worker threads regardless of how many requests arrive. Past that, requests queue silently — no error, no `503` — so latency climbs while throughput stays flat. AntiSlop-vLLM raises this ceiling from config:
+
+```yaml
+generation_params:
+  max_concurrent_requests: 128   # default: falls back to `threads`
+```
+
+This value is applied at server startup and also sizes the upstream HTTP connection pool (`max_concurrent_requests + 8`), so raise both together. Set it at least as high as the number of clients you expect to serve simultaneously.
+
+> **Note:** the limiter is process-global. That is correct for the default single-process `uvicorn.run(app, ...)`, but if you ever run with `workers=N`, note that the regex process pool and the shared HTTP session cache are module globals and therefore become per-process.
+
+#### Chunk mode and throughput
+
+In `request_mode: chunk`, every chunk is a separate upstream call that re-sends the entire prompt. A single request therefore costs roughly `max_new_tokens / chunk_size` sequential prefill round-trips — `chunk_size: 20` with `max_new_tokens: 600` means ~30 of them, multiplied by your concurrency. AntiSlop logs a warning at sampler construction when this ratio reaches 10 or more. The warning is **chunk mode only**: `request_mode: stream` makes a single upstream request and does not re-send the prompt, so the ratio does not apply to it. If you are serving many concurrent clients, prefer a larger `chunk_size` or `request_mode: stream`, which removes the round-trip cost entirely.
+
+### Short banlist entries in stream mode
+
+A banlist entry that is a prefix of a longer word — `la`, for example — used to trigger back-tracking the instant the model had emitted `" la"`, before the next token could extend it to `"land"` or `"last"`. The back-tracker rewrote the token, the model re-emitted the same prefix, and generation looped at that index indefinitely: no token was ever added, so `max_new_tokens` was never reached and the request never finished.
+
+A match that ends at the **end of the text produced so far** is now treated as *provisional* while generation is running. It is deferred until more text arrives, which decides whether the word really is banned. When the backend reports a stop, the deferral is turned off and the text is re-checked **before the stop is accepted** (see [End-of-text violations are resolved before the stop is accepted](#end-of-text-violations-are-resolved-before-the-stop-is-accepted)), so a banned phrase at the very end of a response is still caught while there is still a request to regenerate with.
+
+A match that already ends in a non-word character needs no lookahead and still fires immediately. Word-boundary matching itself is unchanged, so `la` never matches inside `land`.
+
+> **Note:** this affects short entries only. Prefer multi-word phrases where you can — a one- or two-character entry is more likely to collide with ordinary prose.
+
+#### End-of-text violations are resolved before the stop is accepted
+
+A match that only becomes definitive once the text stops growing — the last few tokens of a slop-heavy turn, with `regex_max_span_tokens` holding the tail — cannot be repaired *after* generation has ended. There is no next request, so nothing will regenerate the text that a rewrite invalidates. Both ways of handling it at that point are wrong, and the project has tried both:
+
+*   **Deleting the tail** (before `2026.11.02.1930`) truncated the turn: the record ended at the last repaired word, with `finish_reason='stop'`.
+*   **Rewriting the token in place** (`2026.11.02.1930`) spliced two continuations together, because the following tokens were sampled given the *old* one. `It was not fear, but hunger.` became `It was. fear, but hunger.`, and every n-gram fix produced `took deep breath`.
+
+The fix is to move the decision earlier. `_resolve_before_stop()` runs in both generation loops **before a stop is accepted**, while a back-track can still be followed by a regeneration. If it rewrote a token, the loop resumes generation from there instead of ending the turn; if the violation cannot be regenerated — it is already in text sent to the client, or the restart budget is spent — it is suppressed and the text is left as written.
+
+`_perform_backtrack(final=True)` therefore no longer rewrites anything at all: a violation still present once generation is over is logged and left as written. A back-track also receives `emitted_upto`, the last token already yielded, and never rolls back into text the client has already seen.
+
+> **Note:** if you are testing this path, set `regex_max_span_tokens` high (as the shipped config does). With the default of `0`, `tail_keep_tokens` is `0`, all text is emitted *before* the sweep runs, and the pre-stop resolution has nothing left to hold back.
+
+#### Back-tracking limits
+
+`backtracking.max_retries_per_position` (default `100`) is the number of alternative tokens tried at a single position before the violation is given up on and suppressed. It was previously read from config but never enforced; it now bounds the work done at any one position.
+
+A replacement candidate is always validated **definitively**, even while the stream is still running. The end-of-text deferral described above applies to the live stream — where `" la"` may still grow into `" land"` — but not to a candidate we are about to write in place of a banned token. Checking candidates with the deferral on made every banned single word its own best replacement: with both `gripped` and `gripping` in the banlist, `gripped` was resampled to `gripping`, re-detected at the same index, resampled back to `gripped`, and so on until the attempt budget ran out — and the banned word was emitted anyway. This is the source of the repeated `own own own` / `spark`→`surge`→`spark` output. Candidates are now rejected if they are themselves banned, so a position is fixed once.
+
+A replacement is also never an **end-of-turn token**. vLLM computes logprobs *before* applying `bad_words` and stop handling, so the candidate list includes `<turn|>` and friends; picking one put the marker inside the assistant text, and the next restart sent it upstream as a real end of turn, so the record continued as a new turn. Those candidates are now skipped in both the constrained and the unconstrained pass.
+
+Replacement tokens are resampled with the **request's** `temperature`, `min_p`, `top_p` and `top_k`, not the config file's. A client that sends its own settings used to get replacement tokens drawn under different sampling than the rest of the reply.
+
+`--force-backtrack` now actually reaches the sampler. It used to be written to a top-level `force_backtrack` key that nothing read, so the flag was a silent no-op; it now lands on `backtracking.force_backtrack`. For the same reason `match_requires_word_boundaries` is read from `generation_params` first (where `config-example.yaml` documents it) with the top-level key as a fallback, and `top_k: -1` or `top_k: 0` is treated as *disabled* as vLLM does — the old slice dropped the least likely candidate or returned nothing at all.
+
+Suppressions are also dropped when they stop referring to anything: a back-track discards the `_ignored` entries for token indices past the one it rewrote, so a regenerated occurrence of the same phrase that happens to land on the same index is not silently let through.
+
+#### A phrase the context forces is allowed instead of looped
+
+A banlist entry that the context makes unavoidable — a character called **Mara** against the one-word entry `mara`, a place name, a word the user just used — cannot be satisfied by any replacement. Each rewrite produces a junk token, and the model writes the word again straight after it. The per-position budget never trips, because every retry lands on a new index: a real Gemma 4 run filled the reply with `**` followed by a run of newlines, banning at tokens 22, 23 and 25.
+
+The signature is three bans of the same phrase at **increasing positions, each at most 2 tokens after the previous one**. When that fires, the back-track rolls back to the first of the three and allows that phrase for the rest of the request.
+
+The guard is deliberately narrow:
+
+*   A model that merely *likes* a word returns to it in a new sentence — `flicker` banned at tokens 87, 93 and 96 — and stays banned. Gaps wider than 2 tokens do not qualify.
+*   **Regex rules are never disabled** by it; their key is a whole pattern, not a phrase.
+*   It never rolls back into text already sent to the client.
+
+If you are building on `ApiClient` directly, note that a stream can be cancelled **individually**: create a handle with `client.new_stream_token()` and pass it as `cancel_token=` to `generate_stream()`, then call `client.cancel_stream(token)`. The older client-wide `cancel_current_stream()` aborts every stream open on that client, which is only safe when the client serves a single request (batch mode).
+
+### What the validators actually match
+
+The three validators agree on a few matching rules that are easy to get wrong from a
+ban list alone.
+
+*   **Typographic apostrophes match ASCII ones.** The shipped ban lists are written
+    with `'`, so `couldn’t help but` (U+2019) used to slip past the entry
+    `couldn't help but`. `utils/slop_helpers.fold_for_matching()` folds `’`, `‘`, `ʼ`,
+    `“` and `”` to ASCII before matching, and `RegexValidator` folds the apostrophes in
+    the text it matches so `it'?s` also catches `it’s`. The fold is **one character for
+    one character**, so match offsets still index the original text — `str.lower()`
+    alone can lengthen a string (`İ` becomes two characters) and shift every later
+    offset, blaming the wrong token.
+*   **A suppressed match no longer hides a later one.** All three validators used to
+    return the earliest match unconditionally, so once one match at a position was
+    suppressed, later violations in the same window were never reported.
+    `detect_disallowed_sequence()` now takes a `skip` callback and keeps scanning,
+    `RegexValidator` returns up to 32 matches per pass instead of the first, and
+    `NGramValidator` walks its candidate list (earliest first, longer n-gram on a tie)
+    until it finds one that is not suppressed. The `skip` check sits once, before the
+    word-boundary tests and the early `return`, so it runs once per candidate — see
+    `2026.11.03.0025` in [`CHANGELOG.md`](CHANGELOG.md).
+*   **The slop scan window starts on a word boundary.** A window that began mid-word
+    treated its first character as a boundary, so single-word entries fired inside
+    longer words as the window slid — `grim` in `pilgrim`, `aria` in `Maria` — and each
+    false hit discarded ~50 good tokens.
+*   **The n-gram validator fires while streaming.** Its deferral test was true for
+    practically any text, so every n-gram was deferred and only caught after generation
+    ended. It now defers only a match whose **last** word is the still-growing final
+    word of the text. A word before a mid-text period also used to vanish, because
+    Treebank only splits off a sentence-final period and `eyes.` failed the `isalpha()`
+    filter; trailing periods are stripped first, which fixes any n-gram that ended a
+    sentence.
+*   **`_is_repetition` compares whole words.** `needle in " ".join(existing_words)`
+    matched `he said` inside `she said`, so a genuine continuation was rolled back as a
+    repetition. Both sides are now space-padded before the containment test.
+
+> **Note:** `_ensure_nltk_data()` used to name `nltk.downloader.DownloadError`, which
+> does not exist in current nltk. Naming it in an `except` clause raised
+> `AttributeError` *while handling* the `LookupError`, so importing `validators` failed
+> outright on any machine without the NLTK data. It now catches `LookupError` only and
+> fetches `punkt_tab` alongside `punkt`.
+
+### Handling premature end-of-turn markers
+
+Some models — notably the Gemma family — emit their end-of-turn token prematurely while sampling at `temperature > 0`, and the backend reports `finish_reason="stop"`. Left unhandled, this both leaks the raw marker into your output and cuts the response off mid-sentence.
+
+A backend `stop` is **not** automatically treated as the end of the turn. Gemma-class models emit their end-of-turn token mid-response under sampling, and vLLM reports that as an ordinary `finish_reason="stop"` — the stop token itself never appears in the response, because vLLM detokenises the output and drops it. A check that looked for the marker token therefore never fired, and every such emission truncated the answer.
+
+The decision is now based on evidence that is actually observable:
+
+*   if the attempt produced no text at all, it counts as a *no-progress* stop (the model immediately tried to end);
+*   if a configured `stop_sequence` appears in the text, the stop is terminal;
+*   if the text ends on a natural boundary (sentence punctuation, a closing bracket, a newline), the stop is terminal;
+*   otherwise the stop is a **premature end of turn** and generation continues.
+
+The strike counter only advances on *consecutive no-progress* stops, so a long response with a couple of stray end-of-turn emissions is no longer cut short, while a model that re-emits EOS forever still terminates.
+
+```yaml
+generation_params:
+  stop_on_clean_end: true
+  end_of_turn_markers:
+    - "<end_of_turn>"
+    - "<turn|>"
+  max_consecutive_stops: 3
+  max_stream_attempts: 12
+  max_backtrack_restarts: 200
+  restart_suppress_markers: false
+  restart_suppress_window: 32
+```
+
+*   `stop_on_clean_end`: accept a stop that lands on a natural text boundary. Set to `false` to never accept a stop unless a `stop_sequence` matched — that guarantees no truncation at the cost of occasionally running past the end of the turn.
+*   `clean_end_chars`: which characters count as a natural boundary. The default covers prose punctuation **and roleplay endings** — `*`, `_`, `~`, `—`, `–`, `:`, `;`, `»`, a backtick, the typographic quotes `”`/`’` — plus a trailing character in Unicode category `So`, `Sk` or `Sm`, which is how an emoji or other symbol counts as a deliberate ending. A reply that ends on an `*action*` used to be judged unfinished, so its stop was refused and the model was told to keep writing. In stream mode the test looks at the **whole reply**, not only the current attempt: judging the attempt alone made an immediate stop on a retry (an empty attempt) look mid-sentence, so a finished reply's stop was refused again.
+*   `end_of_turn_markers`: control tokens to **scrub**. Removal happens anywhere in a chunk, and a marker split across two chunks is still caught (text is held back until it can no longer be the start of a marker). List the markers your model uses. The built-in fallback pattern covers the Gemma, Llama-3, ChatML, Mistral and Qwen families; when a chat template is configured the model's own tokenizer is used instead (see `special_token_pattern`).
+*   `special_token_pattern`: optional regex replacing the built-in control-token pattern. When a chat template is configured, the model's own tokenizer is preferred: every string in `all_special_tokens` (plus every `added_tokens_decoder` entry with `special=True`) that looks like `<...>` is scrubbed by exact match, and the pattern is not used at all. The built-in pattern names a fixed set of families and missed 13 of Gemma 4's 24 control tokens (`<|channel>`, `<channel|>`, `<|think|>`, `<|"|>`, …) while deleting harmless prose such as a literal `<mask>`; the tokenizer's list has neither problem. The fallback pattern (used only when no tokenizer is loaded) now includes the Gemma 4 family.
+*   `max_consecutive_stops`: consecutive **no-progress** early stops tolerated before giving up (safety valve against runaway restarts). A refused stop whose continuation only repeats text that is already there counts as no progress, so this valve also ends a repetition loop such as `of course. of course. of course. ...`.
+*   `max_stream_attempts`: hard cap on upstream stream attempts per generation, covering plain retries only — a rejected stop, a dropped connection, an empty chunk. A restart entered to resume after a back-track is *progress* and is charged to `max_backtrack_restarts` instead; sharing one counter cut slop-heavy responses off mid-sentence with `finish_reason='length'`.
+*   `max_backtrack_restarts`: hard cap on restarts entered to resume after a back-track (default 200). Bounds a response that back-tracks forever without truncating one that merely needs a lot of fixes.
+*   `restart_suppress_markers`: send the markers as `bad_words` on the one attempt that **directly follows a refused stop**. Default `false`. `bad_words` holds for the whole request, so on that attempt the model cannot end its turn even when it meant to, and a reply that was in fact finished is padded with whatever it writes instead (stock phrases, stage directions, a new turn) — the source of the repetition loops and long tails in the dataset. Without it, a model that really meant to stop re-emits its marker, which counts as a no-progress stop and ends the turn after `max_consecutive_stops`. Backends that reject `bad_words` disable it automatically.
+*   `restart_suppress_window`: token cap on that suppressed attempt (default `32`), so a model that cannot stop cannot pad indefinitely either.
+*   `probe_stream_logprobs`: probe the backend once for streamed logprobs. The result is cached per endpoint; set to `false` to skip the round-trip.
+
+> **Note:** setting `end_of_turn_markers: []` disables scrubbing entirely. Use this if you are running a model whose control tokens you do not want removed, or if you are debugging output length.
+
+### Building a token-ID banlist (`utils/phrase_token_ids.py`)
+
+If you maintain your own list of slop phrases, this helper converts a flat JSON array of strings into an AntiSlop banlist of `[["phrase", first_token_id], ...]` pairs for a specific tokenizer:
+
+```bash
+pip install tokenizers
+python utils/phrase_token_ids.py \
+    --phrases   slop_phrases_flat.json \
+    --tokenizer /path/to/tokenizer.json \
+    --out       banlists/my_slop_phrases.json \
+    --report    banlists/my_slop_phrases.report.txt
+```
+
+Input is a plain JSON list:
+
+```json
+[
+  "took a deep breath",
+  "voice barely above a whisper"
+]
+```
+
+The script lowercases and de-duplicates entries, and validates each phrase — rejecting any that encode to zero tokens, produce IDs outside the vocabulary, or fail a decode round-trip check. Pass `--report` to get a readable summary of what was kept, dropped, or excluded and why, plus the full token-ID sequence for every kept phrase. The banlist itself stores only the **first** token ID of each phrase.
+
+> The input parser is tolerant: if your JSON is missing a comma between two adjacent `"string"` lines, it repairs the file in memory and reports each repair rather than failing.
 
 ### Iterative Anti-Slop (`auto_unslop.py`)
 
@@ -249,10 +492,128 @@ While `antislop-vllm` is based on the concepts of the original `antislop-sampler
     *   `generation_state.py`: Manages the state of the text being generated.
 *   `validators/`: Implements different validation strategies (`SlopPhraseValidator`, `RegexValidator`, `NGramValidator`).
 *   `utils/`: Helper functions for configuration, string manipulation, chat templates, refusal detection, etc.
+    *   `phrase_token_ids.py`: Standalone CLI that converts a flat JSON phrase list into a token-ID banlist for a given tokenizer.
 *   `banlists/`: Directory for example ban list files (JSON format). **Users should curate their own lists.**
 *   `data/`: Can store auxiliary data like human writing profiles for `auto_unslop.py`.
 *   `results/`: Default output directory for batch generations and `auto_unslop.py` experiments.
+*   `tests/`: Regression suite (see [Running the tests](#running-the-tests)). `_runner.py` holds the single-thread setup, the per-test timer and the abort check; `run_all.py` runs the suites one at a time under a run lock and a hard kill watchdog. See [`AGENTS.md`](AGENTS.md) for the test-first workflow.
 *   `example_run_antislop_vllm.ipynb`: Jupyter notebook with usage examples.
+
+## Running the tests
+
+The regression suite lives in `tests/` and needs no GPU, network, or vLLM — the
+backend is a scripted fake and the heavy optional imports are stubbed.
+
+```bash
+python -m tests.run_all                 # every suite, one at a time (recommended)
+python tests/run_all.py                 # same thing, by path
+python -m tests.run_all early_eos        # a subset, by name
+python -m tests.run_all --list          # what would run
+```
+
+Both forms work: `run_all.py` and every suite insert the repo root on `sys.path`
+before importing, so `PYTHONPATH=.` is not needed either way.
+
+Individual suites also run standalone, which is handy while iterating:
+
+```bash
+python -m tests.test_early_eos           # truncation / early end-of-turn
+python tests/test_early_eos.py          # same, by path
+python -m tests.test_partial_word_bans   # back-tracking storms, cancellation
+python -m tests.test_config_and_sse      # config merge and SSE parsing
+python -m tests.test_sampler_filters    # min-p floor vs. the rejected top token
+python -m tests.test_audit_fixes        # the 2026-11-03 audit (needs fastapi)
+python -m tests.test_harness            # the harness itself
+```
+
+### Optional dependencies and `SKIP`
+
+Two suites need a dependency that is not required to run AntiSlop itself:
+`test_audit_fixes` imports `api_server.server` (needs `fastapi`) and
+`test_config_and_sse` imports `utils.helpers` (needs `pyyaml`). When the dependency
+is missing those individual tests are reported as **`SKIP`** with the install hint,
+and the rest of the suite still runs — a missing optional dependency no longer aborts
+a suite before a single test has executed.
+
+A run that skipped something exits **0** and prints `All runnable suites passed.`
+Pass `--strict-skips` to make a skip a failure instead, which is what you want in
+CI where the dependencies are pinned:
+
+```bash
+python -m tests.run_all --strict-skips   # a SKIP fails the run
+```
+
+Prefer `run_all` over a shell loop: it is the only entry point that enforces the
+hard kill and the run lock described below.
+
+### Nothing here can wedge the board
+
+The suite runs on small ARM boards (it is developed on an Orange Pi 5 Plus) and is
+designed so that a regression cannot take the machine down. Several tests exist
+precisely because the sampler used to loop forever, so a hang is the failure mode
+they are meant to catch — not an accident to be avoided.
+
+*   **Single-threaded.** Suites run one after another and tests run one at a time in
+the main thread. `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`,
+`NUMEXPR_NUM_THREADS`, `VECLIB_MAXIMUM_THREADS` and `TOKENIZERS_PARALLELISM` are
+pinned at import, and the regex validator's process pool is pinned to one worker and
+created lazily instead of forking 16 processes at import time. A suite reports any
+thread still alive when it finishes.
+*   **Short timers.** Each test gets `ANTISLOP_TEST_TIMEOUT` seconds (default **10**),
+enforced in-process with `SIGALRM`. A test that overruns is reported as a failure.
+*   **Automatic kill.** Each suite gets `ANTISLOP_SUITE_TIMEOUT` seconds (default
+**60**) from `run_all.py`, which then `SIGTERM`s and, if needed, `SIGKILL`s the
+suite's **whole process group**. This is the backstop for a hang `SIGALRM` cannot
+break — a blocking C call, or a catastrophic regex — and killing the group also takes
+out the validator's pool workers, which would otherwise survive as orphans and keep
+pegging cores.
+
+### One run at a time
+
+Several agents may share a checkout, and nothing here is isolated per agent. `run_all`
+takes an exclusive `flock` on `tests/.runlock` for the duration, and a second run
+refuses to start with exit code `2` rather than interleaving its output and competing
+for the same four cores:
+
+```
+BUSY  another run holds …/tests/.runlock.
+      Another agent is using this checkout; wait for it to finish.
+```
+
+`flock` rather than a plain lockfile is deliberate: the kernel drops it when the
+holder dies, including on `SIGKILL`, so a killed run cannot wedge the checkout. Do not
+delete `tests/.runlock` while a run is in progress.
+
+### Aborting a run
+
+Whoever started the tests can stop them at any point, without waiting for the current
+test or suite:
+
+```bash
+touch tests/.abort     # checked inside every test, every 50 ms
+```
+
+`Ctrl-C`, `SIGTERM` or `SIGHUP` to the runner does the same thing. The run stops,
+prints `ABORTED` with the reason and exit code `130`, and `run_all` removes a stale
+abort file on the next start.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `ANTISLOP_TEST_TIMEOUT` | `10` | per-test budget, seconds |
+| `ANTISLOP_SUITE_TIMEOUT` | `60` | per-suite hard-kill budget, seconds |
+| `ANTISLOP_TEST_ABORT_FILE` | `tests/.abort` | abort sentinel path |
+| `ANTISLOP_REGEX_MAX_WORKERS` | CPU count, max 16 | regex validator pool size (tests pin it to 1) |
+
+Exit codes: `0` all passed, `1` failures or a kill, `2` another run holds the lock,
+`130` aborted.
+
+## Known Issues
+
+*   **`ApiClient` instances resolve their session per request, not at construction.** Sessions are shared per `base_url` and reference-counted, so `reset_connection_pool()` retires a session that is still in use instead of closing it, and the last request to finish closes it. This is safe to call while other requests are in flight. If you are building on `ApiClient` directly, do not cache `_lease_session()`'s result beyond the request — the session can be retired at any time.
+*   The concurrency limiter and the session registry are process-global, so they do not compose with `uvicorn --workers`. See the note under [Tuning server concurrency](#tuning-server-concurrency).
+*   **Stream mode is the tested path.** `_generate_chunkwise` gained the same pre-stop resolution and `emitted_upto` plumbing as the stream loop, but the 2026-11-03 audit was reported and reproduced against stream mode only.
+*   `tests/test_audit_fixes.py` imports `api_server.server` for three of its tests. Without `fastapi` installed those three fail on `ModuleNotFoundError` rather than on an assertion; the other 21 run.
+*   A test that expects the pre-stop resolution to observe a repair must set `regex_max_span_tokens` high and `regex_validation_interval` explicitly, for the reason given in the [note above](#end-of-text-violations-are-resolved-before-the-stop-is-accepted).
 
 ## Disclaimers
 
